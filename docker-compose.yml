@@ -1,0 +1,101 @@
+# Local development stack. `make up` starts it; see .env.example for the
+# GitHub App settings you must supply first.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sbomdelta
+      POSTGRES_PASSWORD: sbomdelta
+      POSTGRES_DB: sbomdelta
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sbomdelta -d sbomdelta"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # MinIO stands in for S3. The API and the console are separate ports;
+  # the console (9001) is where you can browse stored SBOMs by hand.
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: ./backend
+      target: server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://sbomdelta:sbomdelta@postgres:5432/sbomdelta?sslmode=disable
+      BLOB_ENDPOINT: minio:9000
+      BLOB_BUCKET: sbomdelta
+      BLOB_ACCESS_KEY: minioadmin
+      BLOB_SECRET_KEY: minioadmin
+      BLOB_USE_SSL: "false"
+      BLOB_PATH_STYLE: "true"
+      GITHUB_APP_ID: ${GITHUB_APP_ID}
+      GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-sbomdelta}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+
+  worker:
+    build:
+      context: ./backend
+      target: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      # The server applies migrations, so give it a head start rather than
+      # racing it for an empty schema.
+      server:
+        condition: service_started
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://sbomdelta:sbomdelta@postgres:5432/sbomdelta?sslmode=disable
+      BLOB_ENDPOINT: minio:9000
+      BLOB_BUCKET: sbomdelta
+      BLOB_ACCESS_KEY: minioadmin
+      BLOB_SECRET_KEY: minioadmin
+      BLOB_USE_SSL: "false"
+      BLOB_PATH_STYLE: "true"
+      GITHUB_APP_ID: ${GITHUB_APP_ID}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
+      WORKER_CONCURRENCY: "4"
+    volumes:
+      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+      - worker-scratch:/var/lib/sbomdelta
+
+volumes:
+  postgres-data:
+  minio-data:
+  worker-scratch:

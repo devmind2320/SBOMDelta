@@ -1,0 +1,17 @@
+# Secrets -- the GitHub App private key must never be committed.
+.env
+secrets/
+*.pem
+
+# Go build output
+/backend/bin/
+/backend/dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Frontend (Phase 6)
+node_modules/
+dist/

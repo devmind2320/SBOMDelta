@@ -1,0 +1,271 @@
+# SBOMDelta
+
+Git diff, but for your dependencies — and for the security consequences of changing them.
+
+Most supply-chain tools answer *"what is vulnerable right now?"*. SBOMDelta answers a
+different question:
+
+> **What changed, and did that change make us less secure?**
+
+It installs as a GitHub App. On every push to the default branch and on every pull
+request it generates a [CycloneDX](https://cyclonedx.org/) SBOM for that exact commit,
+compares it against the right baseline, and reports the difference back onto the commit
+as a check run:
+
+```
+3 dependency changes
+
+Added (1)
+- npm express 4.18.2
+
+Updated (1)
+- npm axios 1.6.0 → 1.7.0
+
+Removed (1)
+- npm left-pad 1.3.0
+```
+
+Over time this builds a per-repository history of *dependency drift* rather than a
+snapshot of current vulnerabilities.
+
+---
+
+## Status
+
+Phases 1–3 are implemented and tested: GitHub App integration, SBOM generation and
+archival, and the diff engine.
+
+| Phase | Scope | State |
+|-------|-------------------------------------------------|-------------|
+| 1 | GitHub App, webhooks, check runs | ✅ Done |
+| 2 | Clone, syft/CycloneDX, blob archival | ✅ Done |
+| 3 | Diff engine, drift history | ✅ Done |
+| 4 | OSV vulnerability + license + maintenance enrichment | ⬜ Next |
+| 5 | Risk scoring and policy thresholds | ⬜ Planned |
+| 6 | Vue dashboard | ⬜ Planned |
+| 7 | Crypto primitive analysis, contributor analytics | ⬜ Planned |
+
+The schema already carries the `vulnerabilities` table and the `risk_score` /
+`risk_delta` columns that Phases 4–5 fill in, so those phases add code rather than
+migrations.
+
+---
+
+## How it works
+
+```
+GitHub ──push / pull_request──▶ Go API ──enqueue──▶ Postgres (jobs)
+                                   │                    │
+                                 202 Accepted      FOR UPDATE SKIP LOCKED
+                                                        │
+                                                        ▼
+                                                    Go worker
+                                                        │
+                            ┌───────────────────────────┼───────────────────────┐
+                            ▼                           ▼                       ▼
+                    shallow git clone            syft → CycloneDX        archive to S3
+                                                        │
+                                                        ▼
+                                                  DIFF ENGINE
+                                       base SBOM ◀────┴────▶ head SBOM
+                                                        │
+                                        added · updated · removed · unchanged
+                                                        │
+                                    ┌───────────────────┴────────────────┐
+                                    ▼                                    ▼
+                             Postgres projection                  GitHub check run
+                        (components, drift_events)                 on the commit
+```
+
+The webhook handler never scans anything. It verifies the signature, records just enough
+to act on the event, enqueues a job, and returns `202` — a handler that cloned a
+repository inline would hold GitHub's delivery open for minutes and time out.
+
+### Choosing the baseline
+
+The comparison is only as meaningful as what it compares against:
+
+- **A pull request** is diffed against its **base commit**, so the check shows what the
+  PR itself changes and nothing else.
+- **A push** is diffed against the **previous tip of the default branch**.
+- **The first scan** of a repository is a baseline, not a diff. Every component reported
+  as "added" on day one would be noise.
+
+When a PR's base commit was never scanned (the app was installed mid-stream), the worker
+backfills it before diffing, so the comparison is against the real base rather than
+against nothing.
+
+### Dependency identity
+
+The diff matches on the **version-less PURL** (`pkg:npm/lodash`), not the full one. That
+single decision is what makes `lodash 4.17.21 → 4.18.0` register as *one update* instead
+of an unrelated add plus remove. Namespaces are preserved, so `@scope/utils` never
+collides with `utils`, and qualifiers are stripped, so an architecture change does not
+read as a different dependency.
+
+Packages that ship several versions side by side — routine in npm trees — are handled
+explicitly: unchanged versions stay unchanged, and the versions that moved are paired in
+version order.
+
+---
+
+## Running it locally
+
+### 1. Create a GitHub App
+
+Under **Settings → Developer settings → GitHub Apps → New GitHub App**:
+
+| Field | Value |
+|---------------------|-------------------------------------------------|
+| Webhook URL | your public tunnel, e.g. `https://<id>.ngrok.app/webhooks/github` |
+| Webhook secret | any random string — you will need it below |
+| Repository permissions | **Contents:** Read-only · **Pull requests:** Read-only · **Checks:** Read & write · **Metadata:** Read-only |
+| Subscribe to events | **Push**, **Pull request** |
+
+Generate a private key, and save it as `secrets/github-app.pem`.
+
+### 2. Configure
+
+```bash
+cp .env.example .env      # fill in GITHUB_APP_ID and GITHUB_WEBHOOK_SECRET
+mkdir -p secrets && mv ~/Downloads/*.private-key.pem secrets/github-app.pem
+```
+
+`.env` and `secrets/` are gitignored. The server refuses to start without a webhook
+secret — without one, signatures cannot be verified.
+
+### 3. Start the stack
+
+```bash
+make up      # postgres + minio + server + worker
+make logs
+```
+
+| Service | URL |
+|-----------|-------------------------------------------|
+| API | http://localhost:8080/healthz |
+| MinIO console | http://localhost:9001 (`minioadmin` / `minioadmin`) |
+
+Point a tunnel at `localhost:8080`, install the app on a repository, and push a
+dependency change.
+
+### Running without Docker
+
+You need PostgreSQL, an S3-compatible store, `git`, and
+[syft](https://github.com/anchore/syft) on `PATH`.
+
+```bash
+export DATABASE_URL='postgres://sbomdelta:sbomdelta@localhost:5432/sbomdelta?sslmode=disable'
+make run-server      # applies migrations, then serves
+make run-worker      # in another shell
+```
+
+---
+
+## Tests
+
+```bash
+make test     # unit tests only; database tests skip themselves
+```
+
+The storage and queue tests run against a real PostgreSQL instance — they are what
+verify the schema, the idempotency constraints, and the `SKIP LOCKED` semantics. Point
+them at a **throwaway** database (they truncate tables):
+
+```bash
+docker compose up -d postgres
+TEST_DATABASE_URL='postgres://sbomdelta:sbomdelta@localhost:5432/sbomdelta?sslmode=disable' \
+  make test
+```
+
+---
+
+## API
+
+| Method | Path | Purpose |
+|--------|-----------------------------------|----------------------------------------|
+| `POST` | `/webhooks/github` | GitHub event receiver (signature-verified) |
+| `GET` | `/healthz` | Liveness plus queue depth |
+| `GET` | `/api/repos` | Installed repositories |
+| `GET` | `/api/repos/{id}` | One repository |
+| `GET` | `/api/repos/{id}/scans` | Scan history |
+| `GET` | `/api/repos/{id}/drift` | Drift timeline for charting |
+| `GET` | `/api/scans/{id}` | Scan status and result |
+| `GET` | `/api/scans/{id}/components` | The full component list |
+| `GET` | `/api/scans/{id}/drift` | What changed in this scan |
+| `GET` | `/api/scans/{id}/sbom` | Redirect to a presigned SBOM download |
+
+---
+
+## Layout
+
+```
+backend/
+├── cmd/
+│   ├── server/          API + webhook receiver; owns migrations
+│   └── worker/          Queue consumer
+├── internal/
+│   ├── api/             HTTP handlers
+│   ├── config/          Environment loading and validation
+│   ├── diff/            The diff engine  ← the core
+│   ├── github/          App auth, webhook verification, check runs
+│   ├── models/          Persisted domain types
+│   ├── queue/           Postgres job queue (SKIP LOCKED)
+│   ├── sbom/            Clone, syft, CycloneDX normalization
+│   ├── scanner/         The end-to-end scan pipeline
+│   ├── storage/         Postgres queries and the SBOM blob store
+│   └── worker/          Worker loop
+└── migrations/          Embedded SQL schema
+```
+
+---
+
+## Engineering notes
+
+Some decisions worth explaining, because they are the interesting part:
+
+**Postgres as the job queue, not Redis.** One stateful service instead of two, and — more
+usefully — a job can be enqueued in the same transaction as the row it refers to.
+`FOR UPDATE SKIP LOCKED` lets many workers drain one table without blocking each other.
+Jobs whose lock outlives `WORKER_LOCK_TIMEOUT` are reclaimed, so a worker killed
+mid-clone does not strand its work.
+
+**Idempotency at three layers.** GitHub delivers at least once and retries any non-2xx.
+Delivery IDs are recorded and replays dropped; scans are unique per
+`(repository, commit, PR)`; job dedupe keys collapse repeat submissions. Re-running a
+scan replaces its projection rather than colliding with it.
+
+**Blob storage for SBOMs, Postgres for the projection.** A CycloneDX document for a
+large repository is megabytes of JSON that no query planner should ever touch. Postgres
+holds the queryable columns; S3/MinIO holds the archived artifact, byte-identical to what
+the generator emitted. Downloads are presigned redirects, so multi-megabyte documents
+never pass through the API's heap.
+
+**syft as a subprocess, not a library.** Upgrading the scanner does not mean rebuilding
+this service, and a scanner crash cannot take a worker down with it. Clones are shallow
+and blobless — SBOM generation needs one tree, not the history — which is both a speed
+and a disk-exhaustion concern on a shared worker.
+
+**Scan failures are distinct from scan findings.** A check run that says "failure"
+because syft crashed teaches people to ignore the check. A broken scan reports
+`failure`; a scan that found drift reports `neutral` until the risk engine in Phase 5 can
+justify blocking a merge.
+
+**Credentials never reach a log.** Installation tokens are embedded in clone URLs, so git
+errors are redacted before they reach a log line or a check body, and git is run with
+`GIT_TERMINAL_PROMPT=0` so it can never block a worker waiting for credentials.
+
+---
+
+## Known gaps
+
+- **Risk scoring is not implemented.** `risk_score` and `risk_delta` are present in the
+  schema and the API but stay null until Phase 5. The drift timeline is currently measured
+  in dependency movement, not risk.
+- **No vulnerability data yet.** The `vulnerabilities` table exists and is empty; OSV
+  enrichment is Phase 4.
+- **Only the default branch is tracked for pushes.** Feature branches are covered through
+  their pull requests.
+- **`git clone` shells out**, so a repository whose dependency manifests need a build step
+  to resolve fully (some Gradle and Bazel setups) will produce a thinner SBOM than a
+  build-time scan would.
