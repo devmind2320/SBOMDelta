@@ -31,7 +31,7 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadAPI()
 	if err != nil {
 		return err
 	}
@@ -54,10 +54,15 @@ func run(logger *slog.Logger) error {
 	}
 
 	jobs := queue.New(db.Pool(), cfg.Worker.LockTimeout)
-	app := ghapp.NewApp(cfg.GitHub)
-	_ = app // The server authenticates lazily; the worker is what calls GitHub.
-
-	webhook := ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
+	var webhook http.Handler
+	if cfg.GitHub.Disabled {
+		logger.Info("GitHub integration disabled for local development")
+		webhook = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "GitHub integration is disabled for local development", http.StatusServiceUnavailable)
+		})
+	} else {
+		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
+	}
 	handler := api.New(db, blob, jobs, logger).Routes(webhook)
 
 	server := &http.Server{

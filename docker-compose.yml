@@ -9,7 +9,7 @@ services:
       POSTGRES_PASSWORD: sbomdelta
       POSTGRES_DB: sbomdelta
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +21,7 @@ services:
   # MinIO stands in for S3. The API and the console are separate ports;
   # the console (9001) is where you can browse stored SBOMs by hand.
   minio:
-    image: minio/minio:latest
+    image: ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -56,14 +56,15 @@ services:
       BLOB_SECRET_KEY: minioadmin
       BLOB_USE_SSL: "false"
       BLOB_PATH_STYLE: "true"
-      GITHUB_APP_ID: ${GITHUB_APP_ID}
+      GITHUB_DISABLED: ${GITHUB_DISABLED:-true}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_SLUG: ${GITHUB_APP_SLUG:-sbomdelta}
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
     ports:
       - "8080:8080"
     volumes:
-      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+      - ./secrets:/run/secrets:ro
 
   worker:
     build:
@@ -87,12 +88,13 @@ services:
       BLOB_SECRET_KEY: minioadmin
       BLOB_USE_SSL: "false"
       BLOB_PATH_STYLE: "true"
-      GITHUB_APP_ID: ${GITHUB_APP_ID}
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+      GITHUB_DISABLED: ${GITHUB_DISABLED:-true}
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
       WORKER_CONCURRENCY: "4"
     volumes:
-      - ./secrets/github-app.pem:/run/secrets/github-app.pem:ro
+      - ./secrets:/run/secrets:ro
       - worker-scratch:/var/lib/sbomdelta
 
 volumes:

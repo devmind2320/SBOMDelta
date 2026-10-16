@@ -1,13 +1,15 @@
-.PHONY: help build test lint run-server run-worker up down logs psql clean
+.PHONY: help build test test-integration lint install dev-ui run-server run-worker up down logs psql clean
 
-GO      ?= go
-BACKEND := backend
+GO       ?= go
+BACKEND  := backend
+FRONTEND := frontend
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-build: ## Compile both binaries
+build: ## Compile the Go binaries and the dashboard
 	cd $(BACKEND) && $(GO) build ./...
+	cd $(FRONTEND) && npm run build
 
 test: ## Run the test suite (database tests skip without TEST_DATABASE_URL)
 	cd $(BACKEND) && $(GO) test ./... -race
@@ -20,6 +22,12 @@ test-integration: ## Run every test against the compose database
 lint: ## Vet and check formatting
 	cd $(BACKEND) && $(GO) vet ./...
 	@cd $(BACKEND) && test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+
+install: ## Install frontend dependencies
+	cd $(FRONTEND) && npm install
+
+dev-ui: ## Run the dashboard against a local API on :8080
+	cd $(FRONTEND) && npm run dev
 
 run-server: ## Run the API server against the compose stack
 	cd $(BACKEND) && $(GO) run ./cmd/server

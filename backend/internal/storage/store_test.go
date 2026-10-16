@@ -75,7 +75,7 @@ func seedRepository(t *testing.T, db *storage.DB) models.Repository {
 
 	repo, err := db.UpsertRepository(ctx, models.Repository{
 		InstallationID: &installation.ID,
-		GitHubRepoID:   99001,
+		GitHubRepoID:   githubRepoID(99001),
 		Owner:          "acme",
 		Name:           "payments-api",
 		DefaultBranch:  "main",
@@ -85,6 +85,8 @@ func seedRepository(t *testing.T, db *storage.DB) models.Repository {
 	}
 	return repo
 }
+
+func githubRepoID(id int64) *int64 { return &id }
 
 func component(purl string) sbom.Component {
 	identity, version, ecosystem, name := sbom.ParseIdentity(purl)
@@ -111,7 +113,7 @@ func TestUpsertRepositoryHandlesRename(t *testing.T) {
 	// GitHub keeps the numeric ID stable across a rename, so the same row must
 	// be updated rather than a second one created.
 	renamed, err := db.UpsertRepository(ctx, models.Repository{
-		GitHubRepoID:  99001,
+		GitHubRepoID:  githubRepoID(99001),
 		Owner:         "acme",
 		Name:          "billing-api",
 		DefaultBranch: "main",

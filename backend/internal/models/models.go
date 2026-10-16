@@ -14,14 +14,19 @@ type Installation struct {
 }
 
 type Repository struct {
-	ID             int64     `json:"id"`
-	InstallationID *int64    `json:"installationId,omitempty"`
-	GitHubRepoID   int64     `json:"githubRepoId"`
-	Owner          string    `json:"owner"`
-	Name           string    `json:"name"`
-	DefaultBranch  string    `json:"defaultBranch"`
-	Private        bool      `json:"private"`
-	CreatedAt      time.Time `json:"createdAt"`
+	ID             int64  `json:"id"`
+	InstallationID *int64 `json:"installationId,omitempty"`
+	// GitHubRepoID is nil for repositories registered manually rather than
+	// through the GitHub App.
+	GitHubRepoID *int64 `json:"githubRepoId,omitempty"`
+	// CloneURL is set for manually registered repositories, which are cloned
+	// anonymously because there is no installation token to use.
+	CloneURL      string    `json:"cloneUrl,omitempty"`
+	Owner         string    `json:"owner"`
+	Name          string    `json:"name"`
+	DefaultBranch string    `json:"defaultBranch"`
+	Private       bool      `json:"private"`
+	CreatedAt     time.Time `json:"createdAt"`
 }
 
 // FullName is the owner/name form GitHub uses throughout its API.
@@ -84,6 +89,7 @@ type Scan struct {
 	RiskDelta        *float64    `json:"riskDelta,omitempty"`
 	GitHubCheckRunID *int64      `json:"githubCheckRunId,omitempty"`
 	Error            string      `json:"error,omitempty"`
+	EnrichedAt       *time.Time  `json:"enrichedAt,omitempty"`
 	StartedAt        *time.Time  `json:"startedAt,omitempty"`
 	FinishedAt       *time.Time  `json:"finishedAt,omitempty"`
 	CreatedAt        time.Time   `json:"createdAt"`
@@ -116,4 +122,39 @@ type DriftEvent struct {
 	Direction  string    `json:"direction,omitempty"`
 	RiskDelta  float64   `json:"riskDelta"`
 	CreatedAt  time.Time `json:"createdAt"`
+}
+
+// Vulnerability is one advisory affecting one component. Populated by the OSV
+// enrichment step in Phase 4; the table exists and stays empty until then.
+type Vulnerability struct {
+	ID           int64      `json:"id"`
+	ComponentID  int64      `json:"componentId"`
+	OSVID        string     `json:"osvId"`
+	Aliases      []string   `json:"aliases"`
+	Severity     string     `json:"severity,omitempty"`
+	CVSSScore    *float64   `json:"cvssScore,omitempty"`
+	CVSSVector   string     `json:"cvssVector,omitempty"`
+	Summary      string     `json:"summary,omitempty"`
+	FixedVersion string     `json:"fixedVersion,omitempty"`
+	PublishedAt  *time.Time `json:"publishedAt,omitempty"`
+
+	// Denormalized from the component so a vulnerability table needs one query.
+	PURL      string `json:"purl"`
+	Name      string `json:"name"`
+	Version   string `json:"version"`
+	Ecosystem string `json:"ecosystem"`
+}
+
+// PullRequestSummary is a pull request plus the headline numbers from its most
+// recent scan, which is what a PR list needs to render in one query.
+type PullRequestSummary struct {
+	PullRequest
+
+	ScanID         *int64      `json:"scanId,omitempty"`
+	ScanStatus     *ScanStatus `json:"scanStatus,omitempty"`
+	RiskDelta      *float64    `json:"riskDelta,omitempty"`
+	ComponentCount *int        `json:"componentCount,omitempty"`
+	Added          int         `json:"added"`
+	Updated        int         `json:"updated"`
+	Removed        int         `json:"removed"`
 }

@@ -1,0 +1,143 @@
+@import "tailwindcss";
+
+/* Design tokens.
+ *
+ * Colors are defined once as roles, never as raw hex at the point of use, so
+ * light and dark swap in one place. The categorical series slots and the
+ * status palette come from a validated palette: the three series hues clear
+ * the colorblind-separation, lightness-band, chroma and normal-vision gates in
+ * both modes. Light-mode aqua sits below 3:1 against the surface, so every
+ * chart using it ships a legend and a table view (the relief rule) rather than
+ * relying on hue alone. */
+:root {
+  color-scheme: light;
+
+  --plane: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-raised: #ffffff;
+
+  --ink: #0b0b0b;
+  --ink-secondary: #52514e;
+  --ink-muted: #898781;
+
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --hairline: rgba(11, 11, 11, 0.1);
+
+  /* Categorical series. Assigned to a fixed meaning, never cycled: slot 1 is
+   * always "added", slot 2 "updated", slot 3 "removed", so filtering a series
+   * out never repaints the survivors. */
+  --series-added: #2a78d6;
+  --series-updated: #eb6834;
+  --series-removed: #1baf7a;
+
+  /* Status palette. Reserved for state, never reused as a fourth series, and
+   * always paired with an icon and a label so color never carries meaning
+   * alone. */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --delta-good: #006300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+
+    --plane: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-raised: #232322;
+
+    --ink: #f0efec;
+    --ink-secondary: #c3c2b7;
+    --ink-muted: #898781;
+
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --hairline: rgba(255, 255, 255, 0.1);
+
+    --series-added: #3987e5;
+    --series-updated: #d95926;
+    --series-removed: #199e70;
+
+    --delta-good: #0ca30c;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --plane: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-raised: #232322;
+
+  --ink: #f0efec;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --hairline: rgba(255, 255, 255, 0.1);
+
+  --series-added: #3987e5;
+  --series-updated: #d95926;
+  --series-removed: #199e70;
+
+  --delta-good: #0ca30c;
+}
+
+/* Expose the tokens to Tailwind so utilities like bg-surface and text-ink work
+ * alongside the raw custom properties the charts use. */
+@theme inline {
+  --color-plane: var(--plane);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-ink: var(--ink);
+  --color-ink-secondary: var(--ink-secondary);
+  --color-ink-muted: var(--ink-muted);
+  --color-grid: var(--grid);
+  --color-axis: var(--axis);
+  --color-hairline: var(--hairline);
+  --color-series-added: var(--series-added);
+  --color-series-updated: var(--series-updated);
+  --color-series-removed: var(--series-removed);
+  --color-status-good: var(--status-good);
+  --color-status-warning: var(--status-warning);
+  --color-status-serious: var(--status-serious);
+  --color-status-critical: var(--status-critical);
+  --color-delta-good: var(--delta-good);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+html {
+  background: var(--plane);
+}
+
+body {
+  margin: 0;
+  background: var(--plane);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Columns of numbers align; standalone figures use proportional digits, where
+ * tabular spacing makes a value like 121 read loose. */
+.nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Refetch holds the previous render at reduced opacity rather than flashing a
+ * skeleton, so the layout never jumps. */
+.is-refetching {
+  opacity: 0.55;
+  transition: opacity 120ms ease-out;
+}
+
+:where(a, button, [tabindex]):focus-visible {
+  outline: 2px solid var(--series-added);
+  outline-offset: 2px;
+  border-radius: 4px;
+}

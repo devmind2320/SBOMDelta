@@ -31,7 +31,7 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadWorker()
 	if err != nil {
 		return err
 	}
@@ -55,7 +55,17 @@ func run(logger *slog.Logger) error {
 	}
 
 	jobs := queue.New(db.Pool(), cfg.Worker.LockTimeout)
-	app := ghapp.NewApp(cfg.GitHub)
+
+	// With GitHub disabled there are no credentials to build a client from.
+	// The scanner treats a nil app as "manual scans only" and fails loudly if
+	// a scan actually needs an installation token.
+	var app *ghapp.App
+	if cfg.GitHub.Disabled {
+		logger.Warn("GitHub integration disabled; only manual scans will run")
+	} else {
+		app = ghapp.NewApp(cfg.GitHub)
+	}
+
 	pipeline := scanner.New(db, blob, app, generator, cfg.Scanner, logger)
 
 	return worker.New(workerID(), jobs, pipeline, cfg.Worker, logger).Run(ctx)

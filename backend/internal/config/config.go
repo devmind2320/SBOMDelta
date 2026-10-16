@@ -25,7 +25,11 @@ type Config struct {
 }
 
 type GitHub struct {
-	AppID int64
+	// Disabled turns off GitHub integration for local development. The API
+	// then refuses webhooks and the worker handles only manual scans of
+	// repositories that carry their own clone URL.
+	Disabled bool
+	AppID    int64
 	// PrivateKey is the PEM-encoded RSA key downloaded when the GitHub App was
 	// created. It signs the app JWT used to mint installation tokens.
 	PrivateKey    []byte
@@ -76,6 +80,23 @@ type Worker struct {
 // local development. It returns every validation problem at once rather than
 // failing on the first, so a misconfigured deployment needs one round trip.
 func Load() (*Config, error) {
+	return load(false)
+}
+
+// LoadAPI permits explicitly disabling GitHub integration for local dashboard
+// development. Other environments retain the credential checks.
+func LoadAPI() (*Config, error) {
+	return load(true)
+}
+
+// LoadWorker permits the same opt-out as LoadAPI. A worker with GitHub
+// disabled can still run manual scans of repositories registered by hand; it
+// refuses only the scans that genuinely need an installation token.
+func LoadWorker() (*Config, error) {
+	return load(true)
+}
+
+func load(allowGitHubDisable bool) (*Config, error) {
 	cfg := &Config{
 		Env:         env("APP_ENV", "development"),
 		HTTPAddr:    env("HTTP_ADDR", ":8080"),
@@ -110,25 +131,40 @@ func Load() (*Config, error) {
 
 	var problems []error
 
-	appID := os.Getenv("GITHUB_APP_ID")
-	if appID == "" {
-		problems = append(problems, errors.New("GITHUB_APP_ID is required"))
-	} else {
-		parsed, err := strconv.ParseInt(appID, 10, 64)
-		if err != nil {
-			problems = append(problems, fmt.Errorf("GITHUB_APP_ID %q is not a number", appID))
+	if allowGitHubDisable {
+		if value := os.Getenv("GITHUB_DISABLED"); value != "" {
+			disabled, err := strconv.ParseBool(value)
+			if err != nil {
+				problems = append(problems, errors.New("GITHUB_DISABLED must be true or false"))
+			}
+			cfg.GitHub.Disabled = disabled
 		}
-		cfg.GitHub.AppID = parsed
+	}
+	if cfg.GitHub.Disabled && cfg.Env != "development" {
+		problems = append(problems, errors.New("GITHUB_DISABLED is only allowed when APP_ENV=development"))
 	}
 
-	key, err := loadPrivateKey()
-	if err != nil {
-		problems = append(problems, err)
-	}
-	cfg.GitHub.PrivateKey = key
+	if !cfg.GitHub.Disabled {
+		appID := os.Getenv("GITHUB_APP_ID")
+		if appID == "" {
+			problems = append(problems, errors.New("GITHUB_APP_ID is required"))
+		} else {
+			parsed, err := strconv.ParseInt(appID, 10, 64)
+			if err != nil {
+				problems = append(problems, fmt.Errorf("GITHUB_APP_ID %q is not a number", appID))
+			}
+			cfg.GitHub.AppID = parsed
+		}
 
-	if cfg.GitHub.WebhookSecret == "" {
-		problems = append(problems, errors.New("GITHUB_WEBHOOK_SECRET is required; without it webhook signatures cannot be verified"))
+		key, err := loadPrivateKey()
+		if err != nil {
+			problems = append(problems, err)
+		}
+		cfg.GitHub.PrivateKey = key
+
+		if cfg.GitHub.WebhookSecret == "" {
+			problems = append(problems, errors.New("GITHUB_WEBHOOK_SECRET is required; without it webhook signatures cannot be verified"))
+		}
 	}
 	if cfg.Worker.Concurrency < 1 {
 		problems = append(problems, errors.New("WORKER_CONCURRENCY must be at least 1"))

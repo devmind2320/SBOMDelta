@@ -191,7 +191,7 @@ func (h *WebhookHandler) upsertRepositoryFromEvent(ctx context.Context, installa
 
 	return h.db.UpsertRepository(ctx, models.Repository{
 		InstallationID: &installationID,
-		GitHubRepoID:   repo.GetID(),
+		GitHubRepoID:   githubID(repo.GetID()),
 		Owner:          owner,
 		Name:           name,
 		DefaultBranch:  defaultBranch,
@@ -234,7 +234,7 @@ func (h *WebhookHandler) handlePush(ctx context.Context, logger *slog.Logger, ev
 
 	record, err := h.db.UpsertRepository(ctx, models.Repository{
 		InstallationID: installationRecordID,
-		GitHubRepoID:   repo.GetID(),
+		GitHubRepoID:   githubID(repo.GetID()),
 		Owner:          repo.GetOwner().GetName(),
 		Name:           repo.GetName(),
 		DefaultBranch:  defaultBranch,
@@ -300,7 +300,7 @@ func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Log
 
 	record, err := h.db.UpsertRepository(ctx, models.Repository{
 		InstallationID: installationRecordID,
-		GitHubRepoID:   repo.GetID(),
+		GitHubRepoID:   githubID(repo.GetID()),
 		Owner:          repo.GetOwner().GetLogin(),
 		Name:           repo.GetName(),
 		DefaultBranch:  repo.GetDefaultBranch(),
@@ -401,4 +401,10 @@ func actionOf(event any) string {
 		return typed.GetAction()
 	}
 	return ""
+}
+
+// githubID boxes a GitHub repository ID. Repositories that arrive over a
+// webhook always have one; manually registered repositories do not.
+func githubID(id int64) *int64 {
+	return &id
 }

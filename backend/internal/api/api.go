@@ -4,11 +4,16 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	ghapp "sbomdelta/internal/github"
+	"sbomdelta/internal/models"
 	"sbomdelta/internal/queue"
 	"sbomdelta/internal/storage"
 )
@@ -33,12 +38,17 @@ func (a *API) Routes(webhook http.Handler) http.Handler {
 
 	mux.HandleFunc("GET /healthz", a.health)
 	mux.HandleFunc("GET /api/repos", a.listRepositories)
+	mux.HandleFunc("POST /api/repos", a.registerRepository)
 	mux.HandleFunc("GET /api/repos/{id}", a.getRepository)
 	mux.HandleFunc("GET /api/repos/{id}/scans", a.listScans)
+	mux.HandleFunc("POST /api/repos/{id}/scans", a.triggerScan)
 	mux.HandleFunc("GET /api/repos/{id}/drift", a.driftTimeline)
+	mux.HandleFunc("GET /api/repos/{id}/pulls", a.listPullRequests)
+	mux.HandleFunc("GET /api/pulls/{id}", a.getPullRequest)
 	mux.HandleFunc("GET /api/scans/{id}", a.getScan)
 	mux.HandleFunc("GET /api/scans/{id}/components", a.listComponents)
 	mux.HandleFunc("GET /api/scans/{id}/drift", a.listDrift)
+	mux.HandleFunc("GET /api/scans/{id}/vulnerabilities", a.listVulnerabilities)
 	mux.HandleFunc("GET /api/scans/{id}/sbom", a.downloadSBOM)
 
 	return a.withLogging(a.withCORS(mux))
@@ -213,6 +223,200 @@ func (a *API) downloadSBOM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, url, http.StatusFound)
+}
+
+func (a *API) listPullRequests(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	pulls, err := a.db.ListPullRequests(r.Context(), id, limitParam(r, 50, 200))
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"pullRequests": pulls})
+}
+
+func (a *API) getPullRequest(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	pull, err := a.db.GetPullRequest(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, pull)
+}
+
+// listVulnerabilities returns the advisories for a scan, plus whether
+// enrichment has actually run.
+//
+// The flag is derived from the scan's enriched_at timestamp rather than
+// hardcoded, so it starts reporting true the moment Phase 4 lands instead of
+// waiting for someone to remember to flip a literal. Until then an empty list
+// means "not analyzed", which the dashboard must not render as "clean".
+func (a *API) listVulnerabilities(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	scan, err := a.db.GetScan(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	vulnerabilities, err := a.db.ListVulnerabilities(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"vulnerabilities":     vulnerabilities,
+		"enrichmentAvailable": scan.EnrichedAt != nil,
+		"enrichedAt":          scan.EnrichedAt,
+	})
+}
+
+// registerRepository adds a repository by hand, without the GitHub App.
+//
+// The scan pipeline does not actually need GitHub: given a clone URL and a
+// commit it produces the same SBOM, diff and drift history. This endpoint
+// exists so a public repository can be tracked directly, and so the product
+// can be run and demonstrated before an App is installed anywhere.
+func (a *API) registerRepository(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Owner         string `json:"owner"`
+		Name          string `json:"name"`
+		CloneURL      string `json:"cloneUrl"`
+		DefaultBranch string `json:"defaultBranch"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+
+	body.Owner = strings.TrimSpace(body.Owner)
+	body.Name = strings.TrimSpace(body.Name)
+	if body.Owner == "" || body.Name == "" {
+		writeError(w, http.StatusBadRequest, "owner and name are required")
+		return
+	}
+	if body.DefaultBranch == "" {
+		body.DefaultBranch = "main"
+	}
+	if body.CloneURL == "" {
+		body.CloneURL = fmt.Sprintf("https://github.com/%s/%s.git", body.Owner, body.Name)
+	}
+	// Only anonymous HTTPS is supported here. An ssh:// or file:// source
+	// would let a caller reach things the API should not reach on its behalf.
+	if !strings.HasPrefix(body.CloneURL, "https://") {
+		writeError(w, http.StatusBadRequest, "cloneUrl must be an https:// url")
+		return
+	}
+
+	repo, err := a.db.UpsertManualRepository(r.Context(), models.Repository{
+		Owner:         body.Owner,
+		Name:          body.Name,
+		DefaultBranch: body.DefaultBranch,
+		CloneURL:      body.CloneURL,
+	})
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, repo)
+}
+
+// triggerScan queues a manual scan of one commit.
+//
+// It accepts either an exact commitSha or a ref to resolve. Resolving happens
+// here rather than in the worker because a scan row is keyed on its commit,
+// and that is what makes re-triggering the same commit idempotent instead of
+// piling up duplicate scans.
+func (a *API) triggerScan(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Ref       string `json:"ref"`
+		CommitSHA string `json:"commitSha"`
+	}
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+
+	repo, err := a.db.GetRepository(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+
+	commitSHA := strings.TrimSpace(body.CommitSHA)
+	if commitSHA == "" {
+		ref := strings.TrimSpace(body.Ref)
+		if ref == "" {
+			ref = repo.DefaultBranch
+		}
+		commitSHA, err = ghapp.ResolvePublicRef(r.Context(), repo.Owner, repo.Name, ref)
+		if err != nil {
+			// A failed lookup is the caller's problem to fix (wrong ref,
+			// private repo, rate limit), not a server fault.
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if !ghapp.IsCommitSHA(commitSHA) {
+		writeError(w, http.StatusBadRequest, "commitSha must be a full 40-character sha")
+		return
+	}
+
+	// The previous completed scan is the baseline, mirroring what a push to
+	// the default branch would compare against.
+	var baseCommitSHA string
+	if previous, err := a.db.LatestCompletedScan(r.Context(), repo.ID, 0, time.Now()); err == nil {
+		baseCommitSHA = previous.CommitSHA
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		a.fail(w, r, err)
+		return
+	}
+	if baseCommitSHA == commitSHA {
+		baseCommitSHA = ""
+	}
+
+	scan, err := a.db.CreateScan(r.Context(), models.Scan{
+		RepositoryID:  repo.ID,
+		CommitSHA:     commitSHA,
+		BaseCommitSHA: baseCommitSHA,
+		Trigger:       models.TriggerManual,
+	})
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+
+	if _, err := a.queue.Enqueue(r.Context(), queue.KindScan,
+		queue.ScanPayload{ScanID: scan.ID}, fmt.Sprintf("scan:%d", scan.ID)); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+
+	// 202: the work is accepted, not finished. Poll GET /api/scans/{id}.
+	writeJSON(w, http.StatusAccepted, scan)
+}
+
+// decodeJSON reads a JSON body, rejecting unknown fields so a typo in a
+// hand-written request is reported instead of silently ignored.
+func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
+		return false
+	}
+	return true
 }
 
 func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {

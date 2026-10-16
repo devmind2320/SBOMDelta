@@ -51,6 +51,40 @@ func (db *DB) MarkInstallationDeleted(ctx context.Context, githubInstallationID 
 	return nil
 }
 
+const repositoryColumns = `
+	id, installation_id, github_repo_id, owner, name, default_branch, private,
+	COALESCE(clone_url, ''), created_at`
+
+func repositoryTargets(repo *models.Repository) []any {
+	return []any{
+		&repo.ID, &repo.InstallationID, &repo.GitHubRepoID, &repo.Owner, &repo.Name,
+		&repo.DefaultBranch, &repo.Private, &repo.CloneURL, &repo.CreatedAt,
+	}
+}
+
+// UpsertManualRepository registers a repository that is not managed by the
+// GitHub App. It is keyed on owner/name because there is no GitHub repo ID to
+// key on, and it never clears an existing installation link: adopting a
+// manually added repository into the App later should not lose its history.
+func (db *DB) UpsertManualRepository(ctx context.Context, repo models.Repository) (models.Repository, error) {
+	const query = `
+		INSERT INTO repositories (owner, name, default_branch, private, clone_url)
+		VALUES ($1, $2, $3, false, $4)
+		ON CONFLICT (owner, name) DO UPDATE
+		SET default_branch = EXCLUDED.default_branch,
+		    clone_url      = EXCLUDED.clone_url,
+		    updated_at     = now()
+		RETURNING ` + repositoryColumns
+
+	var out models.Repository
+	err := db.pool.QueryRow(ctx, query, repo.Owner, repo.Name, repo.DefaultBranch, repo.CloneURL).
+		Scan(repositoryTargets(&out)...)
+	if err != nil {
+		return models.Repository{}, fmt.Errorf("upsert manual repository: %w", err)
+	}
+	return out, nil
+}
+
 // UpsertRepository records a repository, keyed on GitHub's numeric repo ID so
 // that a rename or transfer updates the existing row instead of orphaning it.
 func (db *DB) UpsertRepository(ctx context.Context, repo models.Repository) (models.Repository, error) {
@@ -64,12 +98,12 @@ func (db *DB) UpsertRepository(ctx context.Context, repo models.Repository) (mod
 		    default_branch  = EXCLUDED.default_branch,
 		    private         = EXCLUDED.private,
 		    updated_at      = now()
-		RETURNING id, installation_id, github_repo_id, owner, name, default_branch, private, created_at`
+		RETURNING ` + repositoryColumns
 
 	var out models.Repository
 	err := db.pool.QueryRow(ctx, query,
 		repo.InstallationID, repo.GitHubRepoID, repo.Owner, repo.Name, repo.DefaultBranch, repo.Private,
-	).Scan(&out.ID, &out.InstallationID, &out.GitHubRepoID, &out.Owner, &out.Name, &out.DefaultBranch, &out.Private, &out.CreatedAt)
+	).Scan(repositoryTargets(&out)...)
 	if err != nil {
 		return models.Repository{}, fmt.Errorf("upsert repository: %w", err)
 	}
@@ -77,13 +111,10 @@ func (db *DB) UpsertRepository(ctx context.Context, repo models.Repository) (mod
 }
 
 func (db *DB) GetRepository(ctx context.Context, id int64) (models.Repository, error) {
-	const query = `
-		SELECT id, installation_id, github_repo_id, owner, name, default_branch, private, created_at
-		FROM repositories WHERE id = $1`
+	const query = `SELECT ` + repositoryColumns + ` FROM repositories WHERE id = $1`
 
 	var out models.Repository
-	err := db.pool.QueryRow(ctx, query, id).Scan(
-		&out.ID, &out.InstallationID, &out.GitHubRepoID, &out.Owner, &out.Name, &out.DefaultBranch, &out.Private, &out.CreatedAt)
+	err := db.pool.QueryRow(ctx, query, id).Scan(repositoryTargets(&out)...)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.Repository{}, ErrNotFound
 	}
@@ -94,9 +125,7 @@ func (db *DB) GetRepository(ctx context.Context, id int64) (models.Repository, e
 }
 
 func (db *DB) ListRepositories(ctx context.Context) ([]models.Repository, error) {
-	const query = `
-		SELECT id, installation_id, github_repo_id, owner, name, default_branch, private, created_at
-		FROM repositories ORDER BY owner, name`
+	const query = `SELECT ` + repositoryColumns + ` FROM repositories ORDER BY owner, name`
 
 	rows, err := db.pool.Query(ctx, query)
 	if err != nil {
@@ -107,8 +136,7 @@ func (db *DB) ListRepositories(ctx context.Context) ([]models.Repository, error)
 	repos := make([]models.Repository, 0)
 	for rows.Next() {
 		var repo models.Repository
-		if err := rows.Scan(&repo.ID, &repo.InstallationID, &repo.GitHubRepoID, &repo.Owner, &repo.Name,
-			&repo.DefaultBranch, &repo.Private, &repo.CreatedAt); err != nil {
+		if err := rows.Scan(repositoryTargets(&repo)...); err != nil {
 			return nil, fmt.Errorf("scan repository: %w", err)
 		}
 		repos = append(repos, repo)
@@ -181,15 +209,15 @@ func (db *DB) UpsertPullRequest(ctx context.Context, pr models.PullRequest) (mod
 const scanColumns = `
 	id, repository_id, pull_request_id, base_scan_id, commit_sha, base_commit_sha, trigger, status,
 	COALESCE(sbom_location, ''), COALESCE(sbom_sha256, ''), component_count, risk_score, risk_delta,
-	github_check_run_id, COALESCE(error, ''), started_at, finished_at, created_at`
+	github_check_run_id, COALESCE(error, ''), enriched_at, started_at, finished_at, created_at`
 
 func scanScan(row pgx.Row) (models.Scan, error) {
 	var out models.Scan
 	var baseCommitSHA *string
 	err := row.Scan(&out.ID, &out.RepositoryID, &out.PullRequestID, &out.BaseScanID, &out.CommitSHA,
 		&baseCommitSHA, &out.Trigger, &out.Status, &out.SBOMLocation, &out.SBOMSHA256, &out.ComponentCount,
-		&out.RiskScore, &out.RiskDelta, &out.GitHubCheckRunID, &out.Error, &out.StartedAt, &out.FinishedAt,
-		&out.CreatedAt)
+		&out.RiskScore, &out.RiskDelta, &out.GitHubCheckRunID, &out.Error, &out.EnrichedAt,
+		&out.StartedAt, &out.FinishedAt, &out.CreatedAt)
 	if err != nil {
 		return models.Scan{}, err
 	}
@@ -505,4 +533,130 @@ func nullIfEmpty(value string) any {
 		return nil
 	}
 	return value
+}
+
+// ListPullRequests returns a repository's pull requests, each with the
+// headline numbers from its most recent scan. The lateral join keeps this to
+// one round trip rather than one query per pull request.
+func (db *DB) ListPullRequests(ctx context.Context, repositoryID int64, limit int) ([]models.PullRequestSummary, error) {
+	const query = `
+		SELECT pr.id, pr.repository_id, pr.number, COALESCE(pr.title, ''), COALESCE(pr.author_login, ''),
+		       pr.state, COALESCE(pr.base_ref, ''), pr.base_sha, pr.head_sha,
+		       latest.id, latest.status, latest.risk_delta, latest.component_count,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'added')   AS added,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'updated') AS updated,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'removed') AS removed
+		FROM pull_requests pr
+		LEFT JOIN LATERAL (
+			SELECT id, status, risk_delta, component_count
+			FROM scans
+			WHERE pull_request_id = pr.id
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		) latest ON true
+		LEFT JOIN drift_events d ON d.scan_id = latest.id
+		WHERE pr.repository_id = $1
+		GROUP BY pr.id, pr.repository_id, pr.number, pr.title, pr.author_login, pr.state,
+		         pr.base_ref, pr.base_sha, pr.head_sha,
+		         latest.id, latest.status, latest.risk_delta, latest.component_count
+		ORDER BY pr.number DESC
+		LIMIT $2`
+
+	rows, err := db.pool.Query(ctx, query, repositoryID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list pull requests: %w", err)
+	}
+	defer rows.Close()
+
+	summaries := make([]models.PullRequestSummary, 0)
+	for rows.Next() {
+		var summary models.PullRequestSummary
+		if err := rows.Scan(&summary.ID, &summary.RepositoryID, &summary.Number, &summary.Title,
+			&summary.AuthorLogin, &summary.State, &summary.BaseRef, &summary.BaseSHA, &summary.HeadSHA,
+			&summary.ScanID, &summary.ScanStatus, &summary.RiskDelta, &summary.ComponentCount,
+			&summary.Added, &summary.Updated, &summary.Removed); err != nil {
+			return nil, fmt.Errorf("scan pull request summary: %w", err)
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries, rows.Err()
+}
+
+// GetPullRequest loads one pull request with its latest scan numbers.
+func (db *DB) GetPullRequest(ctx context.Context, id int64) (models.PullRequestSummary, error) {
+	const query = `
+		SELECT pr.id, pr.repository_id, pr.number, COALESCE(pr.title, ''), COALESCE(pr.author_login, ''),
+		       pr.state, COALESCE(pr.base_ref, ''), pr.base_sha, pr.head_sha,
+		       latest.id, latest.status, latest.risk_delta, latest.component_count,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'added')   AS added,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'updated') AS updated,
+		       COUNT(d.id) FILTER (WHERE d.change_type = 'removed') AS removed
+		FROM pull_requests pr
+		LEFT JOIN LATERAL (
+			SELECT id, status, risk_delta, component_count
+			FROM scans
+			WHERE pull_request_id = pr.id
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		) latest ON true
+		LEFT JOIN drift_events d ON d.scan_id = latest.id
+		WHERE pr.id = $1
+		GROUP BY pr.id, pr.repository_id, pr.number, pr.title, pr.author_login, pr.state,
+		         pr.base_ref, pr.base_sha, pr.head_sha,
+		         latest.id, latest.status, latest.risk_delta, latest.component_count`
+
+	var summary models.PullRequestSummary
+	err := db.pool.QueryRow(ctx, query, id).Scan(&summary.ID, &summary.RepositoryID, &summary.Number,
+		&summary.Title, &summary.AuthorLogin, &summary.State, &summary.BaseRef, &summary.BaseSHA,
+		&summary.HeadSHA, &summary.ScanID, &summary.ScanStatus, &summary.RiskDelta,
+		&summary.ComponentCount, &summary.Added, &summary.Updated, &summary.Removed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.PullRequestSummary{}, ErrNotFound
+	}
+	if err != nil {
+		return models.PullRequestSummary{}, fmt.Errorf("get pull request: %w", err)
+	}
+	return summary, nil
+}
+
+// ListVulnerabilities returns the advisories affecting a scan's components,
+// most severe first. It returns an empty slice until Phase 4 populates the
+// table, which is a real answer rather than an error.
+func (db *DB) ListVulnerabilities(ctx context.Context, scanID int64) ([]models.Vulnerability, error) {
+	const query = `
+		SELECT v.id, v.component_id, v.osv_id, v.aliases, COALESCE(v.severity, ''), v.cvss_score,
+		       COALESCE(v.cvss_vector, ''), COALESCE(v.summary, ''), COALESCE(v.fixed_version, ''),
+		       v.published_at, c.purl, c.name, c.version, c.ecosystem
+		FROM vulnerabilities v
+		JOIN components c ON c.id = v.component_id
+		WHERE c.scan_id = $1
+		ORDER BY CASE upper(COALESCE(v.severity, ''))
+		             WHEN 'CRITICAL' THEN 1
+		             WHEN 'HIGH'     THEN 2
+		             WHEN 'MODERATE' THEN 3
+		             WHEN 'MEDIUM'   THEN 3
+		             WHEN 'LOW'      THEN 4
+		             ELSE 5
+		         END,
+		         v.cvss_score DESC NULLS LAST, c.name, v.osv_id`
+
+	rows, err := db.pool.Query(ctx, query, scanID)
+	if err != nil {
+		return nil, fmt.Errorf("list vulnerabilities: %w", err)
+	}
+	defer rows.Close()
+
+	vulnerabilities := make([]models.Vulnerability, 0)
+	for rows.Next() {
+		var vulnerability models.Vulnerability
+		if err := rows.Scan(&vulnerability.ID, &vulnerability.ComponentID, &vulnerability.OSVID,
+			&vulnerability.Aliases, &vulnerability.Severity, &vulnerability.CVSSScore,
+			&vulnerability.CVSSVector, &vulnerability.Summary, &vulnerability.FixedVersion,
+			&vulnerability.PublishedAt, &vulnerability.PURL, &vulnerability.Name,
+			&vulnerability.Version, &vulnerability.Ecosystem); err != nil {
+			return nil, fmt.Errorf("scan vulnerability: %w", err)
+		}
+		vulnerabilities = append(vulnerabilities, vulnerability)
+	}
+	return vulnerabilities, rows.Err()
 }

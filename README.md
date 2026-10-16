@@ -32,22 +32,25 @@ snapshot of current vulnerabilities.
 
 ## Status
 
-Phases 1–3 are implemented and tested: GitHub App integration, SBOM generation and
-archival, and the diff engine.
+Phases 1–3 and 6 are implemented and tested: GitHub App integration, SBOM generation
+and archival, the diff engine, and the Vue dashboard.
 
 | Phase | Scope | State |
 |-------|-------------------------------------------------|-------------|
 | 1 | GitHub App, webhooks, check runs | ✅ Done |
 | 2 | Clone, syft/CycloneDX, blob archival | ✅ Done |
 | 3 | Diff engine, drift history | ✅ Done |
+| 6 | Vue dashboard | ✅ Done |
 | 4 | OSV vulnerability + license + maintenance enrichment | ⬜ Next |
 | 5 | Risk scoring and policy thresholds | ⬜ Planned |
-| 6 | Vue dashboard | ⬜ Planned |
 | 7 | Crypto primitive analysis, contributor analytics | ⬜ Planned |
 
-The schema already carries the `vulnerabilities` table and the `risk_score` /
-`risk_delta` columns that Phases 4–5 fill in, so those phases add code rather than
-migrations.
+The schema already carries the `vulnerabilities` table, the `scans.enriched_at` stamp
+and the `risk_score` / `risk_delta` columns that Phases 4–5 fill in, so those phases add
+code rather than migrations. The dashboard reads those fields today and renders an
+explicit "not analyzed yet" state for them — deliberately distinct from "nothing found",
+because an empty vulnerability table must never be mistaken for a clean bill of
+health.
 
 ---
 
@@ -190,9 +193,12 @@ TEST_DATABASE_URL='postgres://sbomdelta:sbomdelta@localhost:5432/sbomdelta?sslmo
 | `GET` | `/api/repos/{id}` | One repository |
 | `GET` | `/api/repos/{id}/scans` | Scan history |
 | `GET` | `/api/repos/{id}/drift` | Drift timeline for charting |
+| `GET` | `/api/repos/{id}/pulls` | Pull requests with their latest scan numbers |
+| `GET` | `/api/pulls/{id}` | One pull request |
 | `GET` | `/api/scans/{id}` | Scan status and result |
 | `GET` | `/api/scans/{id}/components` | The full component list |
 | `GET` | `/api/scans/{id}/drift` | What changed in this scan |
+| `GET` | `/api/scans/{id}/vulnerabilities` | Advisories, plus whether enrichment has run |
 | `GET` | `/api/scans/{id}/sbom` | Redirect to a presigned SBOM download |
 
 ---
@@ -216,7 +222,52 @@ backend/
 │   ├── storage/         Postgres queries and the SBOM blob store
 │   └── worker/          Worker loop
 └── migrations/          Embedded SQL schema
+
+frontend/
+├── src/
+│   ├── api/             fetch wrapper; one place for error shape and aborts
+│   ├── components/      Chart, tables, stat tiles, empty states
+│   ├── composables/     useAsyncData: abort-safe loading that holds stale data
+│   ├── lib/             Formatting helpers
+│   ├── router/          Routes (views are lazily imported)
+│   ├── views/           Repositories, Repository, Pull requests, PR, Scan
+│   └── style.css        Design tokens, light and dark
+└── vite.config.js       Dev proxy to the Go API
 ```
+
+---
+
+## Dashboard
+
+Vue 3 + Vite + Tailwind, no component library and no charting library.
+
+```bash
+cd frontend
+npm install
+npm run dev      # http://localhost:5173, proxies /api to localhost:8080
+```
+
+Pages: repository list → repository overview (drift timeline, scan history) → scan detail
+(changes, components, vulnerabilities, licenses) and a per-pull-request risk page.
+
+The drift timeline is hand-rolled inline SVG. A few deliberate choices there:
+
+- **No second y-axis.** Component count lives in the hundreds while change counts live in
+  single digits. Plotting both on one chart would need two scales, and the alignment
+  between them would be arbitrary — inventing a correlation that is not in the data.
+  Component count is a stat tile instead.
+- **Three fixed series colors**, validated for colorblind separation, lightness band and
+  chroma against both the light and dark surfaces. Slot 1 is always "added", slot 2
+  "updated", slot 3 "removed", so filtering never repaints the survivors.
+- **A table view beside the chart.** One series hue sits below 3:1 contrast on the light
+  surface, so every value is reachable without relying on color — and without a hover.
+- **Selective labels.** The endpoint column is labeled; the rest are carried by the axis,
+  the legend and the per-column tooltip. A number on every bar goes unread.
+- **Status colors are reserved** for severity and always ship with an icon and a written
+  label, never color alone.
+
+Dark mode is a selected palette rather than an inverted one, and follows the OS by
+default with an explicit override in the header.
 
 ---
 
@@ -261,9 +312,16 @@ errors are redacted before they reach a log line or a check body, and git is run
 
 - **Risk scoring is not implemented.** `risk_score` and `risk_delta` are present in the
   schema and the API but stay null until Phase 5. The drift timeline is currently measured
-  in dependency movement, not risk.
+  in dependency movement, not risk, and the dashboard says so rather than showing a zero.
 - **No vulnerability data yet.** The `vulnerabilities` table exists and is empty; OSV
-  enrichment is Phase 4.
+  enrichment is Phase 4. `scans.enriched_at` is what the API uses to report whether a
+  scan was ever analyzed, so the flag starts telling the truth the moment Phase 4 writes
+  that column.
+- **License policy is reporting only.** The dashboard lists what the SBOM declares and
+  flags copyleft families for review; it does not decide whether a license is permitted.
+- **The dashboard has no authentication.** It reads an API that is itself unauthenticated
+  apart from webhook signature verification. Anything beyond local use needs auth in
+  front of both.
 - **Only the default branch is tracked for pushes.** Feature branches are covered through
   their pull requests.
 - **`git clone` shells out**, so a repository whose dependency manifests need a build step

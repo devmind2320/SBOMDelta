@@ -12,6 +12,6 @@ secrets/
 .idea/
 .vscode/
 
-# Frontend (Phase 6)
+# Frontend build output and dependencies
 node_modules/
 dist/
