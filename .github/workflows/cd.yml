@@ -49,11 +49,10 @@ jobs:
             exit 1
           fi
 
+          touch "$HOME/.ssh/known_hosts"
           if ! ssh-keyscan -T 10 -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null; then
-            echo "Could not retrieve SSH host key; check EC2_HOST and network access"
-            exit 1
+            echo "Could not prefetch SSH host key; proceeding with StrictHostKeyChecking=accept-new"
           fi
-
           chmod 600 "$HOME/.ssh/known_hosts"
           echo "SSH configuration checks passed"
 
@@ -64,5 +63,6 @@ jobs:
         run: |
           ssh -i ~/.ssh/ec2_key \
             -o BatchMode=yes \
+            -o StrictHostKeyChecking=accept-new \
             "$EC2_USER@$EC2_HOST" \
             'printf "SSH connection successful\n"; test -d "$HOME/SBOMDelta-deploy"; printf "Deployment directory exists\n"'
