@@ -37,13 +37,13 @@ and archival, the diff engine, and the Vue dashboard.
 
 | Phase | Scope | State |
 |-------|-------------------------------------------------|-------------|
-| 1 | GitHub App, webhooks, check runs | ✅ Done |
-| 2 | Clone, syft/CycloneDX, blob archival | ✅ Done |
-| 3 | Diff engine, drift history | ✅ Done |
-| 6 | Vue dashboard | ✅ Done |
-| 4 | OSV vulnerability + license + maintenance enrichment | ⬜ Next |
-| 5 | Risk scoring and policy thresholds | ⬜ Planned |
-| 7 | Crypto primitive analysis, contributor analytics | ⬜ Planned |
+| 1 | GitHub App, webhooks, check runs | Done |
+| 2 | Clone, syft/CycloneDX, blob archival | Done |
+| 3 | Diff engine, drift history | Done |
+| 6 | Vue dashboard | Done |
+| 4 | OSV vulnerability + license + maintenance enrichment | Next |
+| 5 | Risk scoring and policy thresholds | Planned |
+| 7 | Crypto primitive analysis, contributor analytics | Planned |
 
 The schema already carries the `vulnerabilities` table, the `scans.enriched_at` stamp
 and the `risk_score` / `risk_delta` columns that Phases 4–5 fill in, so those phases add
