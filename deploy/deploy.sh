@@ -530,8 +530,9 @@ for service in "$SERVER_SERVICE" "$WORKER_SERVICE"; do
 	running_hash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid")"
 	running_version="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.version"}}' "$cid")"
 	wanted_hash="$(compose config --hash "$service" 2>/dev/null | awk '{print $NF}')"
-	[ -n "$wanted_hash" ] && [ "$running_hash" = "$wanted_hash" ] ||
+	if [ -z "$wanted_hash" ] || [ "$running_hash" != "$wanted_hash" ]; then
 		die "'$service' runs a different configuration than the production Compose file resolves to now (Compose $compose_version here, $running_version created it); review before deploying"
+	fi
 done
 log "ok: server and worker run the configuration Compose resolves (Compose $compose_version)"
 
@@ -552,7 +553,9 @@ if [ -z "$GITHUB_APP_KEY_FILE" ]; then
 		die "server has no /run/secrets bind mount; set GITHUB_APP_KEY_FILE to the key's host path"
 	GITHUB_APP_KEY_FILE="$(find "$secrets_dir" -maxdepth 1 -type f -name '*.pem' -size +0 | head -n 1)"
 fi
-[ -n "$GITHUB_APP_KEY_FILE" ] && [ -s "$GITHUB_APP_KEY_FILE" ] || die "GitHub App private key not found"
+if [ -z "$GITHUB_APP_KEY_FILE" ] || [ ! -s "$GITHUB_APP_KEY_FILE" ]; then
+	die "GitHub App private key not found"
+fi
 log "ok: .env and GitHub App key present"
 
 pg_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$PG_CID")"
@@ -582,8 +585,10 @@ log "ok: disk space (database is $((db_bytes / 1048576))M)"
 [ "$(docker inspect --format '{{.State.Status}}' "$NGINX_CONTAINER" 2>/dev/null)" = running ] ||
 	die "$NGINX_CONTAINER is not running"
 read -r web_type web_src <<<"$(mount_source "$NGINX_CONTAINER" "$NGINX_WEB_ROOT")"
-[ "$web_type" = bind ] && [ -d "$FRONTEND_DIST" ] && [ "$(realpath "$web_src")" = "$(realpath "$FRONTEND_DIST")" ] ||
+if [ "$web_type" != bind ] || [ ! -d "$FRONTEND_DIST" ] ||
+	[ "$(realpath "$web_src")" != "$(realpath "$FRONTEND_DIST")" ]; then
 	die "$NGINX_CONTAINER does not serve $FRONTEND_DIST at $NGINX_WEB_ROOT"
+fi
 DIST_OWNER="$(stat -c %U "$FRONTEND_DIST")"
 as_dist_owner() { runuser -u "$DIST_OWNER" -- "$@"; }
 log "ok: $NGINX_CONTAINER serves $FRONTEND_DIST"
