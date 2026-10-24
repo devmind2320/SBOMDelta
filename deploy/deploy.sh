@@ -191,6 +191,25 @@ container_for() {
 	printf '%s\n' "${rows%% *}"
 }
 
+# service_image prints the image Compose would use for one service. Naming a
+# service in `compose config --images` also selects everything it depends on,
+# so the worker's line comes with its dependencies' images. Its own image is
+# what remains after removing the images of every other service. This prints
+# nothing if the service shares its image with another service, or if another
+# service depends on it; the caller requires exactly one line.
+service_image() {
+	local own others=() other_images service
+	own="$(compose config --images "$1" 2>/dev/null)" || return 1
+	while IFS= read -r service; do
+		[ -z "$service" ] || [ "$service" = "$1" ] || others+=("$service")
+	done < <(compose config --services 2>/dev/null)
+	other_images=""
+	if [ "${#others[@]}" -gt 0 ]; then
+		other_images="$(compose config --images "${others[@]}" 2>/dev/null)" || return 1
+	fi
+	comm -23 <(printf '%s\n' "$own" | grep . | sort -u) <(printf '%s\n' "$other_images" | grep . | sort -u)
+}
+
 # resolve_worker sets WORKER_PRESENT, WORKER_CID and WORKER_STATE. No worker
 # container is a valid state; several are not, since guessing which one is
 # production is unsafe.
@@ -545,7 +564,7 @@ if [ "$WORKER_PRESENT" -eq 1 ]; then
 	WORKER_OLD_ID="$(docker inspect --format '{{.Image}}' "$WORKER_CID")"
 	log "ok: '$WORKER_SERVICE' container is $WORKER_STATE"
 else
-	WORKER_REF="$(compose config --images "$WORKER_SERVICE" 2>/dev/null)" ||
+	WORKER_REF="$(service_image "$WORKER_SERVICE")" ||
 		die "could not resolve the '$WORKER_SERVICE' image from the production Compose file"
 	[ "$(printf '%s\n' "$WORKER_REF" | grep -c . || true)" -eq 1 ] ||
 		die "the production Compose file does not resolve to exactly one image for '$WORKER_SERVICE'"

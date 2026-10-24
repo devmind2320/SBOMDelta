@@ -430,6 +430,121 @@ check "strict: two server containers are refused and listed" \
 out="$(lookup "$base"$'\n''r2 sbomdelta-server-run-9f8e exited sbomdelta server True' container_for server)"
 check "strict: a one-off server container is ignored" contains "$out" $'s1\npresent= cid= state= rc=0'
 
+# ------------------------------------------------------- worker image --
+
+# With no worker container, deploy.sh takes the worker's image from the
+# production Compose file. `compose config --images worker` also lists the
+# images of everything the worker depends on (the cause of a failed preflight),
+# so service_image must still find exactly the worker's own image.
+image_function="$(awk '/^service_image\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+check "worker image: deploy.sh defines service_image" grep -q '^service_image() {$' <<<"$image_function"
+
+# image_of <compose-file|-> <service>: runs service_image in a subshell, with
+# compose() pointing at the file, or at the stand-in below for "-".
+image_of() {
+	(
+		# compose() is called by the service_image loaded with eval below.
+		# shellcheck disable=SC2317,SC2329
+		if [ "$1" = - ]; then
+			compose() { fake_compose "$@"; }
+		else
+			compose_file="$1"
+			# shellcheck disable=SC2317,SC2329
+			compose() { docker compose --project-directory "$(dirname "$compose_file")" -f "$compose_file" -p sbomdelta "$@"; }
+		fi
+		eval "$image_function"
+		if out="$(service_image "$2")"; then rc=0; else rc=$?; fi
+		printf 'rc=%s lines=%s image=%s\n' "$rc" "$(printf '%s\n' "$out" | grep -c . || true)" "$(printf '%s' "$out" | tr '\n' ' ')"
+	)
+}
+
+if docker compose version >/dev/null 2>&1; then
+	mkdir -p "$WORK/compose"
+	# compose_case <name> <worker definition> [extra services]: a project shaped
+	# like production -- build-only server and worker, the worker depending on
+	# postgres, minio and server, and nginx depending on server.
+	compose_case() {
+		mkdir -p "$WORK/compose/$1"
+		cat >"$WORK/compose/$1/docker-compose.yml" <<EOF
+services:
+  postgres:
+    image: postgres:16-alpine
+  minio:
+    image: minio/minio:latest
+  server:
+    build: { context: ., target: server }
+    depends_on:
+      postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
+  worker:
+$2
+  nginx:
+    image: nginx:alpine
+    container_name: sbomdelta-nginx
+    depends_on: [server]
+${3:-}
+EOF
+		printf '%s\n' "$WORK/compose/$1/docker-compose.yml"
+	}
+	deps='    depends_on:
+      postgres: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      server: { condition: service_started }'
+
+	f="$(compose_case prod "    build: { context: ., target: worker }
+$deps")"
+	check "worker image: the bare 'config --images worker' lists more than the worker (the original failure)" \
+		[ "$(docker compose --project-directory "$(dirname "$f")" -f "$f" -p sbomdelta config --images worker | grep -c .)" -gt 1 ]
+	check "worker image: a build-only worker with dependencies resolves to sbomdelta-worker" \
+		[ "$(image_of "$f" worker)" = "rc=0 lines=1 image=sbomdelta-worker" ]
+	f="$(compose_case explicit "    image: registry.example/sbomdelta-worker:prod
+    build: { context: ., target: worker }
+$deps")"
+	check "worker image: an explicit image name is used" \
+		[ "$(image_of "$f" worker)" = "rc=0 lines=1 image=registry.example/sbomdelta-worker:prod" ]
+	f="$(compose_case nodeps "    build: { context: ., target: worker }")"
+	check "worker image: a worker with no dependencies resolves" \
+		[ "$(image_of "$f" worker)" = "rc=0 lines=1 image=sbomdelta-worker" ]
+	f="$(compose_case shared "    image: postgres:16-alpine
+$deps")"
+	check "worker image: an image shared with another service resolves to nothing (refused)" \
+		contains "$(image_of "$f" worker)" "lines=0"
+	f="$(compose_case dependent "    build: { context: ., target: worker }
+$deps" "  watcher:
+    image: busybox
+    depends_on: [worker]")"
+	check "worker image: a service depending on the worker leaves nothing (refused, not guessed)" \
+		contains "$(image_of "$f" worker)" "lines=0"
+	f="$(compose_case broken "    build: [this is not valid")"
+	check "worker image: an unparsable Compose file is an error" contains "$(image_of "$f" worker)" "rc=1"
+elif [ "$in_ci" -eq 1 ]; then
+	fail "worker image: docker compose is not available in CI"
+else
+	echo "skip worker image (real Compose): docker compose is not available"
+fi
+
+# Stand-in Compose behaviours. "ignore-names" prints every image whatever is
+# asked, which must not yield a guess; the "fail-*" modes make one of the
+# image queries fail, which must be an error rather than a partial answer.
+# shellcheck disable=SC2317,SC2329
+fake_compose() {
+	case "${FAKE_COMPOSE_MODE:-}:$*" in
+	*:"config --services") printf '%s\n' postgres minio server worker nginx ;;
+	fail-own:"config --images worker") return 1 ;;
+	fail-own:"config --images "*) printf '%s\n' sbomdelta-server postgres:16-alpine minio/minio:latest nginx:alpine ;;
+	fail-others:"config --images worker") printf '%s\n' sbomdelta-server sbomdelta-worker postgres:16-alpine minio/minio:latest ;;
+	fail-others:"config --images "*) return 1 ;;
+	ignore-names:"config --images "*) printf '%s\n' sbomdelta-server sbomdelta-worker nginx:alpine postgres:16-alpine minio/minio:latest ;;
+	*) return 1 ;;
+	esac
+}
+check "worker image: a Compose that ignores service names resolves to nothing (refused)" \
+	contains "$(FAKE_COMPOSE_MODE=ignore-names image_of - worker)" "lines=0"
+check "worker image: a failing query for the worker's images is an error" \
+	contains "$(FAKE_COMPOSE_MODE=fail-own image_of - worker)" "rc=1"
+check "worker image: a failing query for the other services' images is an error" \
+	contains "$(FAKE_COMPOSE_MODE=fail-others image_of - worker)" "rc=1"
+
 # ------------------------------------------------- destructive-command guard --
 
 guard="$ROOT/deploy/tests/check-destructive.sh"

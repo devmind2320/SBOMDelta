@@ -60,7 +60,10 @@ development file, which is exactly why git is kept out of that directory.
   states;
 - the `worker` has **at most one** container, in any state. With none (as in
   production today), preflight says so, takes the worker's image name from
-  the production Compose file, skips the checks that need an existing worker
+  the production Compose file (naming a service in `compose config --images`
+  also lists everything it depends on, so the worker's image is the one left
+  after removing every other service's images; anything other than exactly
+  one image stops the preflight), skips the checks that need an existing worker
   (its current image and configuration hash), and a deployment creates the
   worker. With two or more, preflight fails and lists them;
 - the images the services run are what the Compose file specifies;
@@ -427,7 +430,9 @@ resort, to be decided explicitly, with the server and worker stopped first.
 covers the bootstrap against throwaway git repositories (the lock refuses a
 concurrent deployment without fetching or checking out, a commit off `main`
 or a dirty checkout is refused, and the private copy, `--deploy-dir` and the
-lock reach `deploy.sh`); `deploy.sh`'s container lookups against a stand-in
+lock reach `deploy.sh`); `deploy.sh`'s worker-image resolution against real
+Compose files shaped like production (required in CI) and a Compose that
+ignores service names; its container lookups against a stand-in
 `docker` (worker absent, stopped, running or duplicated, one-off and
 other-project containers ignored, strict single containers for the other
 services, a Docker error never read as "absent"); the result-marker parser,
