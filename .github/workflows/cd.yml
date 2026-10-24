@@ -1,49 +1,308 @@
-
 name: CD
 
+# Deploys a commit on main to the production EC2 host through AWS SSM.
+#
+# Automatic: when CI succeeds for a push to main, the exact commit CI tested is
+# deployed -- but only once the repository variable DEPLOY_AUTOMATIC is "true".
+# Until then automatic runs are skipped, so the first deployment is always a
+# manual, reviewed one.
+#
+# Manual: Actions > CD > Run workflow. "preflight" (the default) checks the
+# host and reports the plan without changing anything; "deploy" deploys, and
+# requires a successful CI run for the commit unless the emergency override is
+# used.
+#
+# See deploy/README.md for the AWS and GitHub configuration this relies on.
+
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preflight checks only, or a full deployment'
+        type: choice
+        options: [preflight, deploy]
+        default: preflight
+      sha:
+        description: 'Commit on main to deploy (default: the tip of main)'
+        required: false
+        default: ''
+      emergency_override:
+        description: 'EMERGENCY ONLY: deploy even though CI has not passed for this commit'
+        type: boolean
+        default: false
+      override_reason:
+        description: 'Required with the emergency override: why CI is being bypassed'
+        required: false
+        default: ''
 
 permissions:
   contents: read
   id-token: write
+  actions: read
+
+# One production deployment at a time; a queued run waits rather than
+# cancelling one that is halfway through a migration. The host keeps its own
+# lock too, because cancelling a run does not stop its SSM command.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::153844980148:role/SBOMDelta-GitHub-Deploy-Role' }}
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID || 'i-0296a251d132fc195' }}
+  DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/home/ec2-user/SBOMDelta-deploy' }}
+  PUBLIC_URL: ${{ vars.PUBLIC_URL || 'https://sbomdelta.website' }}
 
 jobs:
-  verify-deployment-access:
-    name: Verify EC2 access through AWS SSM
+  deploy:
+    name: Deploy to production
     runs-on: ubuntu-latest
+    timeout-minutes: 75
+    # Manual runs must come from main, which is also what the AWS trust policy
+    # accepts. Automatic runs need a successful CI run for a push to main in
+    # this repository, and the opt-in variable.
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_run' &&
+       vars.DEPLOY_AUTOMATIC == 'true' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
 
     steps:
-      - name: Checkout repository
+      - name: Resolve the commit to deploy
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_MODE: ${{ inputs.mode }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_run ]; then
+            sha="$RUN_SHA"; mode=deploy; skip_older=1
+          else
+            sha="${INPUT_SHA:-$DISPATCH_SHA}"; mode="$INPUT_MODE"; skip_older=0
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::'$sha' is not a full commit SHA"; exit 1; }
+          [[ "$mode" =~ ^(preflight|deploy)$ ]] || { echo "::error::unknown mode '$mode'"; exit 1; }
+          [[ "$DEPLOY_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "::error::DEPLOY_DIR is not a plain absolute path"; exit 1; }
+          [[ "$EC2_INSTANCE_ID" =~ ^i-[0-9a-f]+$ ]] || { echo "::error::EC2_INSTANCE_ID is malformed"; exit 1; }
+          {
+            echo "sha=$sha"
+            echo "mode=$mode"
+            echo "skip_older=$skip_older"
+          } >>"$GITHUB_OUTPUT"
+          echo "Target: $sha ($mode)"
+
+      - name: Check out main
         uses: actions/checkout@v4
-
-      - name: Debug GitHub OIDC claims
-        uses: actions/github-script@v7
         with:
-          script: |
-            const token = await core.getIDToken('sts.amazonaws.com');
-            const payload = JSON.parse(
-              Buffer.from(token.split('.')[1], 'base64url').toString()
-            );
-            console.log('OIDC subject:', payload.sub);
-            console.log('OIDC audience:', payload.aud);
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Configure AWS credentials
+      - name: Verify the commit is on main and carries the deploy script
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SHA" origin/main ||
+            { echo "::error::$SHA is not on main"; exit 1; }
+          git cat-file -e "$SHA:deploy/deploy.sh" ||
+            { echo "::error::$SHA has no deploy/deploy.sh"; exit 1; }
+          git show "$SHA:deploy/deploy.sh" | bash -n
+
+      # Automatic runs start only from a successful CI run. A manual deploy
+      # must find one too: the latest completed CI run for a push of this
+      # exact commit to main must have succeeded.
+      - name: Require a successful CI run for the commit
+        id: ci
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.target.outputs.sha }}
+          MODE: ${{ steps.target.outputs.mode }}
+          OVERRIDE_REQUESTED: ${{ inputs.emergency_override }}
+          REASON: ${{ inputs.override_reason }}
+        run: |
+          set -euo pipefail
+          conclusion="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$SHA" -f event=push -f branch=main -f status=completed -f per_page=1 \
+            --jq '.workflow_runs[0].conclusion // "none"')"
+          echo "CI for ${SHA:0:12}: $conclusion"
+          override=0
+          if [ "$conclusion" != success ] && [ "$MODE" = deploy ]; then
+            if [ "$OVERRIDE_REQUESTED" != true ]; then
+              echo "::error::CI has not passed for $SHA (latest completed run: $conclusion). Deploy a commit whose CI passed, or, in an emergency, re-run with emergency_override and a reason."
+              exit 1
+            fi
+            if [ -z "${REASON// /}" ]; then
+              echo "::error::emergency_override requires override_reason"
+              exit 1
+            fi
+            echo "::warning::EMERGENCY OVERRIDE: deploying $SHA although CI is '$conclusion'"
+            override=1
+          elif [ "$conclusion" != success ]; then
+            echo "::warning::CI has not passed for $SHA; a deploy of it would be refused"
+          fi
+          echo "override=$override" >>"$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::153844980148:role/SBOMDelta-GitHub-Deploy-Role
-          aws-region: ap-south-1
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
-
-      - name: Verify EC2 SSM connectivity
+      - name: Run deployment on the instance
+        id: ssm
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+          MODE: ${{ steps.target.outputs.mode }}
+          SKIP_OLDER: ${{ steps.target.outputs.skip_older }}
+          CI_OVERRIDE: ${{ steps.ci.outputs.override || '0' }}
         run: |
-          aws ssm send-command \
-            --region ap-south-1 \
-            --instance-ids i-0296a251d132fc195 \
+          set -euo pipefail
+
+          # The command is deploy/bootstrap.sh (from this checkout of main),
+          # after plain assignments of values validated above. The bootstrap
+          # takes the host lock, checks out the commit, and runs that commit's
+          # deploy/deploy.sh.
+          jq -n --arg dir "$DEPLOY_DIR" --arg sha "$SHA" --arg mode "$MODE" \
+            --arg skip "$SKIP_OLDER" --arg override "$CI_OVERRIDE" \
+            --rawfile bootstrap deploy/bootstrap.sh '{
+            commands: [
+              ("DEPLOY_DIR='\''" + $dir + "'\''"),
+              ("SHA=" + $sha),
+              ("MODE=" + $mode),
+              ("SKIP_OLDER=" + $skip),
+              ("CI_OVERRIDE=" + $override),
+              $bootstrap
+            ],
+            executionTimeout: ["3600"]
+          }' >ssm-params.json
+
+          command_id="$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
             --document-name AWS-RunShellScript \
-            --parameters 'commands=["printf \"SSM connection successful\\n\"; test -d /home/ec2-user/SBOMDelta-deploy && printf \"Deployment directory exists\\n\""]' \
-            --comment "SBOMDelta deployment connectivity check" \
-            --query 'Command.CommandId' \
-            --output text
+            --comment "SBOMDelta $MODE ${SHA:0:12}" \
+            --timeout-seconds 600 \
+            --parameters file://ssm-params.json \
+            --query Command.CommandId --output text)"
+          # A file, not a step output: outputs of a cancelled step are lost.
+          echo "$command_id" >ssm-command-id.txt
+          echo "SSM command: $command_id"
+
+          deadline=$((SECONDS + 3900))
+          status=Pending
+          while :; do
+            sleep 15
+            if ! result="$(aws ssm get-command-invocation \
+                --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" --output json 2>ssm-error.txt)"; then
+              if grep -q InvocationDoesNotExist ssm-error.txt && [ "$SECONDS" -lt 120 ]; then
+                continue
+              fi
+              sed -E -f deploy/redact.sed ssm-error.txt >&2
+              exit 1
+            fi
+            status="$(jq -r .Status <<<"$result")"
+            case "$status" in
+              Pending|InProgress|Delayed|Cancelling) ;;
+              *) break ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::gave up waiting for SSM command $command_id (last status $status)"
+              exit 1
+            fi
+          done
+
+          # deploy.sh never prints environment values; the redaction is a
+          # second line of defence for anything a tool might echo.
+          stdout="$(jq -r .StandardOutputContent <<<"$result")"
+          stderr="$(jq -r .StandardErrorContent <<<"$result")"
+          echo "::group::Instance output"
+          printf '%s\n' "$stdout" | sed -E -f deploy/redact.sed
+          echo "::endgroup::"
+          if [ -n "$stderr" ]; then
+            echo "::group::Instance errors"
+            printf '%s\n' "$stderr" | sed -E -f deploy/redact.sed
+            echo "::endgroup::"
+          fi
+
+          if [ "$status" != Success ]; then
+            echo "::error::deployment command finished with status $status (exit $(jq -r .ResponseCode <<<"$result"))"
+            exit 1
+          fi
+
+          # A successful run must end with a result marker that fits it; a
+          # missing one (for example, truncated output) fails the run.
+          parsed="$(deploy/ssm-result.sh "$MODE" "$SHA" "$SKIP_OLDER" <<<"$stdout")"
+          printf '%s\n' "$parsed" >>"$GITHUB_OUTPUT"
+          printf '%s\n' "$parsed"
+
+      - name: Verify the public site
+        if: steps.target.outputs.mode == 'deploy'
+        env:
+          RESULT: ${{ steps.ssm.outputs.result }}
+          INDEX_SHA: ${{ steps.ssm.outputs.index_sha }}
+        run: |
+          set -euo pipefail
+          # deploy.sh has already checked the site through Nginx on the host,
+          # and rolled back if it failed. This confirms it from outside too.
+          # /healthz is not checked here: Nginx proxies only /api/ and
+          # /webhooks/github to the server.
+          case "$RESULT" in
+            deployed) [[ "$INDEX_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no index checksum for a deployed run"; exit 1; } ;;
+            skipped-older) echo "This commit is older than the deployed one; nothing was published. Checking the API only." ;;
+            *) echo "::error::unexpected result '$RESULT'"; exit 1 ;;
+          esac
+          body="$(mktemp)"
+          for attempt in $(seq 1 10); do
+            repos_status="$(curl -s -o "$body" -w '%{http_code}' --max-time 10 "$PUBLIC_URL/api/repos" || true)"
+            api_ok=0
+            if [ "$repos_status" = 200 ] && grep -q '"repositories"' "$body"; then api_ok=1; fi
+            index_ok=1
+            if [ "$RESULT" = deployed ]; then
+              live="$(curl -fsS --max-time 10 "$PUBLIC_URL/" | sha256sum | cut -d' ' -f1 || true)"
+              [ "$live" = "$INDEX_SHA" ] || index_ok=0
+            fi
+            if [ "$api_ok" = 1 ] && [ "$index_ok" = 1 ]; then
+              echo "Public site healthy: /api/repos answers, index.html matches the published build"
+              exit 0
+            fi
+            echo "attempt $attempt: api/repos=$repos_status api_ok=$api_ok index_match=$index_ok"
+            sleep 6
+          done
+          echo "::error::$PUBLIC_URL did not pass post-deployment checks (the host-side checks passed; investigate DNS, the load path, or caching)"
+          exit 1
+
+      - name: Note a still-running SSM command
+        if: cancelled() && hashFiles('ssm-command-id.txt') != ''
+        run: |
+          echo "::warning::This run was cancelled, but SSM command $(cat ssm-command-id.txt) keeps running on the instance and holds the deployment lock until it finishes. Check its result before starting another deployment."
+
+      - name: Summary
+        if: always()
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+          MODE: ${{ steps.target.outputs.mode }}
+          OUTCOME: ${{ job.status }}
+          RESULT: ${{ steps.ssm.outputs.result }}
+          OVERRIDE: ${{ steps.ci.outputs.override }}
+          REASON: ${{ inputs.override_reason }}
+        run: |
+          {
+            echo "### SBOMDelta ${MODE:-unknown}"
+            echo "- Commit: \`${SHA:-unresolved}\`"
+            echo "- Result: **$OUTCOME**${RESULT:+ ($RESULT)}"
+            if [ "${OVERRIDE:-0}" = 1 ]; then
+              echo "- **Emergency CI override used.** Reason: ${REASON}"
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

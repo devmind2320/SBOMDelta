@@ -18,6 +18,26 @@ jobs:
   backend:
     name: Backend tests and lint
     runs-on: ubuntu-latest
+    # The storage, webhook, reconciliation, migration and API tests need a real
+    # database and skip without one. CD deploys whatever passes here, so they
+    # must run. This throwaway database trusts local connections, so no
+    # credential appears anywhere.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sbomdelta
+          POSTGRES_DB: sbomdelta
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sbomdelta -d sbomdelta"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://sbomdelta@localhost:5432/sbomdelta?sslmode=disable
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,6 +50,21 @@ jobs:
 
       - name: Run tests
         run: make test
+
+      # A missing or unreachable database turns every integration test into a
+      # skip, and a skip passes. Fail loudly instead.
+      - name: Confirm database tests ran
+        working-directory: backend
+        run: |
+          set -o pipefail
+          go test ./... -count=1 -v 2>&1 | tee test-output.txt | grep -E '^(ok|FAIL)'
+          if grep -q -- '--- SKIP' test-output.txt; then
+            grep -- '--- SKIP' test-output.txt
+            echo "::error::database-backed tests were skipped"
+            exit 1
+          fi
+          grep -q -- '--- PASS: TestMigration0004UpgradesExistingDatabase' test-output.txt
+          grep -q -- '--- PASS: TestReconcileAfterNarrowingAccess' test-output.txt
 
       - name: Run lint checks
         run: make lint
@@ -59,3 +94,24 @@ jobs:
 
       - name: Build Vue frontend
         run: npm run build
+
+  deploy-script:
+    name: Deploy script checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: ShellCheck
+        run: shellcheck deploy/deploy.sh deploy/bootstrap.sh deploy/ssm-result.sh deploy/tests/*.sh
+
+      # The bootstrap's lock and checkout handling, the result-marker parser,
+      # output redaction, and the destructive-command guard's own cases.
+      - name: Deployment script tests
+        run: deploy/tests/run-tests.sh
+
+      # The deployment path runs as root against production. Commands that
+      # destroy containers, volumes, data or history must never appear in it
+      # outside a comment.
+      - name: Forbid destructive commands
+        run: deploy/tests/check-destructive.sh
