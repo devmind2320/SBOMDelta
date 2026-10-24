@@ -78,6 +78,15 @@ development file, which is exactly why git is kept out of that directory.
 - `sbomdelta-nginx` serves exactly `/home/ec2-user/SBOMDelta/frontend/dist`,
   publishes port 443 on the host, passes `nginx -t`, and runs the
   configuration that is on disk (see [Nginx](#nginx));
+- `sbomdelta-nginx` still holds **that very directory**, not just the same
+  path: `frontend/dist` and its `index.html` have the same inode numbers on
+  the host as `/usr/share/nginx/html` and its `index.html` inside the
+  container. Docker binds the directory that existed when the container
+  started, so a `frontend/dist` moved, re-created or copied over since then
+  leaves Nginx serving the old directory, and a publish would not reach it.
+  A mismatch, or any failure to read the inodes, stops the preflight; see
+  [Frontend bind mount](#frontend-bind-mount). The script never restarts
+  Nginx;
 - the site already works **through Nginx**: `https://sbomdelta.website/api/repos`
   answers with repositories and `/` is the current `index.html`. The requests
   go to Nginx on this host, so TLS, the server name and the proxying are all
@@ -217,7 +226,8 @@ Its side effects on the host are:
 - short-lived temporary files in `/tmp` hold smoke-test responses, removed
   straight away;
 - read-only requests: `GET /api/repos` and `GET /` through Nginx, `GET
-  /healthz` on the server, read-only database queries, and `nginx -t`.
+  /healthz` on the server, read-only database queries, `nginx -t`, and
+  `stat` of the web root inside the Nginx container.
 
 It does **not** create or change `/home/ec2-user/deployment-backups`. A
 deploy creates that directory (mode 700) and its `logs/` only if they are
@@ -346,6 +356,7 @@ only on the instance:
 |---|---|---|
 | The server answers at `http://127.0.0.1:8080/healthz` | The repository's development Compose file publishes `8080:8080`; the production file must too | Publish the port, or set `HEALTH_URL` |
 | `sbomdelta-nginx` publishes 443/tcp on an IPv4 host address | The smoke tests reach Nginx on the host | Check the Nginx container's ports |
+| `sbomdelta-nginx` holds the current `frontend/dist` (same directory and `index.html` inodes inside and outside the container) | A publish must reach what Nginx serves | Reattach the mount ([Frontend bind mount](#frontend-bind-mount)) |
 | `https://sbomdelta.website` through local Nginx serves `/api/repos` and `frontend/dist/index.html` | The baseline for the post-deploy smoke tests | Fix the live site first |
 | No Nginx `*.conf` changed since Nginx last loaded it | A reload must not apply unreviewed edits | Apply or revert the edit, then rerun |
 | Containers were created from exactly `docker-compose.yml`, with no override file present | Deployments use exactly that file | Merge or remove the override |
@@ -424,13 +435,52 @@ resort, to be decided explicitly, with the server and worker stopped first.
 `/home/ec2-user/SBOMDelta` would rebuild the images from that directory's own
 (older) source. Deploy through the workflow instead.
 
+### Frontend bind mount
+
+If preflight says the Nginx bind mount may reference a replaced copy of
+`frontend/dist`, or a deployment failed with "sbomdelta-nginx does not see
+the published index.html", Nginx is serving a directory that is no longer at
+that path. Deployments write into the directory at the path, so they cannot
+reach what visitors see. Reattaching means restarting the Nginx container,
+which binds the path again. That is a short outage, so it is a deliberate
+step: the deployment scripts never do it.
+
+1. Confirm it, read-only, and compare what each side holds:
+   ```bash
+   pid=$(sudo docker inspect -f '{{.State.Pid}}' sbomdelta-nginx)
+   sudo grep ' /usr/share/nginx/html ' /proc/$pid/mountinfo    # "//deleted": the old directory was removed
+   stat -c '%i %n' /home/ec2-user/SBOMDelta/frontend/dist /home/ec2-user/SBOMDelta/frontend/dist/index.html
+   sudo docker exec sbomdelta-nginx stat -c '%i %n' /usr/share/nginx/html /usr/share/nginx/html/index.html
+   sha256sum /home/ec2-user/SBOMDelta/frontend/dist/index.html
+   sudo docker exec sbomdelta-nginx sha256sum /usr/share/nginx/html/index.html
+   ```
+2. After the restart, visitors get what is in
+   `/home/ec2-user/SBOMDelta/frontend/dist` on the host. If the two checksums
+   differ, decide which content should be live before going on.
+3. Check the configuration, then restart the container (a restart keeps its
+   configuration and certificates; do not recreate or remove it):
+   ```bash
+   sudo docker exec sbomdelta-nginx nginx -t
+   sudo docker restart sbomdelta-nginx
+   ```
+4. Check that the two `stat` commands from step 1 now print the same inode
+   numbers, that the site answers, and then run the preflight again.
+
+Find out what replaced the directory, and stop it: build or copy *into*
+`frontend/dist`; never move, delete or re-create the directory itself.
+
 ## Tests
 
 `deploy/tests/run-tests.sh` runs in CI (and locally on Linux or macOS). It
 covers the bootstrap against throwaway git repositories (the lock refuses a
 concurrent deployment without fetching or checking out, a commit off `main`
 or a dirty checkout is refused, and the private copy, `--deploy-dir` and the
-lock reach `deploy.sh`); `deploy.sh`'s worker-image resolution against real
+lock reach `deploy.sh`); the Nginx bind-mount identity check against real directories
+(matching, a replaced directory with identical content, a different
+`index.html`, a failing `docker exec` or `stat`); `deploy.sh`'s own backup,
+publish and restore commands on a scratch frontend (same directory inode
+throughout, `.well-known/` and other files kept, only stale assets pruned);
+`deploy.sh`'s worker-image resolution against real
 Compose files shaped like production (required in CI) and a Compose that
 ignores service names; its container lookups against a stand-in
 `docker` (worker absent, stopped, running or duplicated, one-off and

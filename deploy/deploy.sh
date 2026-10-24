@@ -239,6 +239,33 @@ mount_source() {
 		'{{range .Mounts}}{{if eq .Destination "'"$2"'"}}{{.Type}} {{if .Name}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}' "$1"
 }
 
+# dist_mount_matches checks that Nginx's web root is the very directory this
+# script updates, not merely the same path. Docker binds the directory that
+# existed when the container started; if frontend/dist was replaced since
+# (moved aside, re-created, copied over), Nginx keeps serving the old one and
+# a publish lands where it cannot see it. The directory and index.html must
+# have the same inode numbers on the host and inside the container. Read-only;
+# any failure to read them counts as a mismatch.
+dist_mount_matches() {
+	local host_dir host_index nginx_dir nginx_index
+	host_dir="$(stat -c %i "$FRONTEND_DIST" 2>/dev/null)" || host_dir=""
+	host_index="$(stat -c %i "$FRONTEND_DIST/index.html" 2>/dev/null)" || host_index=""
+	nginx_dir="$(docker exec "$NGINX_CONTAINER" stat -c %i "$NGINX_WEB_ROOT" 2>/dev/null)" || nginx_dir=""
+	nginx_index="$(docker exec "$NGINX_CONTAINER" stat -c %i "$NGINX_WEB_ROOT/index.html" 2>/dev/null)" || nginx_index=""
+	if ! [[ "$host_dir" =~ ^[0-9]+$ && "$host_index" =~ ^[0-9]+$ && "$nginx_dir" =~ ^[0-9]+$ && "$nginx_index" =~ ^[0-9]+$ ]]; then
+		log "ERROR: could not read the inodes of $FRONTEND_DIST and $NGINX_CONTAINER:$NGINX_WEB_ROOT (and their index.html)" >&2
+		return 1
+	fi
+	if [ "$host_dir" != "$nginx_dir" ]; then
+		log "ERROR: $FRONTEND_DIST is inode $host_dir on the host, but $NGINX_CONTAINER sees inode $nginx_dir at $NGINX_WEB_ROOT" >&2
+		return 1
+	fi
+	if [ "$host_index" != "$nginx_index" ]; then
+		log "ERROR: $FRONTEND_DIST/index.html is inode $host_index on the host, but $NGINX_CONTAINER sees inode $nginx_index" >&2
+		return 1
+	fi
+}
+
 # psql_ro runs one read-only query in the Postgres container. The connection
 # settings are the container's own and are expanded inside it, never here.
 psql_ro() {
@@ -672,9 +699,12 @@ if [ "$web_type" != bind ] || [ ! -d "$FRONTEND_DIST" ] ||
 	[ "$(realpath "$web_src")" != "$(realpath "$FRONTEND_DIST")" ]; then
 	die "$NGINX_CONTAINER does not serve $FRONTEND_DIST at $NGINX_WEB_ROOT"
 fi
+# Same path is not enough: the bind mount must still hold this very directory.
+dist_mount_matches ||
+	die "$NGINX_CONTAINER's bind mount may reference a replaced copy of $FRONTEND_DIST, so a publish would not reach it. Reattach the mount before deploying (deploy/README.md, \"Frontend bind mount\"); this script does not restart Nginx. Nothing was changed."
 DIST_OWNER="$(stat -c %U "$FRONTEND_DIST")"
 as_dist_owner() { runuser -u "$DIST_OWNER" -- "$@"; }
-log "ok: $NGINX_CONTAINER serves $FRONTEND_DIST"
+log "ok: $NGINX_CONTAINER serves $FRONTEND_DIST (same directory and index.html inodes inside the container)"
 
 # The smoke tests reach Nginx on its published HTTPS port, on this host.
 https_binding="$(docker port "$NGINX_CONTAINER" 443/tcp 2>/dev/null | grep -E '^[0-9.]+:[0-9]+$' | head -n 1 || true)"

@@ -25,6 +25,9 @@ check() { # check <name> <command...>
 	if "$@"; then pass "$name"; else fail "$name"; fi
 }
 contains() { grep -qF -- "$2" <<<"$1"; }
+# exit_code_is <output> <N>: the output reports exactly "rc=N", so a failure
+# such as rc=127 (command not found) cannot pass for rc=1.
+exit_code_is() { grep -qE "(^|[[:space:]])rc=$2([[:space:]]|\$)" <<<"$1"; }
 
 export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
 export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
@@ -343,6 +346,20 @@ mkdir -p "$WORK/fakebin"
 cat >"$WORK/fakebin/docker" <<'EOF'
 #!/usr/bin/env bash
 [ "${FAKE_DOCKER_FAIL:-0}" = 1 ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+# exec <container> stat -c %i <path>: the container's web root is whichever
+# host directory FAKE_NGINX_DIR names, as a bind mount would make it.
+if [ "$1" = exec ]; then
+	[ "${FAKE_EXEC_FAIL:-0}" = 1 ] && { echo "OCI runtime exec failed" >&2; exit 126; }
+	shift 2
+	[ "$1 $2 $3" = "stat -c %i" ] || { echo "fake docker: unexpected exec $*" >&2; exit 2; }
+	case "$4" in
+	"$FAKE_WEB_ROOT") target="$FAKE_NGINX_DIR" ;;
+	"$FAKE_WEB_ROOT/index.html") target="${FAKE_NGINX_INDEX:-$FAKE_NGINX_DIR/index.html}" ;;
+	*) echo "fake docker: unexpected path $4" >&2; exit 2 ;;
+	esac
+	[ "${FAKE_EXEC_GARBAGE:-0}" = 1 ] && { echo "sh: stat: not found"; exit 0; }
+	exec stat -c %i "$target"
+fi
 [ "$1" = ps ] || { echo "fake docker: unexpected command $*" >&2; exit 2; }
 project="" service="" oneoff=""
 while [ $# -gt 0 ]; do
@@ -374,6 +391,8 @@ lookup() {
 	printf '%s\n' "$1" >"$WORK/rows"
 	shift
 	(
+		# The stand-ins apply to this subshell only, on purpose.
+		# shellcheck disable=SC2030
 		PATH="$WORK/fakebin:$PATH"
 		export FAKE_DOCKER_ROWS="$WORK/rows"
 		# Read by the functions loaded with eval below.
@@ -404,7 +423,7 @@ out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 running sbomdelta worker False'
 check "worker running: found, with its state" contains "$out" "present=1 cid=w1 state=running rc=0"
 
 out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 running sbomdelta worker False'$'\n''w2 abc123_sbomdelta-worker-1 exited sbomdelta worker False' resolve_worker)"
-check "worker multiple: refused" contains "$out" "rc=1"
+check "worker multiple: refused" exit_code_is "$out" 1
 check "worker multiple: names every container and its state" \
 	contains "$out" "found 2: sbomdelta-worker-1 (running), abc123_sbomdelta-worker-1 (exited)"
 
@@ -416,7 +435,7 @@ out="$(lookup "$base"$'\n''x1 other-worker-1 running otherproject worker False' 
 check "worker: another project's worker is ignored" contains "$out" "present=0 cid= state=absent rc=0"
 
 out="$(FAKE_DOCKER_FAIL=1 lookup "$base" resolve_worker)"
-check "worker: a Docker failure is an error, not 'absent'" contains "$out" "rc=1"
+check "worker: a Docker failure is an error, not 'absent'" exit_code_is "$out" 1
 
 out="$(lookup "$base" container_for server)"
 check "strict: one server container is returned" contains "$out" $'s1\npresent= cid= state= rc=0'
@@ -429,6 +448,163 @@ check "strict: two server containers are refused and listed" \
 	contains "$out" "found 2: sbomdelta-server-1 (running), abc123_sbomdelta-server-1 (exited)"
 out="$(lookup "$base"$'\n''r2 sbomdelta-server-run-9f8e exited sbomdelta server True' container_for server)"
 check "strict: a one-off server container is ignored" contains "$out" $'s1\npresent= cid= state= rc=0'
+
+# ------------------------------------------------- frontend bind mount --
+
+# Docker binds the directory that existed when Nginx started. If frontend/dist
+# is replaced afterwards, the path still matches but Nginx serves the old
+# directory, and a publish never reaches it (a failed deployment). Preflight
+# must compare inodes, not paths. These run deploy.sh's dist_mount_matches
+# against real directories, with the stand-in docker playing the container.
+identity_function="$(awk '/^dist_mount_matches\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+check "bind mount: deploy.sh defines dist_mount_matches" grep -q '^dist_mount_matches() {$' <<<"$identity_function"
+check "bind mount: preflight stops on a mismatch, asking for the mount to be reattached" \
+	grep -qE '^dist_mount_matches \|\|$' "$ROOT/deploy/deploy.sh"
+check "bind mount: the preflight message explains what to do and that Nginx is not restarted" \
+	grep -qF "may reference a replaced copy of \$FRONTEND_DIST, so a publish would not reach it. Reattach the mount before deploying" "$ROOT/deploy/deploy.sh"
+
+# GNU stat takes -c %i; BSD (macOS) stat takes -f %i.
+if ! stat -c %i / >/dev/null 2>&1; then
+	mkdir -p "$WORK/fakestat"
+	printf '#!/bin/sh\nif [ "$1" = -c ] && [ "$2" = %%i ]; then exec /usr/bin/stat -f %%i "$3"; fi\nexec /usr/bin/stat "$@"\n' >"$WORK/fakestat/stat"
+	chmod +x "$WORK/fakestat/stat"
+fi
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
+
+# identity <host dist> <dir the container sees>: runs dist_mount_matches;
+# prints "rc=N" and its messages.
+identity() {
+	(
+		# shellcheck disable=SC2030,SC2031
+		PATH="$WORK/fakebin:$PATH"
+		if [ -d "$WORK/fakestat" ]; then PATH="$WORK/fakestat:$PATH"; fi
+		# Read by the function loaded with eval below.
+		# shellcheck disable=SC2034
+		FRONTEND_DIST="$1" NGINX_CONTAINER=sbomdelta-nginx NGINX_WEB_ROOT=/usr/share/nginx/html
+		export FAKE_WEB_ROOT=/usr/share/nginx/html FAKE_NGINX_DIR="$2"
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		eval "$identity_function"
+		if dist_mount_matches 2>"$WORK/identity.err"; then rc=0; else rc=$?; fi
+		echo "rc=$rc"
+		cat "$WORK/identity.err"
+	)
+}
+
+mkdir -p "$WORK/mount/dist"
+echo old-build >"$WORK/mount/dist/index.html"
+echo other >"$WORK/mount/other-index.html"
+out="$(identity "$WORK/mount/dist" "$WORK/mount/dist")"
+check "bind mount: matching directory and index.html pass" [ "$out" = "rc=0" ]
+out="$(FAKE_NGINX_INDEX="$WORK/mount/other-index.html" identity "$WORK/mount/dist" "$WORK/mount/dist")"
+check "bind mount: a different index.html inode fails" exit_code_is "$out" 1
+check "bind mount: ... and names both index.html inodes" \
+	contains "$out" "index.html is inode $(inode_of "$WORK/mount/dist/index.html") on the host, but sbomdelta-nginx sees inode $(inode_of "$WORK/mount/other-index.html")"
+out="$(FAKE_EXEC_FAIL=1 identity "$WORK/mount/dist" "$WORK/mount/dist")"
+check "bind mount: a failing docker exec fails" exit_code_is "$out" 1
+check "bind mount: ... saying the inodes could not be read" contains "$out" "could not read the inodes"
+out="$(FAKE_EXEC_GARBAGE=1 identity "$WORK/mount/dist" "$WORK/mount/dist")"
+check "bind mount: non-numeric output from the container (no stat) fails" exit_code_is "$out" 1
+out="$(identity "$WORK/mount/missing" "$WORK/mount/dist")"
+check "bind mount: a failing host-side stat fails" contains "$out" "could not read the inodes"
+
+# A replaced directory whose index.html is a hard link to the original file:
+# only the directory inodes differ, so this isolates that comparison.
+mkdir -p "$WORK/mount/linked"
+ln "$WORK/mount/dist/index.html" "$WORK/mount/linked/index.html"
+out="$(identity "$WORK/mount/linked" "$WORK/mount/dist")"
+check "bind mount: a different directory inode fails even when index.html is the same file" \
+	exit_code_is "$out" 1
+check "bind mount: ... reporting the directory, not index.html" \
+	sh -c 'printf "%s\n" "$1" | grep -q "/linked is inode" && ! printf "%s\n" "$1" | grep -q "index.html is inode"' _ "$out"
+
+# The incident: the container holds the original directory, then the host's
+# frontend/dist is replaced by a copy with the same content.
+mv "$WORK/mount/dist" "$WORK/mount/dist.original"
+mkdir "$WORK/mount/dist"
+cp "$WORK/mount/dist.original/index.html" "$WORK/mount/dist/index.html"
+out="$(identity "$WORK/mount/dist" "$WORK/mount/dist.original")"
+check "bind mount: a replaced directory with identical content fails" exit_code_is "$out" 1
+check "bind mount: ... and names both directory inodes" \
+	contains "$out" "is inode $(inode_of "$WORK/mount/dist") on the host, but sbomdelta-nginx sees inode $(inode_of "$WORK/mount/dist.original") at /usr/share/nginx/html"
+
+# ------------------------------------------------ frontend publish in place --
+
+# deploy.sh's own backup, publish and restore commands, run on a scratch
+# directory: they must update frontend/dist in place (its inode is what the
+# Nginx bind mount holds), keep .well-known/ and other files, and prune only
+# stale files under assets/.
+publish_block="$(awk '
+	/^FRONTEND_TOUCHED=1$/ { on = 1 }
+	on { print }
+	on && /^fi$/ { exit }
+' "$ROOT/deploy/deploy.sh")"
+backup_cmd="$(grep -m 1 -xF 'tar -C "$FRONTEND_DIST" -czf "$FRONTEND_BACKUP" .' "$ROOT/deploy/deploy.sh" || true)"
+check "publish: deploy.sh's publish commands were found" \
+	sh -c 'printf "%s\n" "$1" | grep -qF "mv -f \"\$FRONTEND_DIST/.index.html.new\" \"\$FRONTEND_DIST/index.html\"" &&
+		printf "%s\n" "$1" | grep -qF "comm -23"' _ "$publish_block"
+check "publish: deploy.sh's backup command was found" [ -n "$backup_cmd" ]
+
+# publish_case <name> <with new assets/ 0|1>: builds an old and a new frontend,
+# then runs backup, publish and (if it is the expected command) restore,
+# printing the state after each.
+publish_case() {
+	local pub="$WORK/publish-$1"
+	mkdir -p "$pub/dist/assets" "$pub/dist/.well-known/acme-challenge" "$pub/new"
+	echo old >"$pub/dist/index.html"
+	echo old >"$pub/dist/assets/old-1a2b.js"
+	echo shared >"$pub/dist/assets/shared-9f8e.css"
+	echo token >"$pub/dist/.well-known/acme-challenge/t"
+	echo robots >"$pub/dist/robots.txt"
+	echo new >"$pub/new/index.html"
+	if [ "$2" = 1 ]; then
+		mkdir -p "$pub/new/assets"
+		echo new >"$pub/new/assets/new-3c4d.js"
+		echo shared >"$pub/new/assets/shared-9f8e.css"
+	fi
+	(
+		# Read by the commands loaded with eval below.
+		# shellcheck disable=SC2034
+		FRONTEND_DIST="$pub/dist" NEW_DIST="$pub/new" FRONTEND_BACKUP="$pub/backup.tar.gz"
+		# Called by the commands loaded with eval below.
+		# shellcheck disable=SC2317,SC2329
+		as_dist_owner() { "$@"; }
+		# shellcheck disable=SC2317,SC2329
+		die() { echo "die: $*"; exit 1; }
+		state() {
+			printf '%s: dir=%s index=%s old=%s new=%s shared=%s well-known=%s robots=%s\n' "$1" \
+				"$([ "$(inode_of "$FRONTEND_DIST")" = "$dir_inode" ] && echo same || echo REPLACED)" \
+				"$(cat "$FRONTEND_DIST/index.html")" \
+				"$([ -e "$FRONTEND_DIST/assets/old-1a2b.js" ] && echo yes || echo no)" \
+				"$([ -e "$FRONTEND_DIST/assets/new-3c4d.js" ] && echo yes || echo no)" \
+				"$([ -e "$FRONTEND_DIST/assets/shared-9f8e.css" ] && echo yes || echo no)" \
+				"$([ -e "$FRONTEND_DIST/.well-known/acme-challenge/t" ] && echo yes || echo no)" \
+				"$([ -e "$FRONTEND_DIST/robots.txt" ] && echo yes || echo no)"
+		}
+		dir_inode="$(inode_of "$FRONTEND_DIST")"
+		eval "$backup_cmd"
+		eval "$publish_block"
+		state published
+		if [ "$restore_cmd" = "$expected_restore" ]; then
+			eval "$restore_cmd"
+			state restored
+		fi
+	) 2>&1
+}
+
+out="$(publish_case assets 1)"
+published="$(grep '^published:' <<<"$out" || true)"
+restored="$(grep '^restored:' <<<"$out" || true)"
+check "publish: frontend/dist is updated in place, with the new index.html" \
+	contains "$published" "published: dir=same index=new"
+check "publish: stale assets are pruned, current ones kept" contains "$published" "old=no new=yes shared=yes"
+check "publish: .well-known/ and files outside assets/ are kept" contains "$published" "well-known=yes robots=yes"
+check "restore: frontend/dist stays the same directory, with the old index.html and assets back" \
+	contains "$restored" "restored: dir=same index=old old=yes"
+check "restore: .well-known/ and files outside assets/ are kept" contains "$restored" "well-known=yes robots=yes"
+out="$(publish_case noassets 0)"
+check "publish: with no assets/ in the new build, nothing under assets/ is pruned" \
+	[ "$(grep '^published:' <<<"$out" || true)" = "published: dir=same index=new old=yes new=no shared=yes well-known=yes robots=yes" ]
 
 # ------------------------------------------------------- worker image --
 
@@ -516,7 +692,7 @@ $deps" "  watcher:
 	check "worker image: a service depending on the worker leaves nothing (refused, not guessed)" \
 		contains "$(image_of "$f" worker)" "lines=0"
 	f="$(compose_case broken "    build: [this is not valid")"
-	check "worker image: an unparsable Compose file is an error" contains "$(image_of "$f" worker)" "rc=1"
+	check "worker image: an unparsable Compose file is an error" exit_code_is "$(image_of "$f" worker)" 1
 elif [ "$in_ci" -eq 1 ]; then
 	fail "worker image: docker compose is not available in CI"
 else
@@ -541,9 +717,9 @@ fake_compose() {
 check "worker image: a Compose that ignores service names resolves to nothing (refused)" \
 	contains "$(FAKE_COMPOSE_MODE=ignore-names image_of - worker)" "lines=0"
 check "worker image: a failing query for the worker's images is an error" \
-	contains "$(FAKE_COMPOSE_MODE=fail-own image_of - worker)" "rc=1"
+	exit_code_is "$(FAKE_COMPOSE_MODE=fail-own image_of - worker)" 1
 check "worker image: a failing query for the other services' images is an error" \
-	contains "$(FAKE_COMPOSE_MODE=fail-others image_of - worker)" "rc=1"
+	exit_code_is "$(FAKE_COMPOSE_MODE=fail-others image_of - worker)" 1
 
 # ------------------------------------------------- destructive-command guard --
 
