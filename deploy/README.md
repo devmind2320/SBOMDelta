@@ -51,8 +51,19 @@ development file, which is exactly why git is kept out of that directory.
 - the Compose **project name is read from the running containers' labels**,
   and every container was created from **exactly** the production Compose
   file: no extra `-f` files and no override;
-- the `server`, `worker` and `postgres` services exist, and the images they
-  run are what the Compose file specifies;
+- the `server`, `worker`, `postgres`, `minio` and `nginx` services exist in
+  the production Compose file;
+- `server`, `postgres`, `minio` and `nginx` each have **exactly one**
+  container (one-off `docker compose run` containers are ignored), MinIO is
+  running, and `sbomdelta-nginx` is the `nginx` service's container. Two
+  containers for a service fail the preflight, listing their names and
+  states;
+- the `worker` has **at most one** container, in any state. With none (as in
+  production today), preflight says so, takes the worker's image name from
+  the production Compose file, skips the checks that need an existing worker
+  (its current image and configuration hash), and a deployment creates the
+  worker. With two or more, preflight fails and lists them;
+- the images the services run are what the Compose file specifies;
 - recreating `server` would not restart other services (no
   `depends_on: {server: {restart: true}}` outside the worker);
 - the server and worker run the configuration Compose resolves now (their
@@ -91,8 +102,9 @@ Compose file and project. It applies migrations on start. The script waits for
 database it just backed up, points Nginx at the new container if its address
 changed, and then requires `/api/repos` to answer **through Nginx**.
 
-**Worker.** Recreated only after that, and required to run steadily without
-restarting.
+**Worker.** Created, or recreated and started, only after that, and required
+to run steadily without restarting. A worker that was stopped before the
+deployment is started by it.
 
 **Frontend.** Published into the bind-mounted `frontend/dist` **in place**:
 assets first, `index.html` last, then stale files under `assets/` pruned. The
@@ -108,7 +120,11 @@ marker.
 If anything fails after the switchover, **including a failed smoke test
 through Nginx**, the previous server and worker images and the previous
 frontend are restored automatically, Nginx is pointed back at the restored
-server if needed, and the site is checked through Nginx again. **Migrations
+server if needed, and the site is checked through Nginx again. A previous
+worker comes back in the state it was in (running, or created but not
+started). A worker that **did not exist** before the deployment has nothing to
+go back to, and the script never stops or removes containers, so it is left
+running the new image; see [Rollback](#rollback). **Migrations
 are never rolled back.** They are additive, so the previous release runs on
 the new schema; the pre-deploy database dump is there if a migration itself
 is the problem.
@@ -350,7 +366,7 @@ df -h /home/ec2-user "$(docker info --format '{{.DockerRootDir}}')"
 production: `PROD_DIR`, `PROD_COMPOSE_FILE`, `DEPLOY_DIR` (or `--deploy-dir`),
 `BACKUP_DIR`, `DEPLOY_LOCK_FILE`, `FRONTEND_DIST`, `NGINX_CONTAINER`,
 `NGINX_WEB_ROOT`, `PUBLIC_HOST`, `SERVER_SERVICE`, `WORKER_SERVICE`,
-`POSTGRES_SERVICE`, `HEALTH_URL`, `GITHUB_APP_KEY_FILE`, `MIN_FREE_GB`,
+`POSTGRES_SERVICE`, `MINIO_SERVICE`, `NGINX_SERVICE`, `HEALTH_URL`, `GITHUB_APP_KEY_FILE`, `MIN_FREE_GB`,
 `NODE_IMAGE`, `KEEP_BACKUPS` (default 10), `HEALTH_TIMEOUT`,
 `DEPLOY_TIME_LIMIT`, `SWITCHOVER_RESERVE`.
 
@@ -385,6 +401,18 @@ docker compose --project-directory . -f docker-compose.yml -p "$P" up -d --no-de
 tar -C frontend/dist -xzf /home/ec2-user/deployment-backups/frontend-dist-<timestamp>.tar.gz
 ```
 
+**A worker that did not exist before.** If a deployment created the worker
+and then failed, the new worker is left running the new image, which works
+with the restored server (migrations are additive). If it must not run, stop
+it (this keeps the container; it does not remove it):
+
+```bash
+cd /home/ec2-user/SBOMDelta
+P=$(docker ps --filter "label=com.docker.compose.project.working_dir=$PWD" \
+      --format '{{.Label "com.docker.compose.project"}}' | sort -u)
+docker compose --project-directory . -f docker-compose.yml -p "$P" stop worker
+```
+
 **Database.** Migrations stay applied; the previous release works with them.
 Restoring a dump with `pg_restore` **replaces current data**. It is a last
 resort, to be decided explicitly, with the server and worker stopped first.
@@ -399,7 +427,11 @@ resort, to be decided explicitly, with the server and worker stopped first.
 covers the bootstrap against throwaway git repositories (the lock refuses a
 concurrent deployment without fetching or checking out, a commit off `main`
 or a dirty checkout is refused, and the private copy, `--deploy-dir` and the
-lock reach `deploy.sh`); the result-marker parser, including truncated output;
+lock reach `deploy.sh`); `deploy.sh`'s container lookups against a stand-in
+`docker` (worker absent, stopped, running or duplicated, one-off and
+other-project containers ignored, strict single containers for the other
+services, a Docker error never read as "absent"); the result-marker parser,
+including truncated output;
 redaction; and the destructive-command guard's own cases.
 `deploy/tests/check-destructive.sh` checks the deployment path itself.
 `deploy.sh` needs root and Docker, so beyond ShellCheck it is exercised by its

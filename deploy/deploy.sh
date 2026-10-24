@@ -55,6 +55,8 @@ PUBLIC_HOST="${PUBLIC_HOST:-sbomdelta.website}"
 SERVER_SERVICE="${SERVER_SERVICE:-server}"
 WORKER_SERVICE="${WORKER_SERVICE:-worker}"
 POSTGRES_SERVICE="${POSTGRES_SERVICE:-postgres}"
+MINIO_SERVICE="${MINIO_SERVICE:-minio}"
+NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/healthz}"
 GITHUB_APP_KEY_FILE="${GITHUB_APP_KEY_FILE:-}"
 MIN_FREE_GB="${MIN_FREE_GB:-5}"
@@ -76,6 +78,10 @@ CI_OVERRIDE=0
 PROJECT=""
 SERVER_SWITCHED=0
 WORKER_SWITCHED=0
+# The worker, unlike the other services, may have no container: production can
+# run without one, and a deployment then creates it.
+WORKER_PRESENT=0
+WORKER_STATE=""
 FRONTEND_TOUCHED=0
 FRONTEND_BACKUP=""
 DB_BACKUP=""
@@ -156,21 +162,50 @@ compose() {
 	docker compose --project-directory "$PROD_DIR" -f "$PROD_COMPOSE_FILE" -p "$PROJECT" "$@"
 }
 
-# container_for prints the single container ID of a production service. It
-# reports on stderr, because it is called inside command substitutions.
-container_for() {
-	local ids
-	# One-off `docker compose run` containers carry the service label too.
-	ids="$(docker ps -a --no-trunc \
+# service_containers prints "ID NAME STATE" for each container of a production
+# service, in any state. One-off `docker compose run` containers carry the
+# service label too, and are left out.
+service_containers() {
+	docker ps -a --no-trunc \
 		--filter "label=com.docker.compose.project=$PROJECT" \
 		--filter "label=com.docker.compose.service=$1" \
 		--filter "label=com.docker.compose.oneoff=False" \
-		--format '{{.ID}}')"
-	if [ "$(printf '%s\n' "$ids" | grep -c .)" -ne 1 ]; then
-		log "ERROR: expected exactly one container for service '$1' in project '$PROJECT'" >&2
+		--format '{{.ID}} {{.Names}} {{.State}}'
+}
+
+# describe_containers turns service_containers lines into "name (state), ...".
+describe_containers() {
+	awk '{ printf "%s%s (%s)", (NR > 1 ? ", " : ""), $2, $3 } END { if (NR) print "" }'
+}
+
+# container_for prints the single container ID of a production service. It
+# reports on stderr, because it is called inside command substitutions.
+container_for() {
+	local rows count
+	rows="$(service_containers "$1")" || { log "ERROR: could not list containers for service '$1'" >&2; return 1; }
+	count="$(printf '%s\n' "$rows" | grep -c . || true)"
+	if [ "$count" -ne 1 ]; then
+		log "ERROR: expected exactly one container for service '$1' in project '$PROJECT', found $count${rows:+: $(describe_containers <<<"$rows")}" >&2
 		return 1
 	fi
-	printf '%s\n' "$ids"
+	printf '%s\n' "${rows%% *}"
+}
+
+# resolve_worker sets WORKER_PRESENT, WORKER_CID and WORKER_STATE. No worker
+# container is a valid state; several are not, since guessing which one is
+# production is unsafe.
+resolve_worker() {
+	local rows count
+	rows="$(service_containers "$WORKER_SERVICE")" || { log "ERROR: could not list containers for service '$WORKER_SERVICE'" >&2; return 1; }
+	count="$(printf '%s\n' "$rows" | grep -c . || true)"
+	case "$count" in
+	0) WORKER_PRESENT=0; WORKER_CID=""; WORKER_STATE=absent ;;
+	1) WORKER_PRESENT=1; read -r WORKER_CID _ WORKER_STATE <<<"$rows" ;;
+	*)
+		log "ERROR: expected at most one container for service '$WORKER_SERVICE' in project '$PROJECT', found $count: $(describe_containers <<<"$rows")" >&2
+		return 1
+		;;
+	esac
 }
 
 # container_ips prints a container's addresses on all its networks, sorted.
@@ -327,10 +362,19 @@ rollback() {
 			log "ROLLBACK: frontend restore FAILED; restore $FRONTEND_BACKUP by hand"
 		fi
 	fi
-	if [ "$WORKER_SWITCHED" -eq 1 ]; then
+	if [ "$WORKER_SWITCHED" -eq 1 ] && [ "$WORKER_PRESENT" -eq 0 ]; then
+		# There is no previous worker to go back to, and this script never stops
+		# or removes containers. The new worker stays; it works with the
+		# restored server, because migrations are additive.
+		log "ROLLBACK: '$WORKER_SERVICE' had no container before this deployment, so it is left on the new image."
+		log "ROLLBACK: if it must not run, stop it by hand (deploy/README.md, Rollback, \"worker that did not exist before\")"
+	elif [ "$WORKER_SWITCHED" -eq 1 ]; then
+		# Put the previous image back in the state it was in: running, or not.
+		start_flag=-d
+		[ "$WORKER_STATE" = running ] || start_flag=--no-start
 		if docker tag "$WORKER_REPO:sbomdelta-rollback" "$WORKER_REF" &&
-			compose up -d --no-deps --no-build "$WORKER_SERVICE" >>"$BUILD_LOG" 2>&1; then
-			log "ROLLBACK: worker back on its previous image"
+			compose up "$start_flag" --no-deps --no-build "$WORKER_SERVICE" >>"$BUILD_LOG" 2>&1; then
+			log "ROLLBACK: worker back on its previous image (previously $WORKER_STATE)"
 		else
 			log "ROLLBACK: worker restore FAILED"
 		fi
@@ -476,20 +520,38 @@ done < <(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
 log "ok: Compose project '$PROJECT' (from container labels), created from that file alone"
 
 services="$(compose config --services 2>/dev/null)" || die "the production Compose file does not parse"
-for service in "$SERVER_SERVICE" "$WORKER_SERVICE" "$POSTGRES_SERVICE"; do
+for service in "$SERVER_SERVICE" "$WORKER_SERVICE" "$POSTGRES_SERVICE" "$MINIO_SERVICE" "$NGINX_SERVICE"; do
 	grep -qx "$service" <<<"$services" || die "service '$service' is not defined in the production Compose file"
 done
 compose_images="$(compose config --images 2>/dev/null)" || die "could not list production images"
 
+# Every service but the worker must have exactly one container.
 SERVER_CID="$(container_for "$SERVER_SERVICE")" || die "cannot identify the server container"
-WORKER_CID="$(container_for "$WORKER_SERVICE")" || die "cannot identify the worker container"
 PG_CID="$(container_for "$POSTGRES_SERVICE")" || die "cannot identify the Postgres container"
+MINIO_CID="$(container_for "$MINIO_SERVICE")" || die "cannot identify the MinIO container"
+[ "$(docker inspect --format '{{.State.Status}}' "$MINIO_CID")" = running ] || die "MinIO is not running"
+NGINX_CID="$(container_for "$NGINX_SERVICE")" || die "cannot identify the Nginx container"
+[ "$(docker inspect --format '{{.Id}}' "$NGINX_CONTAINER" 2>/dev/null)" = "$NGINX_CID" ] ||
+	die "$NGINX_CONTAINER is not the '$NGINX_SERVICE' container of project '$PROJECT'"
+resolve_worker || die "cannot identify the worker container"
 
-# Images: the name Compose will run, and the image each service runs now.
+# Images: the name Compose will run, and the image each service runs now. With
+# no worker container, the worker's image name comes from the production
+# Compose file, and there is no previous worker image.
 SERVER_REF="$(docker inspect --format '{{.Config.Image}}' "$SERVER_CID")"
-WORKER_REF="$(docker inspect --format '{{.Config.Image}}' "$WORKER_CID")"
 SERVER_OLD_ID="$(docker inspect --format '{{.Image}}' "$SERVER_CID")"
-WORKER_OLD_ID="$(docker inspect --format '{{.Image}}' "$WORKER_CID")"
+if [ "$WORKER_PRESENT" -eq 1 ]; then
+	WORKER_REF="$(docker inspect --format '{{.Config.Image}}' "$WORKER_CID")"
+	WORKER_OLD_ID="$(docker inspect --format '{{.Image}}' "$WORKER_CID")"
+	log "ok: '$WORKER_SERVICE' container is $WORKER_STATE"
+else
+	WORKER_REF="$(compose config --images "$WORKER_SERVICE" 2>/dev/null)" ||
+		die "could not resolve the '$WORKER_SERVICE' image from the production Compose file"
+	[ "$(printf '%s\n' "$WORKER_REF" | grep -c . || true)" -eq 1 ] ||
+		die "the production Compose file does not resolve to exactly one image for '$WORKER_SERVICE'"
+	WORKER_OLD_ID=""
+	log "note: '$WORKER_SERVICE' has no container; a deployment will create it from $WORKER_REF once the new server is healthy"
+fi
 for ref in "$SERVER_REF" "$WORKER_REF"; do
 	[[ "$ref" != sha256:* ]] || die "a running service uses an untagged image; cannot redeploy it safely"
 	normalized="$(normalize_ref "$ref")"
@@ -525,7 +587,9 @@ done < <(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
 # a variable resolves differently). Only hashes are compared, never printed
 # configuration.
 compose_version="$(docker compose version --short 2>/dev/null || true)"
-for service in "$SERVER_SERVICE" "$WORKER_SERVICE"; do
+hash_services=("$SERVER_SERVICE")
+[ "$WORKER_PRESENT" -eq 0 ] || hash_services+=("$WORKER_SERVICE")
+for service in "${hash_services[@]}"; do
 	cid="$(container_for "$service")" || die "cannot identify the $service container"
 	running_hash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid")"
 	running_version="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.version"}}' "$cid")"
@@ -534,7 +598,7 @@ for service in "$SERVER_SERVICE" "$WORKER_SERVICE"; do
 		die "'$service' runs a different configuration than the production Compose file resolves to now (Compose $compose_version here, $running_version created it); review before deploying"
 	fi
 done
-log "ok: server and worker run the configuration Compose resolves (Compose $compose_version)"
+log "ok: ${hash_services[*]} run the configuration Compose resolves (Compose $compose_version)"
 
 # Persistent database storage must already exist.
 read -r pg_type pg_volume <<<"$(mount_source "$PG_CID" /var/lib/postgresql/data)"
@@ -657,7 +721,8 @@ NGINX_UPSTREAM_IPS="$(container_ips "$SERVER_CID")"
 log "preflight passed"
 if [ "$MODE" = preflight ]; then
 	log "plan: build ${SHA:0:12} into $SERVER_REF and $WORKER_REF, back up the database to $BACKUP_DIR,"
-	log "      recreate '$SERVER_SERVICE' then '$WORKER_SERVICE' with project '$PROJECT', publish the frontend to $FRONTEND_DIST;"
+	log "      recreate '$SERVER_SERVICE', then $([ "$WORKER_PRESENT" -eq 1 ] && echo "recreate and start '$WORKER_SERVICE' (now $WORKER_STATE)" || echo "create '$WORKER_SERVICE'") with project '$PROJECT',"
+	log "      publish the frontend to $FRONTEND_DIST;"
 	log "      Nginx is reloaded only if the server's address ($NGINX_UPSTREAM_IPS) changes"
 	log "preflight only: no changes were made"
 	result preflight-ok
@@ -731,7 +796,7 @@ find "$BACKUP_DIR" -maxdepth 1 -name 'frontend-dist-*.tar.gz' -printf '%T@ %p\n'
 require_time "$SWITCHOVER_RESERVE" "the switchover"
 
 docker tag "$SERVER_OLD_ID" "$SERVER_REPO:sbomdelta-rollback"
-docker tag "$WORKER_OLD_ID" "$WORKER_REPO:sbomdelta-rollback"
+[ "$WORKER_PRESENT" -eq 0 ] || docker tag "$WORKER_OLD_ID" "$WORKER_REPO:sbomdelta-rollback"
 
 log "recreating '$SERVER_SERVICE' (applies migrations on start)"
 SERVER_SWITCHED=1
@@ -751,10 +816,10 @@ refresh_nginx_upstream || die "could not point Nginx at the new server"
 wait_for_nginx || die "the new server does not answer through Nginx"
 log "ok: the new server answers through Nginx"
 
-log "recreating '$WORKER_SERVICE'"
+if [ "$WORKER_PRESENT" -eq 1 ]; then log "recreating '$WORKER_SERVICE'"; else log "creating '$WORKER_SERVICE'"; fi
 WORKER_SWITCHED=1
 docker tag "$WORKER_REPO:$NEW_TAG" "$WORKER_REF"
-compose up -d --no-deps --no-build "$WORKER_SERVICE" >>"$BUILD_LOG" 2>&1 || die "could not recreate the worker"
+compose up -d --no-deps --no-build "$WORKER_SERVICE" >>"$BUILD_LOG" 2>&1 || die "could not create or recreate the worker"
 wait_for_container "$WORKER_SERVICE" "$WORKER_NEW_ID" || die "worker is not running steadily on the new image"
 log "ok: worker running"
 

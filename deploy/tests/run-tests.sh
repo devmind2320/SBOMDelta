@@ -326,6 +326,110 @@ else
 	restore_scenario 755
 fi
 
+# ------------------------------------------------------- container lookup --
+
+# deploy.sh's own lookup functions, run against a stand-in `docker` that
+# applies label filters to canned containers the way `docker ps -a` does.
+# Rows: ID NAME STATE PROJECT SERVICE ONEOFF.
+lookup_functions="$(awk '
+	/^(service_containers|describe_containers|container_for|resolve_worker)\(\) \{$/ { on = 1 }
+	on { print }
+	on && /^\}$/ { on = 0 }
+' "$ROOT/deploy/deploy.sh")"
+check "lookup: deploy.sh defines the four container lookup functions" \
+	[ "$(grep -cE '^(service_containers|describe_containers|container_for|resolve_worker)\(\) \{$' <<<"$lookup_functions")" -eq 4 ]
+
+mkdir -p "$WORK/fakebin"
+cat >"$WORK/fakebin/docker" <<'EOF'
+#!/usr/bin/env bash
+[ "${FAKE_DOCKER_FAIL:-0}" = 1 ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+[ "$1" = ps ] || { echo "fake docker: unexpected command $*" >&2; exit 2; }
+project="" service="" oneoff=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--filter)
+		case "$2" in
+		label=com.docker.compose.project=*) project="${2#label=com.docker.compose.project=}" ;;
+		label=com.docker.compose.service=*) service="${2#label=com.docker.compose.service=}" ;;
+		label=com.docker.compose.oneoff=*) oneoff="${2#label=com.docker.compose.oneoff=}" ;;
+		esac
+		shift 2 ;;
+	*) shift ;;
+	esac
+done
+while read -r id name state p s o; do
+	[ -n "$id" ] || continue
+	[ -z "$project" ] || [ "$p" = "$project" ] || continue
+	[ -z "$service" ] || [ "$s" = "$service" ] || continue
+	[ -z "$oneoff" ] || [ "$o" = "$oneoff" ] || continue
+	echo "$id $name $state"
+done <"$FAKE_DOCKER_ROWS"
+EOF
+chmod +x "$WORK/fakebin/docker"
+
+# lookup <rows> <function> [args]: runs one lookup function in a subshell with
+# the stand-in docker; prints its stdout, then the worker variables, then
+# "rc=N" and its stderr.
+lookup() {
+	printf '%s\n' "$1" >"$WORK/rows"
+	shift
+	(
+		PATH="$WORK/fakebin:$PATH"
+		export FAKE_DOCKER_ROWS="$WORK/rows"
+		# Read by the functions loaded with eval below.
+		# shellcheck disable=SC2034
+		PROJECT=sbomdelta WORKER_SERVICE=worker
+		WORKER_PRESENT="" WORKER_CID="" WORKER_STATE=""
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		eval "$lookup_functions"
+		if "$@" 2>"$WORK/lookup.err"; then rc=0; else rc=$?; fi
+		echo "present=$WORKER_PRESENT cid=$WORKER_CID state=$WORKER_STATE rc=$rc"
+		cat "$WORK/lookup.err"
+	)
+}
+
+base='s1 sbomdelta-server-1 running sbomdelta server False
+p1 sbomdelta-postgres-1 running sbomdelta postgres False
+m1 sbomdelta-minio-1 running sbomdelta minio False
+n1 sbomdelta-nginx running sbomdelta nginx False'
+
+out="$(lookup "$base" resolve_worker)"
+check "worker absent: accepted, not an error" contains "$out" "present=0 cid= state=absent rc=0"
+
+out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 exited sbomdelta worker False' resolve_worker)"
+check "worker stopped: found, with its state" contains "$out" "present=1 cid=w1 state=exited rc=0"
+
+out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 running sbomdelta worker False' resolve_worker)"
+check "worker running: found, with its state" contains "$out" "present=1 cid=w1 state=running rc=0"
+
+out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 running sbomdelta worker False'$'\n''w2 abc123_sbomdelta-worker-1 exited sbomdelta worker False' resolve_worker)"
+check "worker multiple: refused" contains "$out" "rc=1"
+check "worker multiple: names every container and its state" \
+	contains "$out" "found 2: sbomdelta-worker-1 (running), abc123_sbomdelta-worker-1 (exited)"
+
+out="$(lookup "$base"$'\n''w1 sbomdelta-worker-1 running sbomdelta worker False'$'\n''r1 sbomdelta-worker-run-1a2b exited sbomdelta worker True' resolve_worker)"
+check "worker: a one-off run container is ignored next to the real one" contains "$out" "present=1 cid=w1 state=running rc=0"
+out="$(lookup "$base"$'\n''r1 sbomdelta-worker-run-1a2b exited sbomdelta worker True' resolve_worker)"
+check "worker: a one-off run container alone counts as absent" contains "$out" "present=0 cid= state=absent rc=0"
+out="$(lookup "$base"$'\n''x1 other-worker-1 running otherproject worker False' resolve_worker)"
+check "worker: another project's worker is ignored" contains "$out" "present=0 cid= state=absent rc=0"
+
+out="$(FAKE_DOCKER_FAIL=1 lookup "$base" resolve_worker)"
+check "worker: a Docker failure is an error, not 'absent'" contains "$out" "rc=1"
+
+out="$(lookup "$base" container_for server)"
+check "strict: one server container is returned" contains "$out" $'s1\npresent= cid= state= rc=0'
+for svc in postgres minio nginx; do
+	out="$(lookup "$(grep -v " $svc False" <<<"$base")" container_for "$svc")"
+	check "strict: a missing $svc container is refused" contains "$out" "expected exactly one container for service '$svc' in project 'sbomdelta', found 0"
+done
+out="$(lookup "$base"$'\n''s2 abc123_sbomdelta-server-1 exited sbomdelta server False' container_for server)"
+check "strict: two server containers are refused and listed" \
+	contains "$out" "found 2: sbomdelta-server-1 (running), abc123_sbomdelta-server-1 (exited)"
+out="$(lookup "$base"$'\n''r2 sbomdelta-server-run-9f8e exited sbomdelta server True' container_for server)"
+check "strict: a one-off server container is ignored" contains "$out" $'s1\npresent= cid= state= rc=0'
+
 # ------------------------------------------------- destructive-command guard --
 
 guard="$ROOT/deploy/tests/check-destructive.sh"
