@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	gh "github.com/google/go-github/v66/github"
 
@@ -122,6 +123,8 @@ func (h *WebhookHandler) handleInstallation(ctx context.Context, logger *slog.Lo
 
 	switch event.GetAction() {
 	case "deleted":
+		// Repositories are not touched: their access is reported as
+		// uninstalled from the installation row, and their history stays.
 		return h.db.MarkInstallationDeleted(ctx, installation.GetID())
 	case "suspend", "unsuspend", "created", "new_permissions_accepted":
 		record, err := h.db.UpsertInstallation(ctx, models.Installation{
@@ -138,8 +141,17 @@ func (h *WebhookHandler) handleInstallation(ctx context.Context, logger *slog.Lo
 				return err
 			}
 		}
-		logger.Info("recorded installation", "account", record.AccountLogin, "repos", len(event.Repositories))
-		return nil
+		logger.Info("recorded installation",
+			"action", event.GetAction(), "account", record.AccountLogin, "repos", len(event.Repositories))
+
+		// Only "created" carries a repository list, and even that one is not
+		// a complete statement of access. Ask GitHub for the real list
+		// whenever the installation becomes usable. A suspended installation
+		// cannot mint a token, so there is nothing to ask until it returns.
+		if event.GetAction() == "suspend" {
+			return nil
+		}
+		return h.enqueueReconcile(ctx, logger, installation.GetID())
 	default:
 		return nil
 	}
@@ -150,11 +162,10 @@ func (h *WebhookHandler) handleInstallationRepositories(ctx context.Context, log
 	if installation == nil {
 		return errors.New("installation_repositories event carried no installation")
 	}
-	record, err := h.db.UpsertInstallation(ctx, models.Installation{
-		GitHubInstallationID: installation.GetID(),
-		AccountLogin:         installation.GetAccount().GetLogin(),
-		AccountType:          installation.GetAccount().GetType(),
-	})
+	// Not an installation lifecycle event, so it must not clear a suspension
+	// or undo an uninstall -- a redelivery can arrive after either.
+	record, err := h.db.EnsureInstallation(ctx, installation.GetID(),
+		installation.GetAccount().GetLogin(), installation.GetAccount().GetType())
 	if err != nil {
 		return err
 	}
@@ -164,16 +175,67 @@ func (h *WebhookHandler) handleInstallationRepositories(ctx context.Context, log
 			return err
 		}
 	}
+
+	// Narrowing access from "All repositories" to a selection, or removing a
+	// repository from the selection, arrives here. The rows are marked
+	// revoked rather than deleted so their scan history survives.
+	removedIDs := make([]int64, 0, len(event.RepositoriesRemoved))
+	for _, repo := range event.RepositoriesRemoved {
+		if id := repo.GetID(); id != 0 {
+			removedIDs = append(removedIDs, id)
+		}
+	}
+	revoked, err := h.db.MarkRepositoriesRevoked(ctx, record.ID, removedIDs)
+	if err != nil {
+		return err
+	}
+
 	logger.Info("updated installation repositories",
-		"added", len(event.RepositoriesAdded), "removed", len(event.RepositoriesRemoved))
+		"action", event.GetAction(), "selection", event.GetRepositorySelection(),
+		"added", len(event.RepositoriesAdded), "removed", len(event.RepositoriesRemoved), "revoked", revoked)
+
+	// The event describes a delta. Reconciling afterwards repairs anything an
+	// earlier, missed delivery left behind.
+	return h.enqueueReconcile(ctx, logger, installation.GetID())
+}
+
+// reconcileSettleDelay holds back the reconciliation a webhook asks for. The
+// webhook itself is applied immediately; the follow-up listing waits so that
+// it reads GitHub after the change the webhook announced has propagated,
+// rather than a listing that still shows the old selection and would undo it.
+const reconcileSettleDelay = 2 * time.Minute
+
+func (h *WebhookHandler) enqueueReconcile(ctx context.Context, logger *slog.Logger, githubInstallationID int64) error {
+	// No dedupe key: reconciliation is idempotent and cheap, and a dedupe key
+	// would stay pinned to a dead job and block every later reconciliation.
+	jobID, err := h.queue.EnqueueAfter(ctx, queue.KindReconcileInstallation,
+		queue.ReconcileInstallationPayload{GitHubInstallationID: githubInstallationID}, "", reconcileSettleDelay)
+	if err != nil {
+		return err
+	}
+	logger.Info("queued repository reconciliation", "installation", githubInstallationID, "job", jobID)
 	return nil
 }
 
-// upsertRepositoryFromEvent handles the trimmed-down repository shape that
-// installation events carry, where FullName is present but Owner often is not.
+// upsertRepositoryFromEvent records a repository that an installation event
+// says is accessible.
 func (h *WebhookHandler) upsertRepositoryFromEvent(ctx context.Context, installationID int64, repo *gh.Repository, fallbackOwner string) (models.Repository, error) {
+	model, err := repositoryFromGitHub(installationID, repo, fallbackOwner)
+	if err != nil {
+		return models.Repository{}, err
+	}
+	return h.db.UpsertAccessibleRepository(ctx, model)
+}
+
+// repositoryFromGitHub handles both the full repository objects the REST API
+// returns and the trimmed-down shape installation events carry, where
+// FullName is present but Owner often is not.
+func repositoryFromGitHub(installationID int64, repo *gh.Repository, fallbackOwner string) (models.Repository, error) {
 	if repo == nil {
-		return models.Repository{}, errors.New("event carried a nil repository")
+		return models.Repository{}, errors.New("github returned a nil repository")
+	}
+	if repo.GetID() == 0 {
+		return models.Repository{}, fmt.Errorf("repository %q has no GitHub id", repo.GetFullName())
 	}
 	owner := repo.GetOwner().GetLogin()
 	name := repo.GetName()
@@ -189,14 +251,14 @@ func (h *WebhookHandler) upsertRepositoryFromEvent(ctx context.Context, installa
 		defaultBranch = "main"
 	}
 
-	return h.db.UpsertRepository(ctx, models.Repository{
+	return models.Repository{
 		InstallationID: &installationID,
 		GitHubRepoID:   githubID(repo.GetID()),
 		Owner:          owner,
 		Name:           name,
 		DefaultBranch:  defaultBranch,
 		Private:        repo.GetPrivate(),
-	})
+	}, nil
 }
 
 // handlePush scans commits landing on the default branch.
@@ -242,6 +304,12 @@ func (h *WebhookHandler) handlePush(ctx context.Context, logger *slog.Logger, ev
 	})
 	if err != nil {
 		return err
+	}
+	if !record.Accessible() {
+		// Typically a redelivery of an event from before access was
+		// revoked. The stored row is refreshed, but nothing is scanned.
+		logger.Info("ignoring event for inaccessible repository", "repo", record.FullName(), "access", record.Access)
+		return nil
 	}
 
 	if err := h.db.UpsertCommit(ctx, models.Commit{
@@ -309,6 +377,12 @@ func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Log
 	if err != nil {
 		return err
 	}
+	if !record.Accessible() {
+		// Typically a redelivery of an event from before access was
+		// revoked. The stored row is refreshed, but nothing is scanned.
+		logger.Info("ignoring event for inaccessible repository", "repo", record.FullName(), "access", record.Access)
+		return nil
+	}
 
 	stored, err := h.db.UpsertPullRequest(ctx, models.PullRequest{
 		RepositoryID: record.ID,
@@ -371,15 +445,16 @@ func (h *WebhookHandler) enqueueScan(ctx context.Context, logger *slog.Logger, s
 
 // installationRecordID maps GitHub's installation ID to our row ID, tolerating
 // events that arrive before the installation event itself.
+//
+// Push and pull request payloads carry only the installation's ID, so this
+// must not use UpsertInstallation: that would blank the stored account and
+// clear any suspension or uninstall.
 func (h *WebhookHandler) installationRecordID(ctx context.Context, installation *gh.Installation) (*int64, error) {
 	if installation == nil || installation.GetID() == 0 {
 		return nil, nil
 	}
-	record, err := h.db.UpsertInstallation(ctx, models.Installation{
-		GitHubInstallationID: installation.GetID(),
-		AccountLogin:         installation.GetAccount().GetLogin(),
-		AccountType:          installation.GetAccount().GetType(),
-	})
+	record, err := h.db.EnsureInstallation(ctx, installation.GetID(),
+		installation.GetAccount().GetLogin(), installation.GetAccount().GetType())
 	if err != nil {
 		return nil, err
 	}

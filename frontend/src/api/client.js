@@ -42,8 +42,10 @@ async function request(path, { signal } = {}) {
 }
 
 export const api = {
-  listRepositories: (options) =>
-    request('/api/repos', options).then((body) => body.repositories ?? []),
+  // access is 'active' (the API default), 'inactive' or 'all'. Inactive
+  // repositories are ones SBOMDelta lost access to; their history is kept.
+  listRepositories: ({ access = 'active', ...options } = {}) =>
+    request(`/api/repos?access=${access}`, options).then((body) => body.repositories ?? []),
 
   getRepository: (id, options) => request(`/api/repos/${id}`, options),
 

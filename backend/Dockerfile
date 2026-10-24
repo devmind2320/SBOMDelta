@@ -14,9 +14,10 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/serve
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker
 
 # --- API server -------------------------------------------------------------
-# The server never shells out, so it needs nothing but CA certificates.
+# git is here only for `git ls-remote`, which resolves a branch or tag to a
+# commit before a manual scan is queued. Cloning still happens on the worker.
 FROM alpine:3.21 AS server
-RUN apk add --no-cache ca-certificates && adduser -D -u 10001 sbomdelta
+RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 sbomdelta
 COPY --from=build /out/server /usr/local/bin/server
 USER sbomdelta
 EXPOSE 8080

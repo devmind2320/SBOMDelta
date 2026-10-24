@@ -27,10 +27,34 @@ type Repository struct {
 	DefaultBranch string    `json:"defaultBranch"`
 	Private       bool      `json:"private"`
 	CreatedAt     time.Time `json:"createdAt"`
+	// Access says whether SBOMDelta can currently reach the repository. It is
+	// derived on read; a repository that lost access keeps its row and its
+	// scan history.
+	Access RepositoryAccess `json:"access"`
+	// AccessRevokedAt is when the repository was removed from its
+	// installation's selection, if it has been.
+	AccessRevokedAt *time.Time `json:"accessRevokedAt,omitempty"`
 }
 
 // FullName is the owner/name form GitHub uses throughout its API.
 func (r Repository) FullName() string { return r.Owner + "/" + r.Name }
+
+// Accessible reports whether new scans of this repository can run.
+func (r Repository) Accessible() bool { return r.Access == AccessActive }
+
+type RepositoryAccess string
+
+const (
+	AccessActive RepositoryAccess = "active"
+	// AccessRevoked: the installation still exists but no longer includes
+	// this repository.
+	AccessRevoked RepositoryAccess = "revoked"
+	// AccessUninstalled: the installation that granted access was deleted.
+	AccessUninstalled RepositoryAccess = "uninstalled"
+	// AccessSuspended: the installation is suspended, so its token is
+	// unusable until it is unsuspended.
+	AccessSuspended RepositoryAccess = "suspended"
+)
 
 type Commit struct {
 	ID           int64      `json:"id"`

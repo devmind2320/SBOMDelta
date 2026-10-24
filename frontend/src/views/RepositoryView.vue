@@ -3,7 +3,15 @@ import { computed, toRef } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '../api/client.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
-import { compactNumber, formatDateTime, relativeTime, shortSha } from '../lib/format.js'
+import {
+  accessLabel,
+  compactNumber,
+  formatDate,
+  formatDateTime,
+  isAccessible,
+  relativeTime,
+  shortSha,
+} from '../lib/format.js'
 import DataCard from '../components/DataCard.vue'
 import DriftTimeline from '../components/DriftTimeline.vue'
 import EmptyState from '../components/EmptyState.vue'
@@ -66,7 +74,21 @@ const componentDelta = computed(() => {
 
     <ErrorState v-if="repository.error.value" :error="repository.error.value" @retry="repository.reload" />
 
-    <template v-else>
+    <!-- History stays browsable after access is lost, so say plainly that
+         what follows is a record, not the repository's current state. -->
+    <div
+      v-else-if="repository.data.value && !isAccessible(repository.data.value)"
+      role="status"
+      class="rounded-lg border border-hairline bg-surface px-4 py-3 text-sm text-ink-secondary"
+    >
+      <span class="font-medium text-ink">No longer accessible</span>
+      · {{ accessLabel(repository.data.value.access) }}<template
+        v-if="repository.data.value.accessRevokedAt"
+      > on {{ formatDate(repository.data.value.accessRevokedAt) }}</template>.
+      The history below is kept, but this repository is no longer scanned.
+    </div>
+
+    <template v-if="!repository.error.value">
       <!-- One hero figure per view: the risk score. Everything else is a tile. -->
       <div class="grid gap-3 lg:grid-cols-[minmax(240px,1fr)_2fr]">
         <RiskScore :score="current?.riskScore ?? null" :delta="null" />

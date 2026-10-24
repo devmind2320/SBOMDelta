@@ -81,3 +81,26 @@ export function severityRole(severity) {
       return 'unknown'
   }
 }
+
+/**
+ * Describes why SBOMDelta can no longer reach a repository. Responses from an
+ * API older than the access field carry none, which means active.
+ */
+export function accessLabel(access) {
+  switch (access ?? 'active') {
+    case 'active':
+      return 'active'
+    case 'revoked':
+      return 'removed from the GitHub App'
+    case 'uninstalled':
+      return 'GitHub App uninstalled'
+    case 'suspended':
+      return 'GitHub App suspended'
+    default:
+      return 'no access'
+  }
+}
+
+export function isAccessible(repository) {
+  return (repository?.access ?? 'active') === 'active'
+}

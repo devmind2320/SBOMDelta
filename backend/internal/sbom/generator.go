@@ -98,7 +98,7 @@ func Clone(ctx context.Context, cfg config.Scanner, cloneURL, commitSHA, dir str
 	}
 
 	for _, args := range steps {
-		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd := exec.CommandContext(ctx, cfg.GitPath, args...)
 		cmd.Dir = dir
 		// Never let git block a worker waiting for credentials on a repo the
 		// installation token does not actually cover.

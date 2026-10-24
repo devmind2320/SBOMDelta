@@ -54,6 +54,10 @@ type Blob struct {
 type Scanner struct {
 	// SyftPath is the syft binary to shell out to for SBOM generation.
 	SyftPath string
+	// GitPath is the git binary used for cloning and ref resolution. It is
+	// configurable because a stale git earlier on PATH is a common and
+	// confusing failure: partial clone needs 2.19 or newer.
+	GitPath string
 	// WorkDir holds clone directories; each scan gets a subdirectory that is
 	// removed when the scan finishes.
 	WorkDir string
@@ -117,6 +121,7 @@ func load(allowGitHubDisable bool) (*Config, error) {
 		},
 		Scanner: Scanner{
 			SyftPath:      env("SYFT_PATH", "syft"),
+			GitPath:       env("GIT_PATH", "git"),
 			WorkDir:       env("SCANNER_WORK_DIR", os.TempDir()),
 			CloneTimeout:  durationEnv("SCANNER_CLONE_TIMEOUT", 5*time.Minute),
 			SBOMTimeout:   durationEnv("SCANNER_SBOM_TIMEOUT", 10*time.Minute),

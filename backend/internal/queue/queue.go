@@ -24,6 +24,9 @@ const (
 	// KindScan runs the full pipeline for one commit: clone, generate SBOM,
 	// diff against the base, persist, report to GitHub.
 	KindScan Kind = "scan"
+	// KindReconcileInstallation re-reads an installation's repository list
+	// from GitHub and brings stored access in line with it.
+	KindReconcileInstallation Kind = "reconcile_installation"
 )
 
 // ErrNoJobs signals that the queue is empty right now.
@@ -44,6 +47,11 @@ type ScanPayload struct {
 	ScanID int64 `json:"scanId"`
 }
 
+// ReconcileInstallationPayload is the body of a KindReconcileInstallation job.
+type ReconcileInstallationPayload struct {
+	GitHubInstallationID int64 `json:"githubInstallationId"`
+}
+
 // Queue reads and writes the jobs table.
 type Queue struct {
 	pool        *pgxpool.Pool
@@ -58,19 +66,25 @@ func New(pool *pgxpool.Pool, lockTimeout time.Duration) *Queue {
 // second enqueue of the same key is a no-op, which is what keeps a redelivered
 // webhook from scanning the same commit twice.
 func (q *Queue) Enqueue(ctx context.Context, kind Kind, payload any, dedupeKey string) (int64, error) {
+	return q.EnqueueAfter(ctx, kind, payload, dedupeKey, 0)
+}
+
+// EnqueueAfter is Enqueue for a job that should not run until delay has
+// passed.
+func (q *Queue) EnqueueAfter(ctx context.Context, kind Kind, payload any, dedupeKey string, delay time.Duration) (int64, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return 0, fmt.Errorf("marshal job payload: %w", err)
 	}
 
 	const query = `
-		INSERT INTO jobs (kind, payload, dedupe_key)
-		VALUES ($1, $2, NULLIF($3, ''))
+		INSERT INTO jobs (kind, payload, dedupe_key, run_after)
+		VALUES ($1, $2, NULLIF($3, ''), now() + make_interval(secs => $4))
 		ON CONFLICT (dedupe_key) DO NOTHING
 		RETURNING id`
 
 	var id int64
-	err = q.pool.QueryRow(ctx, query, string(kind), body, dedupeKey).Scan(&id)
+	err = q.pool.QueryRow(ctx, query, string(kind), body, dedupeKey, delay.Seconds()).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil // Already queued; nothing more to do.
 	}

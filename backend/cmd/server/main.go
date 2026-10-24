@@ -63,7 +63,7 @@ func run(logger *slog.Logger) error {
 	} else {
 		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
 	}
-	handler := api.New(db, blob, jobs, logger).Routes(webhook)
+	handler := api.New(db, blob, jobs, cfg.Scanner, logger).Routes(webhook)
 
 	server := &http.Server{
 		Addr:    cfg.HTTPAddr,

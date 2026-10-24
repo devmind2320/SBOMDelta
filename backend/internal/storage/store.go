@@ -16,6 +16,10 @@ import (
 // ErrNotFound is returned when a lookup matches no row.
 var ErrNotFound = errors.New("not found")
 
+// ErrInstallationUnusable is returned when an installation has been deleted
+// or suspended, so nothing GitHub said about it a moment ago can be applied.
+var ErrInstallationUnusable = errors.New("installation is deleted or suspended")
+
 // UpsertInstallation records a GitHub App installation, or refreshes it when
 // the app is reinstalled on the same account.
 func (db *DB) UpsertInstallation(ctx context.Context, in models.Installation) (models.Installation, error) {
@@ -39,6 +43,33 @@ func (db *DB) UpsertInstallation(ctx context.Context, in models.Installation) (m
 	return out, nil
 }
 
+// EnsureInstallation makes sure an installation row exists for an event that
+// merely references one -- push, pull_request and installation_repositories.
+//
+// Those payloads are not authoritative about the installation's lifecycle; a
+// push carries only the installation's ID. So this fills in account details
+// only where the event actually has them, and never touches suspended_at or
+// deleted_at: only installation events themselves may change those, through
+// UpsertInstallation.
+func (db *DB) EnsureInstallation(ctx context.Context, githubInstallationID int64, accountLogin, accountType string) (models.Installation, error) {
+	const query = `
+		INSERT INTO installations (github_installation_id, account_login, account_type)
+		VALUES ($1, $2, COALESCE(NULLIF($3, ''), 'User'))
+		ON CONFLICT (github_installation_id) DO UPDATE
+		SET account_login = COALESCE(NULLIF(EXCLUDED.account_login, ''), installations.account_login),
+		    account_type  = CASE WHEN $3 = '' THEN installations.account_type ELSE EXCLUDED.account_type END,
+		    updated_at    = now()
+		RETURNING id, github_installation_id, account_login, account_type, suspended_at, deleted_at`
+
+	var out models.Installation
+	err := db.pool.QueryRow(ctx, query, githubInstallationID, accountLogin, accountType).
+		Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.SuspendedAt, &out.DeletedAt)
+	if err != nil {
+		return models.Installation{}, fmt.Errorf("ensure installation: %w", err)
+	}
+	return out, nil
+}
+
 // MarkInstallationDeleted soft-deletes an installation so that historical scan
 // data survives an uninstall.
 func (db *DB) MarkInstallationDeleted(ctx context.Context, githubInstallationID int64) error {
@@ -51,14 +82,31 @@ func (db *DB) MarkInstallationDeleted(ctx context.Context, githubInstallationID 
 	return nil
 }
 
+// repositoryAccess derives a repository's access state. Revocation is stored
+// on the repository; uninstall and suspension live on the installation and are
+// looked up here, so they never have to be copied onto each repository row.
+//
+// The subqueries are correlated on the repositories table by name rather than
+// by alias so the same expression works in SELECTs and in RETURNING clauses.
+const repositoryAccess = `
+	CASE
+		WHEN repositories.access_revoked_at IS NOT NULL THEN 'revoked'
+		WHEN EXISTS (SELECT 1 FROM installations i
+		             WHERE i.id = repositories.installation_id AND i.deleted_at IS NOT NULL) THEN 'uninstalled'
+		WHEN EXISTS (SELECT 1 FROM installations i
+		             WHERE i.id = repositories.installation_id AND i.suspended_at IS NOT NULL) THEN 'suspended'
+		ELSE 'active'
+	END`
+
 const repositoryColumns = `
 	id, installation_id, github_repo_id, owner, name, default_branch, private,
-	COALESCE(clone_url, ''), created_at`
+	COALESCE(clone_url, ''), created_at, access_revoked_at, ` + repositoryAccess
 
 func repositoryTargets(repo *models.Repository) []any {
 	return []any{
 		&repo.ID, &repo.InstallationID, &repo.GitHubRepoID, &repo.Owner, &repo.Name,
 		&repo.DefaultBranch, &repo.Private, &repo.CloneURL, &repo.CreatedAt,
+		&repo.AccessRevokedAt, &repo.Access,
 	}
 }
 
@@ -87,25 +135,71 @@ func (db *DB) UpsertManualRepository(ctx context.Context, repo models.Repository
 
 // UpsertRepository records a repository, keyed on GitHub's numeric repo ID so
 // that a rename or transfer updates the existing row instead of orphaning it.
+//
+// It leaves access exactly as it was. Push and pull request deliveries can be
+// redelivered long after a repository left the installation, so they are not
+// evidence of current access; UpsertAccessibleRepository is for the events
+// that are.
+//
+// It runs in two steps because a repository can arrive here already known:
+// tracked manually first, then adopted into the GitHub App. That row matches
+// on owner/name but carries no GitHub ID, so a plain ON CONFLICT on
+// github_repo_id would insert a second row and trip the owner/name
+// constraint. Claiming it first keeps the adoption lossless -- the scan
+// history stays attached.
 func (db *DB) UpsertRepository(ctx context.Context, repo models.Repository) (models.Repository, error) {
-	const query = `
+	return db.upsertRepository(ctx, repo, false)
+}
+
+// UpsertAccessibleRepository records a repository that GitHub has just said
+// the installation can reach -- an installation event or an
+// installation_repositories "added" event -- and so clears any revocation.
+func (db *DB) UpsertAccessibleRepository(ctx context.Context, repo models.Repository) (models.Repository, error) {
+	return db.upsertRepository(ctx, repo, true)
+}
+
+func (db *DB) upsertRepository(ctx context.Context, repo models.Repository, grantAccess bool) (models.Repository, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return models.Repository{}, fmt.Errorf("begin repository upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Step one: adopt a manually registered row, if one is waiting.
+	const adopt = `
+		UPDATE repositories
+		SET github_repo_id  = $1,
+		    installation_id = COALESCE($2, installation_id),
+		    updated_at      = now()
+		WHERE owner = $3 AND name = $4 AND github_repo_id IS NULL`
+	if _, err := tx.Exec(ctx, adopt, repo.GitHubRepoID, repo.InstallationID, repo.Owner, repo.Name); err != nil {
+		return models.Repository{}, fmt.Errorf("adopt existing repository: %w", err)
+	}
+
+	// Step two: the normal insert-or-update keyed on the GitHub ID.
+	const upsert = `
 		INSERT INTO repositories (installation_id, github_repo_id, owner, name, default_branch, private)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (github_repo_id) DO UPDATE
-		SET installation_id = COALESCE(EXCLUDED.installation_id, repositories.installation_id),
-		    owner           = EXCLUDED.owner,
-		    name            = EXCLUDED.name,
-		    default_branch  = EXCLUDED.default_branch,
-		    private         = EXCLUDED.private,
-		    updated_at      = now()
+		SET installation_id   = COALESCE(EXCLUDED.installation_id, repositories.installation_id),
+		    owner             = EXCLUDED.owner,
+		    name              = EXCLUDED.name,
+		    default_branch    = EXCLUDED.default_branch,
+		    private           = EXCLUDED.private,
+		    access_revoked_at = CASE WHEN $7 THEN NULL ELSE repositories.access_revoked_at END,
+		    updated_at        = now()
 		RETURNING ` + repositoryColumns
 
 	var out models.Repository
-	err := db.pool.QueryRow(ctx, query,
-		repo.InstallationID, repo.GitHubRepoID, repo.Owner, repo.Name, repo.DefaultBranch, repo.Private,
+	err = tx.QueryRow(ctx, upsert,
+		repo.InstallationID, repo.GitHubRepoID, repo.Owner, repo.Name, repo.DefaultBranch, repo.Private, grantAccess,
 	).Scan(repositoryTargets(&out)...)
 	if err != nil {
 		return models.Repository{}, fmt.Errorf("upsert repository: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return models.Repository{}, fmt.Errorf("commit repository upsert: %w", err)
 	}
 	return out, nil
 }
@@ -124,8 +218,30 @@ func (db *DB) GetRepository(ctx context.Context, id int64) (models.Repository, e
 	return out, nil
 }
 
-func (db *DB) ListRepositories(ctx context.Context) ([]models.Repository, error) {
-	const query = `SELECT ` + repositoryColumns + ` FROM repositories ORDER BY owner, name`
+// AccessFilter selects repositories by whether they are currently reachable.
+type AccessFilter string
+
+const (
+	AccessFilterActive   AccessFilter = "active"
+	AccessFilterInactive AccessFilter = "inactive"
+	AccessFilterAll      AccessFilter = "all"
+)
+
+// ListRepositories returns stored repositories. Inactive ones are kept so
+// their history stays reachable, but most callers want only what SBOMDelta
+// can scan today, which is AccessFilterActive.
+func (db *DB) ListRepositories(ctx context.Context, filter AccessFilter) ([]models.Repository, error) {
+	var where string
+	switch filter {
+	case AccessFilterActive:
+		where = `WHERE ` + repositoryAccess + ` = 'active'`
+	case AccessFilterInactive:
+		where = `WHERE ` + repositoryAccess + ` <> 'active'`
+	case AccessFilterAll:
+	default:
+		return nil, fmt.Errorf("unknown access filter %q", filter)
+	}
+	query := `SELECT ` + repositoryColumns + ` FROM repositories ` + where + ` ORDER BY owner, name`
 
 	rows, err := db.pool.Query(ctx, query)
 	if err != nil {
@@ -162,6 +278,177 @@ func (db *DB) GetInstallationIDForRepo(ctx context.Context, repositoryID int64) 
 		return 0, fmt.Errorf("get installation for repo: %w", err)
 	}
 	return installationID, nil
+}
+
+// MarkRepositoriesRevoked records that an installation no longer grants
+// access to the given repositories. It is scoped to the installation so that
+// a repository now reachable through a different installation -- after a
+// transfer, say -- is left alone. Rows are never deleted: their scans and
+// drift history stay intact.
+func (db *DB) MarkRepositoriesRevoked(ctx context.Context, installationID int64, githubRepoIDs []int64) (int64, error) {
+	if len(githubRepoIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE repositories
+		SET access_revoked_at = now(), updated_at = now()
+		WHERE installation_id = $1
+		  AND github_repo_id = ANY($2)
+		  AND access_revoked_at IS NULL`,
+		installationID, githubRepoIDs)
+	if err != nil {
+		return 0, fmt.Errorf("mark repositories revoked: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ReconcileResult summarizes what a reconciliation changed.
+type ReconcileResult struct {
+	Accessible int
+	Revoked    int64
+}
+
+// ReconcileInstallationRepositories makes the stored repositories for an
+// installation match GitHub's current list: every listed repository is
+// upserted as accessible, and every other repository linked to the
+// installation is marked revoked.
+//
+// listedAt must be a database timestamp taken before GitHub was asked for the
+// list. Webhooks keep arriving while the listing is paged through, and an
+// event processed after listedAt is newer than the list, so it wins: a
+// repository revoked after listedAt is not re-granted, and one granted or
+// touched after listedAt is not revoked.
+//
+// The installation row is share-locked for the duration, and the
+// reconciliation is abandoned with ErrInstallationUnusable if it has been
+// deleted or suspended since the listing began. An uninstall or suspension
+// webhook arriving meanwhile waits for this transaction rather than
+// interleaving with it.
+func (db *DB) ReconcileInstallationRepositories(ctx context.Context, installationID int64, repos []models.Repository, listedAt time.Time) (ReconcileResult, error) {
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return ReconcileResult{}, fmt.Errorf("begin reconcile: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var usable bool
+	err = tx.QueryRow(ctx, `
+		SELECT deleted_at IS NULL AND suspended_at IS NULL
+		FROM installations WHERE id = $1
+		FOR SHARE`, installationID).Scan(&usable)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !usable) {
+		return ReconcileResult{}, ErrInstallationUnusable
+	}
+	if err != nil {
+		return ReconcileResult{}, fmt.Errorf("lock installation: %w", err)
+	}
+
+	// Adopt manually registered rows first, exactly as UpsertRepository does,
+	// so the insert below cannot trip the owner/name constraint.
+	const adopt = `
+		UPDATE repositories
+		SET github_repo_id  = $1,
+		    installation_id = $2,
+		    updated_at      = now()
+		WHERE owner = $3 AND name = $4 AND github_repo_id IS NULL`
+
+	const upsert = `
+		INSERT INTO repositories (installation_id, github_repo_id, owner, name, default_branch, private)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (github_repo_id) DO UPDATE
+		SET installation_id   = EXCLUDED.installation_id,
+		    owner             = EXCLUDED.owner,
+		    name              = EXCLUDED.name,
+		    default_branch    = EXCLUDED.default_branch,
+		    private           = EXCLUDED.private,
+		    access_revoked_at = CASE
+		        WHEN repositories.access_revoked_at > $7 THEN repositories.access_revoked_at
+		        ELSE NULL
+		    END,
+		    updated_at        = now()`
+
+	ids := make([]int64, 0, len(repos))
+	for _, repo := range repos {
+		if repo.GitHubRepoID == nil {
+			return ReconcileResult{}, fmt.Errorf("reconcile %s: repository has no GitHub id", repo.FullName())
+		}
+		ids = append(ids, *repo.GitHubRepoID)
+
+		if _, err := tx.Exec(ctx, adopt, repo.GitHubRepoID, installationID, repo.Owner, repo.Name); err != nil {
+			return ReconcileResult{}, fmt.Errorf("adopt %s: %w", repo.FullName(), err)
+		}
+		if _, err := tx.Exec(ctx, upsert, installationID, repo.GitHubRepoID, repo.Owner, repo.Name,
+			repo.DefaultBranch, repo.Private, listedAt); err != nil {
+			return ReconcileResult{}, fmt.Errorf("upsert %s: %w", repo.FullName(), err)
+		}
+	}
+
+	tag, err := tx.Exec(ctx, `
+		UPDATE repositories
+		SET access_revoked_at = now(), updated_at = now()
+		WHERE installation_id = $1
+		  AND github_repo_id IS NOT NULL
+		  AND NOT (github_repo_id = ANY($2))
+		  AND access_revoked_at IS NULL
+		  AND updated_at <= $3`,
+		installationID, ids, listedAt)
+	if err != nil {
+		return ReconcileResult{}, fmt.Errorf("revoke unlisted repositories: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return ReconcileResult{}, fmt.Errorf("commit reconcile: %w", err)
+	}
+	return ReconcileResult{Accessible: len(repos), Revoked: tag.RowsAffected()}, nil
+}
+
+// GetInstallationByGitHubID loads an installation by GitHub's numeric ID.
+func (db *DB) GetInstallationByGitHubID(ctx context.Context, githubInstallationID int64) (models.Installation, error) {
+	var out models.Installation
+	err := db.pool.QueryRow(ctx, `
+		SELECT id, github_installation_id, account_login, account_type, suspended_at, deleted_at
+		FROM installations WHERE github_installation_id = $1`, githubInstallationID).
+		Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.SuspendedAt, &out.DeletedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.Installation{}, ErrNotFound
+	}
+	if err != nil {
+		return models.Installation{}, fmt.Errorf("get installation: %w", err)
+	}
+	return out, nil
+}
+
+// ListUsableInstallations returns the GitHub IDs of installations whose
+// tokens can currently be minted: not deleted and not suspended.
+func (db *DB) ListUsableInstallations(ctx context.Context) ([]int64, error) {
+	rows, err := db.pool.Query(ctx, `
+		SELECT github_installation_id FROM installations
+		WHERE deleted_at IS NULL AND suspended_at IS NULL
+		ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("list installations: %w", err)
+	}
+	defer rows.Close()
+
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan installation id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// Now returns the database clock, which is what row timestamps are written
+// with. Comparisons against updated_at must not mix in the application clock.
+func (db *DB) Now(ctx context.Context) (time.Time, error) {
+	var now time.Time
+	if err := db.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("read database clock: %w", err)
+	}
+	return now, nil
 }
 
 func (db *DB) UpsertCommit(ctx context.Context, commit models.Commit) error {

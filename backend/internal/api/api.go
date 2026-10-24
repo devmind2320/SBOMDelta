@@ -12,21 +12,25 @@ import (
 	"strings"
 	"time"
 
-	ghapp "sbomdelta/internal/github"
+	"sbomdelta/internal/config"
 	"sbomdelta/internal/models"
 	"sbomdelta/internal/queue"
+	"sbomdelta/internal/sbom"
 	"sbomdelta/internal/storage"
 )
 
 type API struct {
-	db     *storage.DB
-	blob   *storage.BlobStore
-	queue  *queue.Queue
-	logger *slog.Logger
+	db   *storage.DB
+	blob *storage.BlobStore
+	// scanner config is needed only to resolve a ref to a commit before
+	// queueing; the scan itself still happens on the worker.
+	scanner config.Scanner
+	queue   *queue.Queue
+	logger  *slog.Logger
 }
 
-func New(db *storage.DB, blob *storage.BlobStore, q *queue.Queue, logger *slog.Logger) *API {
-	return &API{db: db, blob: blob, queue: q, logger: logger}
+func New(db *storage.DB, blob *storage.BlobStore, q *queue.Queue, scanner config.Scanner, logger *slog.Logger) *API {
+	return &API{db: db, blob: blob, queue: q, scanner: scanner, logger: logger}
 }
 
 // Routes builds the HTTP handler. The webhook is mounted by the caller so that
@@ -69,8 +73,23 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, status)
 }
 
+// listRepositories returns the repositories SBOMDelta can currently reach.
+// ?access=inactive returns the ones it has lost access to, whose history is
+// still stored, and ?access=all returns both.
 func (a *API) listRepositories(w http.ResponseWriter, r *http.Request) {
-	repos, err := a.db.ListRepositories(r.Context())
+	filter := storage.AccessFilterActive
+	switch access := r.URL.Query().Get("access"); access {
+	case "", "active":
+	case "inactive":
+		filter = storage.AccessFilterInactive
+	case "all":
+		filter = storage.AccessFilterAll
+	default:
+		writeError(w, http.StatusBadRequest, "access must be one of active, inactive, all")
+		return
+	}
+
+	repos, err := a.db.ListRepositories(r.Context(), filter)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -353,6 +372,13 @@ func (a *API) triggerScan(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
+	// Its history stays readable, but a repository SBOMDelta lost access to
+	// cannot be cloned with the access it had.
+	if !repo.Accessible() {
+		writeError(w, http.StatusConflict,
+			fmt.Sprintf("SBOMDelta no longer has access to %s (%s); its history is still available", repo.FullName(), repo.Access))
+		return
+	}
 
 	commitSHA := strings.TrimSpace(body.CommitSHA)
 	if commitSHA == "" {
@@ -360,7 +386,7 @@ func (a *API) triggerScan(w http.ResponseWriter, r *http.Request) {
 		if ref == "" {
 			ref = repo.DefaultBranch
 		}
-		commitSHA, err = ghapp.ResolvePublicRef(r.Context(), repo.Owner, repo.Name, ref)
+		commitSHA, err = sbom.ResolveRef(r.Context(), a.scanner, repo.CloneURL, ref)
 		if err != nil {
 			// A failed lookup is the caller's problem to fix (wrong ref,
 			// private repo, rate limit), not a server fault.
@@ -368,7 +394,7 @@ func (a *API) triggerScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !ghapp.IsCommitSHA(commitSHA) {
+	if !sbom.IsCommitSHA(commitSHA) {
 		writeError(w, http.StatusBadRequest, "commitSha must be a full 40-character sha")
 		return
 	}

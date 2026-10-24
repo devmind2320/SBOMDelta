@@ -42,6 +42,11 @@ func run(logger *slog.Logger) error {
 	if err := generator.Check(ctx); err != nil {
 		return err
 	}
+	// Same reasoning for git: a stale binary fails every clone with a
+	// confusing error rather than at startup.
+	if err := sbom.CheckGit(ctx, cfg.Scanner); err != nil {
+		return err
+	}
 
 	db, err := storage.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -68,7 +73,33 @@ func run(logger *slog.Logger) error {
 
 	pipeline := scanner.New(db, blob, app, generator, cfg.Scanner, logger)
 
-	return worker.New(workerID(), jobs, pipeline, cfg.Worker, logger).Run(ctx)
+	var reconciler *ghapp.Reconciler
+	if app != nil {
+		reconciler = ghapp.NewReconciler(app, db, logger)
+		// A webhook missed while nothing was listening is never redelivered
+		// once GitHub stops retrying, so re-read every installation's
+		// repository list each time a worker starts.
+		if err := enqueueReconciliation(ctx, db, jobs, logger); err != nil {
+			return err
+		}
+	}
+
+	return worker.New(workerID(), jobs, pipeline, reconciler, cfg.Worker, logger).Run(ctx)
+}
+
+func enqueueReconciliation(ctx context.Context, db *storage.DB, jobs *queue.Queue, logger *slog.Logger) error {
+	installations, err := db.ListUsableInstallations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, id := range installations {
+		if _, err := jobs.Enqueue(ctx, queue.KindReconcileInstallation,
+			queue.ReconcileInstallationPayload{GitHubInstallationID: id}, ""); err != nil {
+			return err
+		}
+	}
+	logger.Info("queued startup repository reconciliation", "installations", len(installations))
+	return nil
 }
 
 // workerID identifies which process holds a job lock, which is what makes a

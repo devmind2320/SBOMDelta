@@ -46,6 +46,16 @@ func (s *Scanner) Run(ctx context.Context, scanID int64) error {
 	}
 
 	logger := s.logger.With("scan", scanID, "repo", repo.FullName(), "commit", short(scan.CommitSHA))
+
+	// Access can be revoked between queueing and running. That is permanent
+	// as far as this scan is concerned, so record it on the scan and finish
+	// the job instead of letting the queue retry it into the dead letter.
+	if !repo.Accessible() {
+		cause := fmt.Sprintf("SBOMDelta no longer has access to %s (%s)", repo.FullName(), repo.Access)
+		logger.Warn("skipping scan of inaccessible repository", "access", repo.Access)
+		return s.db.MarkScanFailed(ctx, scan.ID, cause)
+	}
+
 	logger.Info("starting scan", "trigger", scan.Trigger)
 
 	access, err := s.resolveAccess(ctx, repo)

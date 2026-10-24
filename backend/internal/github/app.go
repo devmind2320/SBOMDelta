@@ -33,8 +33,11 @@ type App struct {
 
 func NewApp(cfg config.GitHub) *App {
 	return &App{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		cfg: cfg,
+		// Transport is set explicitly because ghinstallation uses it as-is:
+		// a nil RoundTripper is not defaulted and panics on the first token
+		// exchange.
+		httpClient: &http.Client{Timeout: 30 * time.Second, Transport: http.DefaultTransport},
 		clients:    make(map[int64]*gh.Client),
 	}
 }
@@ -87,6 +90,58 @@ func (a *App) InstallationToken(ctx context.Context, installationID int64) (stri
 		return "", fmt.Errorf("mint installation token: %w", err)
 	}
 	return token, nil
+}
+
+// ListInstallationRepositories returns every repository the installation can
+// currently access, following pagination.
+//
+// GET /installation/repositories needs only the installation token: GitHub
+// grants every App the metadata permission it requires, so no additional App
+// permission has to be requested for reconciliation to work.
+func (a *App) ListInstallationRepositories(ctx context.Context, installationID int64) ([]*gh.Repository, error) {
+	client, err := a.InstallationClient(installationID)
+	if err != nil {
+		return nil, err
+	}
+
+	// The listing is offset-paginated, so a repository added to or removed
+	// from the installation between two page fetches shifts every later page:
+	// one repository is skipped or seen twice. A skipped repository would be
+	// revoked by reconciliation. Every page reports the installation's total,
+	// so a total that moves, or a count that does not add up, means the list
+	// changed mid-read and is rejected rather than trusted.
+	var repos []*gh.Repository
+	seen := make(map[int64]struct{})
+	total := -1
+	opts := &gh.ListOptions{PerPage: 100}
+	for {
+		page, resp, err := client.Apps.ListRepos(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("list repositories for installation %d: %w", installationID, err)
+		}
+		if total == -1 {
+			total = page.GetTotalCount()
+		} else if page.GetTotalCount() != total {
+			return nil, fmt.Errorf("repositories for installation %d changed while listing (%d, then %d); retry",
+				installationID, total, page.GetTotalCount())
+		}
+		for _, repo := range page.Repositories {
+			if _, dup := seen[repo.GetID()]; dup {
+				continue
+			}
+			seen[repo.GetID()] = struct{}{}
+			repos = append(repos, repo)
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	if len(repos) != total {
+		return nil, fmt.Errorf("listed %d repositories for installation %d but GitHub reported %d; retry",
+			len(repos), installationID, total)
+	}
+	return repos, nil
 }
 
 // CloneURL builds an authenticated HTTPS clone URL. The token is embedded in

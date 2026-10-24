@@ -1,0 +1,11 @@
+-- Track whether the GitHub App can still reach a repository.
+--
+-- A repository leaves the App's reach when an installer narrows access from
+-- "All repositories" to a selection, or removes it from the selection. The row
+-- must survive that: commits, scans, components and drift all hang off it with
+-- ON DELETE CASCADE, so deleting it would erase the history the dashboard
+-- exists to show. Instead the revocation is recorded and reads filter on it.
+--
+-- Uninstalls and suspensions are already recorded on installations, so they
+-- are derived at read time rather than copied onto every repository row.
+ALTER TABLE repositories ADD COLUMN access_revoked_at TIMESTAMPTZ;

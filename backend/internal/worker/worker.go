@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"sbomdelta/internal/config"
+	ghapp "sbomdelta/internal/github"
 	"sbomdelta/internal/queue"
 	"sbomdelta/internal/scanner"
 )
@@ -19,12 +20,14 @@ type Worker struct {
 	id      string
 	queue   *queue.Queue
 	scanner *scanner.Scanner
-	cfg     config.Worker
-	logger  *slog.Logger
+	// reconciler is nil when GitHub integration is disabled.
+	reconciler *ghapp.Reconciler
+	cfg        config.Worker
+	logger     *slog.Logger
 }
 
-func New(id string, q *queue.Queue, s *scanner.Scanner, cfg config.Worker, logger *slog.Logger) *Worker {
-	return &Worker{id: id, queue: q, scanner: s, cfg: cfg, logger: logger}
+func New(id string, q *queue.Queue, s *scanner.Scanner, reconciler *ghapp.Reconciler, cfg config.Worker, logger *slog.Logger) *Worker {
+	return &Worker{id: id, queue: q, scanner: s, reconciler: reconciler, cfg: cfg, logger: logger}
 }
 
 // Run starts cfg.Concurrency loops and blocks until ctx is cancelled. Each
@@ -106,6 +109,18 @@ func (w *Worker) handle(ctx context.Context, job *queue.Job) error {
 			return errors.New("scan job carried no scan id")
 		}
 		return w.scanner.Run(ctx, payload.ScanID)
+	case queue.KindReconcileInstallation:
+		var payload queue.ReconcileInstallationPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return fmt.Errorf("decode reconcile payload: %w", err)
+		}
+		if payload.GitHubInstallationID == 0 {
+			return errors.New("reconcile job carried no installation id")
+		}
+		if w.reconciler == nil {
+			return errors.New("cannot reconcile repositories: GitHub integration is disabled on this worker")
+		}
+		return w.reconciler.Reconcile(ctx, payload.GitHubInstallationID)
 	default:
 		return fmt.Errorf("unknown job kind %q", job.Kind)
 	}
