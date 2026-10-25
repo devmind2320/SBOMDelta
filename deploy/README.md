@@ -104,6 +104,11 @@ development file, which is exactly why git is kept out of that directory.
 - the site already works **through Nginx**: `/` is the current `index.html`,
   and an anonymous `https://sbomdelta.website/api/repos` answers the way the
   running server must (see [API smoke expectations](#api-smoke-expectations)).
+  For a server with sign-in, an anonymous `POST /api/auth/logout` (no cookie,
+  no CSRF header) must also reach the server and get its own
+  `{"error":"cross-site request refused"}`: that proves Nginx passes the
+  `POST`, `PUT` and `DELETE` requests that sign-out, scans and tracking use.
+  The server refuses the probe before any handler runs, so it changes nothing.
   The requests go to Nginx on this host, so TLS, the server name and the
   proxying are all exercised;
 - the running server reports healthy at `http://127.0.0.1:8080/healthz`
@@ -216,10 +221,35 @@ server, `deploy.sh` compares the server's address with the one Nginx resolved:
   graceful: no container restart, in-flight requests finish, and nothing on
   disk is modified.
 
+**Methods.** The dashboard sends `GET` and `HEAD` reads and three kinds of
+writes under `/api/`: `POST` (`/api/auth/logout`, `/api/repos/{id}/scans`),
+`PUT` and `DELETE` (`/api/me/tracked/{id}`). Restrict the location to exactly
+those methods, never to `GET` alone:
+
+```nginx
+location /api/ {
+    limit_except GET POST PUT DELETE {
+        deny all;
+    }
+
+    proxy_pass http://server:8080/api/;
+    # ... proxy headers unchanged
+}
+```
+
+`limit_except GET` also allows `HEAD`. Every other method (`PATCH`, `OPTIONS`,
+`TRACE`, ...) gets Nginx's 403 before reaching the server. The server still
+checks every allowed write: sign-in (`auth.RequireUser`), and the CSRF header
+plus same-origin `Origin` (`auth.SameOrigin`). A `GET`-only `limit_except`
+answers every write with Nginx's HTML 403 page: sign-out reports "the server
+refused the sign-out request", and scans and tracking fail. Preflight detects
+that (see [What `deploy.sh` does](#what-deploysh-does)) and stops.
+`/webhooks/github` is a separate location and must allow `POST`.
+
 A reload applies whatever configuration is on disk, so preflight requires that
 no `*.conf` file under `/etc/nginx` in the container changed after Nginx last
 loaded its configuration (the start time of its oldest worker). An edit that
-has not been applied, such as the planned `limit_except` change, stops the
+has not been applied, such as a `limit_except` change, stops the
 preflight. Apply it (or revert it) deliberately first, then run preflight
 again. Files outside `/etc/nginx` that the configuration includes (for example
 certbot's `options-ssl-nginx.conf`) are not covered by this check.

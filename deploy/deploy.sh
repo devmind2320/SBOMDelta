@@ -370,6 +370,23 @@ nginx_get() {
 # load balancer, or another application -- proves nothing about this server.
 SIGNIN_REFUSAL='{"error":"authentication required"}'
 
+# nginx_post sends an anonymous POST through the running Nginx, like
+# nginx_get: no cookie, no CSRF header, no body. It writes the body to a file
+# and prints the HTTP status.
+nginx_post() {
+	curl -sS -X POST -o "$2" -w '%{http_code}' --max-time 10 \
+		--resolve "$PUBLIC_HOST:$NGINX_HTTPS_PORT:$NGINX_HTTPS_IP" \
+		"https://$PUBLIC_HOST:$NGINX_HTTPS_PORT$1" 2>/dev/null || true
+}
+
+# CSRF_REFUSAL is the server's exact answer to a state-changing request
+# without the CSRF header (auth.SameOrigin). An anonymous POST to
+# /api/auth/logout gets it before any handler runs, so the probe changes
+# nothing, and only this body proves the request reached the server: a proxy
+# that refuses the method (limit_except ... { deny all; }) answers with its
+# own 403 page.
+CSRF_REFUSAL='{"error":"cross-site request refused"}'
+
 # smoke_nginx checks the API through Nginx and, given a checksum, that Nginx
 # serves that index.html. On failure SMOKE_PROBLEM says which check failed --
 # the API, the homepage's status, or its checksum -- since each points at a
@@ -380,6 +397,11 @@ SIGNIN_REFUSAL='{"error":"authentication required"}'
 # sign-in lists repositories). Anything else, including no expectation at
 # all, fails. A server with sign-in that lists repositories anonymously fails
 # "signin": that is an authorization failure.
+#
+# A server with sign-in also takes POST, PUT and DELETE under /api/ (sign-out,
+# scans, tracking), so for "signin" an anonymous POST /api/auth/logout must
+# reach it and get its CSRF_REFUSAL. Nginx refusing the method fails here,
+# before preflight changes anything.
 smoke_nginx() {
 	local body code sha
 	SMOKE_PROBLEM=""
@@ -414,6 +436,16 @@ smoke_nginx() {
 		fi
 		;;
 	esac
+	if [ -z "$SMOKE_PROBLEM" ] && [ "$API_EXPECT" = signin ]; then
+		code="$(nginx_post /api/auth/logout "$body")"
+		if [ "$code" = 403 ] && [ "$(tr -d '\r\n' <"$body")" = "$CSRF_REFUSAL" ]; then
+			:
+		elif [ "$code" = 403 ]; then
+			SMOKE_PROBLEM="POST /api/auth/logout was refused with HTTP 403 before reaching the server; Nginx must pass POST, PUT and DELETE under /api/ (see deploy/README.md, Nginx)"
+		else
+			SMOKE_PROBLEM="POST /api/auth/logout without the CSRF header returned HTTP ${code:-none}, not the server's CSRF refusal"
+		fi
+	fi
 	if [ -z "$SMOKE_PROBLEM" ] && [ -n "${1:-}" ]; then
 		code="$(nginx_get / "$body")"
 		if [ "$code" != 200 ]; then

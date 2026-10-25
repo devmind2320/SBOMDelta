@@ -204,6 +204,56 @@ func TestStateChangingRequestsRequireSameOriginAndCSRFHeader(t *testing.T) {
 	}
 }
 
+// An anonymous POST to /api/auth/logout with no cookie and no CSRF header is
+// how deploy/deploy.sh proves that Nginx passes state-changing requests to
+// the server: only the server answers it with exactly this JSON refusal (a
+// proxy that denies the method answers with its own 403 page). The probe must
+// stay side-effect free, so it is refused before the handler runs.
+func TestAnonymousWriteProbeGetsTheServersCSRFRefusal(t *testing.T) {
+	f := newFixture(t)
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	recorder := serve(f, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("anonymous POST /api/auth/logout: status %d, want 403", recorder.Code)
+	}
+	if body := strings.TrimSpace(recorder.Body.String()); body != `{"error":"cross-site request refused"}` {
+		t.Errorf("body = %q, want the exact refusal deploy.sh matches", body)
+	}
+	if contentType := recorder.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", contentType)
+	}
+	if cookies := recorder.Result().Cookies(); len(cookies) != 0 {
+		t.Errorf("the refused probe set cookies %v; it must change nothing", cookies)
+	}
+	if code, _ := f.as(t, f.session, http.MethodGet, "/api/me"); code != http.StatusOK {
+		t.Errorf("an existing session after the probe: status %d, want 200", code)
+	}
+}
+
+// Every state-changing route the dashboard calls passes the browser checks
+// when it carries the CSRF header from the dashboard's own origin, and
+// reaches its handler (no 403); signing out then ends the session.
+func TestDashboardWriteRoutesPassTheBrowserChecks(t *testing.T) {
+	f := newFixture(t)
+	repo := jsonID(f.active.ID)
+	for _, route := range []struct{ method, path string }{
+		{http.MethodPut, "/api/me/tracked/" + repo},
+		{http.MethodDelete, "/api/me/tracked/" + repo},
+		{http.MethodPost, "/api/repos/" + repo + "/scans"},
+	} {
+		if code, body := f.as(t, f.session, route.method, route.path); code == http.StatusForbidden || code >= 500 {
+			t.Errorf("%s %s from the dashboard: status %d %s, want it to reach the handler", route.method, route.path, code, body)
+		}
+	}
+
+	if code, body := f.as(t, f.session, http.MethodPost, "/api/auth/logout"); code != http.StatusNoContent {
+		t.Fatalf("POST /api/auth/logout from the dashboard: status %d %s, want 204", code, body)
+	}
+	if code, _ := f.as(t, f.session, http.MethodGet, "/api/me"); code != http.StatusUnauthorized {
+		t.Errorf("the session after signing out: status %d, want 401", code)
+	}
+}
+
 // The webhook is exempt from the browser checks -- GitHub sends no Origin or
 // CSRF header -- and is still served by the signature-verifying handler.
 func TestWebhookBypassesBrowserChecksOnly(t *testing.T) {

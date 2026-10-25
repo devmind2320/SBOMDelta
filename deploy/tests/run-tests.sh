@@ -790,31 +790,44 @@ check "permissions: the previous as_dist_owner leaves the frontend unreadable (t
 signin_refusal="$(sed -n "s/^SIGNIN_REFUSAL='\(.*\)'$/\1/p" "$ROOT/deploy/deploy.sh")"
 check "smoke: deploy.sh defines the server's exact sign-in refusal" \
 	[ "$signin_refusal" = '{"error":"authentication required"}' ]
+# The server's CSRF refusal (auth.SameOrigin), which the write-path probe
+# requires; backend TestAnonymousWriteProbeGetsTheServersCSRFRefusal pins the
+# same body on the server side.
+csrf_refusal="$(sed -n "s/^CSRF_REFUSAL='\(.*\)'$/\1/p" "$ROOT/deploy/deploy.sh")"
+check "smoke: deploy.sh defines the server's exact CSRF refusal" \
+	[ "$csrf_refusal" = '{"error":"cross-site request refused"}' ]
 smoke_functions="$(awk '
-	/^(nginx_get|smoke_nginx|wait_for_nginx)\(\) \{$/ { on = 1 }
+	/^(nginx_get|nginx_post|smoke_nginx|wait_for_nginx)\(\) \{$/ { on = 1 }
 	on { print }
 	on && /^\}$/ { on = 0 }
 ' "$ROOT/deploy/deploy.sh")"
-check "smoke: deploy.sh defines nginx_get, smoke_nginx and wait_for_nginx" \
-	[ "$(grep -cE '^(nginx_get|smoke_nginx|wait_for_nginx)\(\) \{$' <<<"$smoke_functions")" -eq 3 ]
+check "smoke: deploy.sh defines nginx_get, nginx_post, smoke_nginx and wait_for_nginx" \
+	[ "$(grep -cE '^(nginx_get|nginx_post|smoke_nginx|wait_for_nginx)\(\) \{$' <<<"$smoke_functions")" -eq 4 ]
 
 mkdir -p "$WORK/fakecurl" "$WORK/smoke"
 cat >"$WORK/fakecurl/curl" <<'EOF2'
 #!/usr/bin/env bash
-# curl -sS -o <file> -w '%{http_code}' --max-time N --resolve H:P:IP <url>
-out="" url=""
+# curl -sS [-X METHOD] -o <file> -w '%{http_code}' --max-time N --resolve H:P:IP <url>
+out="" url="" method=GET
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-o) out="$2"; shift 2 ;;
+	-X) method="$2"; shift 2 ;;
 	-w | --max-time | --resolve) shift 2 ;;
 	-*) shift ;;
 	*) url="$1"; shift ;;
 	esac
 done
-case "$url" in
-*/api/repos) cat "$FAKE_API_BODY" >"$out"; printf '%s' "${FAKE_API_CODE:-200}" ;;
-*/) cat "$FAKE_HOME_BODY" >"$out"; printf '%s' "${FAKE_HOME_CODE:-200}" ;;
-*) echo "fake curl: unexpected url $url" >&2; exit 2 ;;
+case "$method $url" in
+"GET "*/api/repos) cat "$FAKE_API_BODY" >"$out"; printf '%s' "${FAKE_API_CODE:-200}" ;;
+# The write-path probe. By default the server's CSRF refusal, as a server
+# behind a correctly configured Nginx answers.
+"POST "*/api/auth/logout)
+	if [ -n "${FAKE_WRITE_BODY:-}" ]; then cat "$FAKE_WRITE_BODY" >"$out"
+	else printf '{"error":"cross-site request refused"}\n' >"$out"; fi
+	printf '%s' "${FAKE_WRITE_CODE:-403}" ;;
+"GET "*/) cat "$FAKE_HOME_BODY" >"$out"; printf '%s' "${FAKE_HOME_CODE:-200}" ;;
+*) echo "fake curl: unexpected $method $url" >&2; exit 2 ;;
 esac
 EOF2
 chmod +x "$WORK/fakecurl/curl"
@@ -835,7 +848,7 @@ smoke() {
 		# shellcheck disable=SC2034
 		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SMOKE_PROBLEM=""
 		# shellcheck disable=SC2034,SC2031
-		API_EXPECT="${API_EXPECT-repos}" SIGNIN_REFUSAL="$signin_refusal"
+		API_EXPECT="${API_EXPECT-repos}" SIGNIN_REFUSAL="$signin_refusal" CSRF_REFUSAL="$csrf_refusal"
 		# shellcheck disable=SC2030
 		export FAKE_API_BODY="${FAKE_API_BODY:-$WORK/smoke/api-ok}" FAKE_HOME_BODY="${FAKE_HOME_BODY:-$WORK/smoke/index-new}"
 		# shellcheck disable=SC2317,SC2329
@@ -920,13 +933,39 @@ for expectation in bogus either unknown ""; do
 	check "smoke: expectation '$expectation' does not accept the refusal either" exit_code_is "$out" 1
 done
 
+# The write path. A server with sign-in also takes POST, PUT and DELETE under
+# /api/ (sign-out, scans, tracking), so smoke_nginx sends an anonymous POST
+# /api/auth/logout, which only the server answers with its CSRF refusal. The
+# incident: Nginx's "limit_except GET { deny all; }" answered every such
+# request with its own HTML 403, so sign-out failed while every GET check
+# passed.
+printf '<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx/1.31.7</center>\r\n</body>\r\n</html>\r\n' >"$WORK/smoke/nginx-403"
+printf '{"error":"forbidden"}' >"$WORK/smoke/write-other-403"
+printf '{"error":"cross-site request refused"}\n' >"$WORK/smoke/write-refused"
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" FAKE_WRITE_BODY="$WORK/smoke/write-refused" smoke "$new_sha")"
+check "smoke (write): the server's CSRF refusal through Nginx passes" [ "$out" = "rc=0" ]
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" FAKE_WRITE_CODE=403 FAKE_WRITE_BODY="$WORK/smoke/nginx-403" smoke "$new_sha")"
+check "smoke (write): Nginx refusing POST under /api/ fails" exit_code_is "$out" 1
+check "smoke (write): ... and says Nginx must pass POST, PUT and DELETE" \
+	contains "$out" "last: POST /api/auth/logout was refused with HTTP 403 before reaching the server; Nginx must pass POST, PUT and DELETE under /api/ (see deploy/README.md, Nginx)"
+check "smoke (write): ... without blaming the homepage" sh -c '! printf "%s\n" "$1" | grep -q homepage' _ "$out"
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" FAKE_WRITE_CODE=403 FAKE_WRITE_BODY="$WORK/smoke/write-other-403" smoke "$new_sha")"
+check "smoke (write): a 403 with any other body is not the server's refusal" \
+	contains "$out" "last: POST /api/auth/logout was refused with HTTP 403 before reaching the server"
+for code in 204 401 404 405 502; do
+	out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" FAKE_WRITE_CODE=$code smoke "$new_sha")"
+	check "smoke (write): HTTP $code to the probe fails" \
+		contains "$out" "last: POST /api/auth/logout without the CSRF header returned HTTP $code, not the server's CSRF refusal"
+done
+out="$(API_EXPECT=repos FAKE_WRITE_CODE=403 FAKE_WRITE_BODY="$WORK/smoke/nginx-403" smoke "$new_sha")"
+check "smoke (write): a server that predates sign-in is not probed" [ "$out" = "rc=0" ]
 # What smoke_nginx saw is what rollback will require of the restored server.
 seen_of() {
 	(
 		# shellcheck disable=SC2030,SC2031
 		PATH="$WORK/fakecurl:$PATH"
 		# shellcheck disable=SC2034
-		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 API_EXPECT=repos SIGNIN_REFUSAL="$signin_refusal"
+		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 API_EXPECT=repos SIGNIN_REFUSAL="$signin_refusal" CSRF_REFUSAL="$csrf_refusal"
 		# shellcheck disable=SC2030,SC2031
 		export FAKE_API_BODY="$1" FAKE_API_CODE="$2" FAKE_HOME_BODY="$WORK/smoke/index-new"
 		eval "$smoke_functions"
@@ -1037,7 +1076,7 @@ lifecycle() {
 		# shellcheck disable=SC2030,SC2031,SC2034
 		PATH="$WORK/fakedocker:$WORK/fakecurl:$PATH" SIGNIN_LABEL="$signin_label_key"
 		# shellcheck disable=SC2034
-		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SIGNIN_REFUSAL="$signin_refusal"
+		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SIGNIN_REFUSAL="$signin_refusal" CSRF_REFUSAL="$csrf_refusal"
 		# shellcheck disable=SC2031
 		export FAKE_HOME_BODY="$WORK/smoke/index-new"
 		# shellcheck disable=SC2317,SC2329
@@ -1089,12 +1128,21 @@ for state in missing stale garbage unreadable; do
 done
 out="$(lifecycle sha256:gone repos sha256:new signin repos missing)"
 check "lifecycle: a running image that cannot be inspected stops preflight" [ "$out" = "preflight=error" ]
+# Nginx refusing POST under /api/: a running signed-in release fails preflight,
+# before anything changes; the first signed-in rollout behind such an Nginx
+# fails after the switch and rolls back to the old image, which predates
+# sign-in and is not probed.
+out="$(FAKE_WRITE_CODE=403 FAKE_WRITE_BODY="$WORK/smoke/nginx-403" lifecycle sha256:new signin sha256:new signin signin missing)"
+check "lifecycle: Nginx refusing POST under /api/ fails a signed-in release's preflight" [ "${out%% *}" = "preflight=fail" ]
+out="$(FAKE_WRITE_CODE=403 FAKE_WRITE_BODY="$WORK/smoke/nginx-403" lifecycle sha256:old repos sha256:new signin repos missing)"
+check "lifecycle: ... and a first signed-in rollout behind it fails after the switch, then rolls back" [ "$out" = "preflight=pass post=fail rollback=pass" ]
 
 # deploy.sh, the CD workflow and the server's own test must agree on the
 # refusal, or a correct server would fail its smoke tests (or a wrong one pass).
 check "smoke: the CD workflow requires the same refusal" grep -qF -- "refusal='$signin_refusal'" "$ROOT/.github/workflows/cd.yml"
 check "smoke: the CD workflow fails an anonymous repository list" grep -qF -- 'lists repositories without sign-in' "$ROOT/.github/workflows/cd.yml"
 check "smoke: the server's test pins the same refusal" grep -qF -- "got != \`$signin_refusal\`" "$ROOT/backend/internal/api/security_test.go"
+check "smoke: the server's test pins the same CSRF refusal" grep -qF -- "body != \`$csrf_refusal\`" "$ROOT/backend/internal/api/security_test.go"
 
 # ------------------------------------------------- CD public check --
 

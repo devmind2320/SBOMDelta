@@ -86,6 +86,8 @@ jobs:
           grep -q -- '--- PASS: TestWebhookIsAuthenticatedIdempotentAndFollowsThePullRequest' test-output.txt
           grep -q -- '--- PASS: TestTrackMovesARepositoryBetweenTheDashboardSections' test-output.txt
           grep -q -- '--- PASS: TestLastScansAndImpactAreScopedToTrackedRepositories' test-output.txt
+          grep -q -- '--- PASS: TestAnonymousWriteProbeGetsTheServersCSRFRefusal' test-output.txt
+          grep -q -- '--- PASS: TestDashboardWriteRoutesPassTheBrowserChecks' test-output.txt
 
       - name: Run lint checks
         run: make lint
