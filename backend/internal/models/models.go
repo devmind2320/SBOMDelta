@@ -95,6 +95,9 @@ const (
 	TriggerPullRequest ScanTrigger = "pull_request"
 	TriggerManual      ScanTrigger = "manual"
 	TriggerBackfill    ScanTrigger = "backfill"
+	// TriggerInitial is the first scan of a repository the GitHub App can
+	// reach, taken at its default branch head without waiting for a push.
+	TriggerInitial ScanTrigger = "initial"
 )
 
 type Scan struct {

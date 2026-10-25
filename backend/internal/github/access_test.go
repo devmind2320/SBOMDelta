@@ -23,8 +23,10 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 func newTestHandler(t *testing.T) (*WebhookHandler, *storage.DB) {
 	t.Helper()
 	db := storagetest.Open(t, "test_github")
-	return NewWebhookHandler("unused", db, queue.New(db.Pool(), time.Minute), discardLogger()), db
+	return NewWebhookHandler("unused", db, testQueue(db), discardLogger()), db
 }
+
+func testQueue(db *storage.DB) *queue.Queue { return queue.New(db.Pool(), time.Minute) }
 
 func testInstallation() *gh.Installation {
 	return &gh.Installation{
@@ -220,7 +222,7 @@ func TestReconcileAfterNarrowingAccess(t *testing.T) {
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"), eventRepo(1002, "devmind2320/web"))
 
 	lister := &fakeLister{repos: []*gh.Repository{apiRepo(1002, "web"), apiRepo(1003, "docs")}}
-	if err := NewReconciler(lister, db, discardLogger()).Reconcile(context.Background(), testInstallationID); err != nil {
+	if err := NewReconciler(lister, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
 
@@ -242,7 +244,7 @@ func TestReconcileListingErrorChangesNothing(t *testing.T) {
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"))
 
 	lister := &fakeLister{err: errors.New("github is unreachable")}
-	if err := NewReconciler(lister, db, discardLogger()).Reconcile(context.Background(), testInstallationID); err == nil {
+	if err := NewReconciler(lister, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err == nil {
 		t.Fatal("Reconcile() succeeded, want the listing error so the job retries")
 	}
 	if got := repoByName(t, db, "api").Access; got != models.AccessActive {
@@ -254,7 +256,7 @@ func TestReconcileSkipsUnusableInstallations(t *testing.T) {
 	_, db := newTestHandler(t)
 	ctx := context.Background()
 	lister := &fakeLister{}
-	reconciler := NewReconciler(lister, db, discardLogger())
+	reconciler := NewReconciler(lister, db, testQueue(db), discardLogger())
 
 	// Unknown: the installation event that creates it has not landed yet.
 	if err := reconciler.Reconcile(ctx, 999); err != nil {
@@ -420,7 +422,7 @@ func TestReconcileAbandonedWhenUninstalledDuringListing(t *testing.T) {
 	h, db := newTestHandler(t)
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"))
 
-	if err := NewReconciler(listerThatUninstalls{db: db}, db, discardLogger()).
+	if err := NewReconciler(listerThatUninstalls{db: db}, db, testQueue(db), discardLogger()).
 		Reconcile(context.Background(), testInstallationID); err != nil {
 		t.Fatalf("Reconcile() error = %v, want the reconciliation quietly abandoned", err)
 	}

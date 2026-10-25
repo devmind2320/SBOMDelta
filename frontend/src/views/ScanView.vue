@@ -3,7 +3,7 @@ import { computed, ref, toRef, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
-import { compactNumber, formatDateTime, shortSha } from '../lib/format.js'
+import { compactNumber, formatDateTime, scanTriggerLabel, shortSha } from '../lib/format.js'
 import ComponentTable from '../components/ComponentTable.vue'
 import DataCard from '../components/DataCard.vue'
 import DriftList from '../components/DriftList.vue'
@@ -102,7 +102,7 @@ const isBaseline = computed(
         </h1>
         <p class="mt-1 mb-0 flex flex-wrap items-center gap-2 text-sm text-ink-muted">
           <ScanStatusBadge :status="scan.data.value.status" />
-          <span>{{ scan.data.value.trigger.replace('_', ' ') }}</span>
+          <span>{{ scanTriggerLabel(scan.data.value.trigger) }}</span>
           <span>· {{ formatDateTime(scan.data.value.createdAt) }}</span>
           <span v-if="scan.data.value.baseCommitSha">
             · base

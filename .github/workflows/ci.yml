@@ -64,7 +64,9 @@ jobs:
             exit 1
           fi
           grep -q -- '--- PASS: TestMigration0004UpgradesExistingDatabase' test-output.txt
+          grep -q -- '--- PASS: TestMigration0005AddsInitialTrigger' test-output.txt
           grep -q -- '--- PASS: TestReconcileAfterNarrowingAccess' test-output.txt
+          grep -q -- '--- PASS: TestConcurrentInitialAndPushScansCreateOneBaseline' test-output.txt
 
       - name: Run lint checks
         run: make lint
@@ -91,6 +93,9 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Run frontend tests
+        run: npm test
 
       - name: Build Vue frontend
         run: npm run build

@@ -74,17 +74,20 @@ func run(logger *slog.Logger) error {
 	pipeline := scanner.New(db, blob, app, generator, cfg.Scanner, logger)
 
 	var reconciler *ghapp.Reconciler
+	var initial *ghapp.InitialScanner
 	if app != nil {
-		reconciler = ghapp.NewReconciler(app, db, logger)
+		reconciler = ghapp.NewReconciler(app, db, jobs, logger)
+		initial = ghapp.NewInitialScanner(app, db, jobs, logger)
 		// A webhook missed while nothing was listening is never redelivered
 		// once GitHub stops retrying, so re-read every installation's
-		// repository list each time a worker starts.
+		// repository list each time a worker starts. Reconciliation also
+		// queues initial scans for repositories that have never been scanned.
 		if err := enqueueReconciliation(ctx, db, jobs, logger); err != nil {
 			return err
 		}
 	}
 
-	return worker.New(workerID(), jobs, pipeline, reconciler, cfg.Worker, logger).Run(ctx)
+	return worker.New(workerID(), jobs, pipeline, reconciler, initial, cfg.Worker, logger).Run(ctx)
 }
 
 func enqueueReconciliation(ctx context.Context, db *storage.DB, jobs *queue.Queue, logger *slog.Logger) error {

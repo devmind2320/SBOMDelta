@@ -92,7 +92,11 @@ The comparison is only as meaningful as what it compares against:
   PR itself changes and nothing else.
 - **A push** is diffed against the **previous tip of the default branch**.
 - **The first scan** of a repository is a baseline, not a diff. Every component reported
-  as "added" on day one would be noise.
+  as "added" on day one would be noise. A repository the App can reach that has no
+  default-branch scan yet gets an **initial scan** of its default branch head
+  automatically, queued by repository reconciliation (on every worker start and after
+  installation changes) and spaced out across repositories. Initial scans post no check
+  run.
 
 When a PR's base commit was never scanned (the app was installed mid-stream), the worker
 backfills it before diffing, so the comparison is against the real base rather than

@@ -27,6 +27,9 @@ const (
 	// KindReconcileInstallation re-reads an installation's repository list
 	// from GitHub and brings stored access in line with it.
 	KindReconcileInstallation Kind = "reconcile_installation"
+	// KindInitialScan gives a repository that has never been scanned its
+	// first scan, at the head of its default branch.
+	KindInitialScan Kind = "initial_scan"
 )
 
 // ErrNoJobs signals that the queue is empty right now.
@@ -50,6 +53,11 @@ type ScanPayload struct {
 // ReconcileInstallationPayload is the body of a KindReconcileInstallation job.
 type ReconcileInstallationPayload struct {
 	GitHubInstallationID int64 `json:"githubInstallationId"`
+}
+
+// InitialScanPayload is the body of a KindInitialScan job.
+type InitialScanPayload struct {
+	RepositoryID int64 `json:"repositoryId"`
 }
 
 // Queue reads and writes the jobs table.
@@ -92,6 +100,68 @@ func (q *Queue) EnqueueAfter(ctx context.Context, kind Kind, payload any, dedupe
 		return 0, fmt.Errorf("enqueue %s job: %w", kind, err)
 	}
 	return id, nil
+}
+
+// EnqueueSpaced is Enqueue for background work that must not arrive as a
+// burst: the job runs spacing after the latest job of the same kind still
+// waiting in the queue, or now if none is. Spacing is measured across every
+// caller, so two installations reconciled at once interleave their jobs
+// rather than each starting its own burst at the same moment.
+func (q *Queue) EnqueueSpaced(ctx context.Context, kind Kind, payload any, dedupeKey string, spacing time.Duration) (int64, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("marshal job payload: %w", err)
+	}
+
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin spaced enqueue: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Serializes spaced enqueues of one kind, so concurrent callers cannot
+	// read the same latest run_after and schedule on top of each other.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended('sbomdelta.jobs.spaced.' || $1, 0))`,
+		string(kind)); err != nil {
+		return 0, fmt.Errorf("lock spaced enqueue: %w", err)
+	}
+
+	const query = `
+		INSERT INTO jobs (kind, payload, dedupe_key, run_after)
+		SELECT $1, $2, NULLIF($3, ''), GREATEST(now(),
+			COALESCE((SELECT max(run_after) FROM jobs WHERE kind = $1 AND status = 'queued')
+			         + make_interval(secs => $4), now()))
+		ON CONFLICT (dedupe_key) DO NOTHING
+		RETURNING id`
+
+	var id int64
+	err = tx.QueryRow(ctx, query, string(kind), body, dedupeKey, spacing.Seconds()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil // Already queued; nothing more to do.
+	}
+	if err != nil {
+		return 0, fmt.Errorf("enqueue %s job: %w", kind, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit spaced enqueue: %w", err)
+	}
+	return id, nil
+}
+
+// ReleaseDeadDedupeKey frees a dedupe key held by a job that exhausted its
+// retries, so the same work can be queued again. The dead job itself is kept
+// for inspection. A key held by a queued, running or retrying job is left
+// alone. It reports whether a key was released.
+func (q *Queue) ReleaseDeadDedupeKey(ctx context.Context, dedupeKey string) (bool, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE jobs
+		SET dedupe_key = NULL, updated_at = now()
+		WHERE dedupe_key = $1 AND status = 'dead'`, dedupeKey)
+	if err != nil {
+		return false, fmt.Errorf("release dead dedupe key: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // Dequeue claims the oldest runnable job for this worker. Jobs whose lock has

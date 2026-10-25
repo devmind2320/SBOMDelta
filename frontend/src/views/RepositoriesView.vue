@@ -33,7 +33,7 @@ const inactive = computed(() => (repositories.value ?? []).filter((repo) => !isA
       <EmptyState
         v-else-if="!active.length"
         title="No repositories yet"
-        note="Install the GitHub App on a repository and push a commit. The first scan records a baseline; the commit after it starts the drift history."
+        note="Install the GitHub App on a repository. Its default branch is scanned automatically to record a baseline; the next push starts the drift history."
       />
 
       <ul v-else class="m-0 flex list-none flex-col p-0">

@@ -4,6 +4,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -142,6 +143,92 @@ func (a *App) ListInstallationRepositories(ctx context.Context, installationID i
 			len(repos), installationID, total)
 	}
 	return repos, nil
+}
+
+// ErrNoBranchHead means GitHub answered definitively that a repository has no
+// default branch commit to scan: it is empty, or the installation can no
+// longer see it. Retrying will not change the answer, unlike a network error,
+// a rate limit or a 5xx.
+var ErrNoBranchHead = errors.New("repository has no default branch head")
+
+// BranchHead is the commit a repository's default branch points at, and the
+// repository's name as GitHub reported it alongside.
+type BranchHead struct {
+	Owner  string
+	Name   string
+	Branch string
+	SHA    string
+}
+
+// FullName is the owner/name GitHub currently uses for the repository.
+func (h BranchHead) FullName() string { return h.Owner + "/" + h.Name }
+
+// DefaultBranchHead asks GitHub, as the installation, which commit the
+// repository's default branch points at right now.
+//
+// The repository is looked up by its numeric GitHub ID, which survives
+// renames and transfers, so the answer is about exactly the repository that
+// was granted -- never another one that has since taken its old name. The
+// default branch is likewise read from GitHub rather than from the stored
+// row. The calls need metadata and contents read access, which the worker
+// already relies on to clone the repository.
+func (a *App) DefaultBranchHead(ctx context.Context, installationID, githubRepoID int64) (BranchHead, error) {
+	client, err := a.InstallationClient(installationID)
+	if err != nil {
+		return BranchHead{}, err
+	}
+
+	label := fmt.Sprintf("repository %d", githubRepoID)
+	repo, resp, err := client.Repositories.GetByID(ctx, githubRepoID)
+	if err != nil {
+		return BranchHead{}, headError(label, "read repository", resp, err)
+	}
+	owner, name := repo.GetOwner().GetLogin(), repo.GetName()
+	if repo.GetID() != githubRepoID || owner == "" || name == "" {
+		return BranchHead{}, fmt.Errorf("%s: GitHub returned repository %d %q/%q", label, repo.GetID(), owner, name)
+	}
+	branch := repo.GetDefaultBranch()
+	if branch == "" {
+		return BranchHead{}, fmt.Errorf("%s/%s reports no default branch: %w", owner, name, ErrNoBranchHead)
+	}
+
+	ref, resp, err := client.Repositories.GetBranch(ctx, owner, name, branch, 1)
+	if err != nil {
+		return BranchHead{}, headError(owner+"/"+name, "read branch "+branch, resp, err)
+	}
+	sha := ref.GetCommit().GetSHA()
+	if !isCommitSHA(sha) {
+		return BranchHead{}, fmt.Errorf("%s/%s branch %s returned malformed commit %q", owner, name, branch, sha)
+	}
+	return BranchHead{Owner: owner, Name: name, Branch: branch, SHA: sha}, nil
+}
+
+// headError classifies a failed head lookup by HTTP status. 404 (no access,
+// or an empty repository's missing branch) and 409 (empty repository) are
+// definitive; everything else, including no response at all, is left
+// retryable. The status is read from the response rather than the error
+// because GetBranch reports failures as an untyped error.
+func headError(label, action string, resp *gh.Response, err error) error {
+	if resp != nil && resp.Response != nil {
+		switch resp.StatusCode {
+		case http.StatusNotFound, http.StatusConflict:
+			return fmt.Errorf("%s: %s: %w (%v)", label, action, ErrNoBranchHead, err)
+		}
+	}
+	return fmt.Errorf("%s: %s: %w", label, action, err)
+}
+
+// isCommitSHA accepts full SHA-1 and SHA-256 object names only.
+func isCommitSHA(sha string) bool {
+	if len(sha) != 40 && len(sha) != 64 {
+		return false
+	}
+	for _, c := range sha {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // CloneURL builds an authenticated HTTPS clone URL. The token is embedded in

@@ -101,6 +101,24 @@ export function accessLabel(access) {
   }
 }
 
+/** Human wording for what queued a scan. Unknown values fall back to the raw name. */
+export function scanTriggerLabel(trigger) {
+  switch (trigger) {
+    case 'push':
+      return 'push'
+    case 'pull_request':
+      return 'pull request'
+    case 'manual':
+      return 'manual'
+    case 'backfill':
+      return 'backfill'
+    case 'initial':
+      return 'initial scan'
+    default:
+      return typeof trigger === 'string' ? trigger.replaceAll('_', ' ') : ''
+  }
+}
+
 export function isAccessible(repository) {
   return (repository?.access ?? 'active') === 'active'
 }

@@ -10,6 +10,7 @@ import {
   formatDateTime,
   isAccessible,
   relativeTime,
+  scanTriggerLabel,
   shortSha,
 } from '../lib/format.js'
 import DataCard from '../components/DataCard.vue'
@@ -171,7 +172,7 @@ const componentDelta = computed(() => {
               >
                 <td class="nums px-2 py-2 text-ink">{{ shortSha(scan.commitSha) }}</td>
                 <td class="px-2 py-2 text-xs text-ink-secondary">
-                  {{ scan.trigger.replace('_', ' ') }}
+                  {{ scanTriggerLabel(scan.trigger) }}
                 </td>
                 <td class="px-2 py-2"><ScanStatusBadge :status="scan.status" /></td>
                 <td class="nums px-2 py-2 text-right text-ink-secondary">

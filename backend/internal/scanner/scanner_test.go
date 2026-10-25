@@ -60,3 +60,15 @@ func TestRunRefusesRepositoryWithoutAccess(t *testing.T) {
 		t.Errorf("error = %q, want it to explain the revoked access", got.Error)
 	}
 }
+
+// Initial, manual and backfill scans never open a check run. The scanner has
+// no GitHub app here, so reaching StartCheckRun would panic.
+func TestOpenCheckRunSkipsScansNotCausedByAPushOrPullRequest(t *testing.T) {
+	s := New(nil, nil, nil, nil, config.Scanner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	for _, trigger := range []models.ScanTrigger{models.TriggerInitial, models.TriggerManual, models.TriggerBackfill} {
+		scan := models.Scan{ID: 1, CommitSHA: "3333333333333333333333333333333333333333", Trigger: trigger}
+		if id := s.openCheckRun(context.Background(), s.logger, scan, models.Repository{}, repoAccess{installationID: 4242}); id != 0 {
+			t.Errorf("%s scan opened check run %d, want none", trigger, id)
+		}
+	}
+}

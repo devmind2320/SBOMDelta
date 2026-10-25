@@ -256,7 +256,11 @@ func (s *Scanner) backfill(ctx context.Context, logger *slog.Logger, repo models
 }
 
 func (s *Scanner) openCheckRun(ctx context.Context, logger *slog.Logger, scan models.Scan, repo models.Repository, access repoAccess) int64 {
-	if scan.Trigger == models.TriggerBackfill || scan.Trigger == models.TriggerManual {
+	// Only scans caused by a push or pull request report back. A check run on
+	// a commit nobody just pushed -- a backfilled base, a manual scan, or the
+	// default branch head an initial scan picked -- would be unexplained noise.
+	switch scan.Trigger {
+	case models.TriggerBackfill, models.TriggerManual, models.TriggerInitial:
 		return 0
 	}
 	// A manually registered repository has no installation to post a check as.

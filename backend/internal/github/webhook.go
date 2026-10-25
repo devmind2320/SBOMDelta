@@ -341,7 +341,7 @@ func (h *WebhookHandler) handlePush(ctx context.Context, logger *slog.Logger, ev
 		return err
 	}
 
-	return h.enqueueScan(ctx, logger, scan, record.FullName())
+	return enqueuePendingScan(ctx, h.queue, logger, scan, record.FullName())
 }
 
 func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Logger, event *gh.PullRequestEvent) error {
@@ -419,10 +419,14 @@ func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Log
 	}
 
 	logger = logger.With("pr", pr.GetNumber())
-	return h.enqueueScan(ctx, logger, scan, record.FullName())
+	return enqueuePendingScan(ctx, h.queue, logger, scan, record.FullName())
 }
 
-func (h *WebhookHandler) enqueueScan(ctx context.Context, logger *slog.Logger, scan models.Scan, fullName string) error {
+// enqueuePendingScan queues a scan job for a scan that has not started. Every
+// path that creates a scan -- push, pull request and initial scan -- goes
+// through it, so they share one dedupe key per scan and cannot queue the same
+// scan twice or re-run one that is already finished.
+func enqueuePendingScan(ctx context.Context, q *queue.Queue, logger *slog.Logger, scan models.Scan, fullName string) error {
 	// A scan already past pending was queued by an earlier delivery of the
 	// same commit; leave it alone rather than racing the worker.
 	if scan.Status != models.ScanPending {
@@ -431,7 +435,7 @@ func (h *WebhookHandler) enqueueScan(ctx context.Context, logger *slog.Logger, s
 	}
 
 	dedupeKey := fmt.Sprintf("scan:%d", scan.ID)
-	jobID, err := h.queue.Enqueue(ctx, queue.KindScan, queue.ScanPayload{ScanID: scan.ID}, dedupeKey)
+	jobID, err := q.Enqueue(ctx, queue.KindScan, queue.ScanPayload{ScanID: scan.ID}, dedupeKey)
 	if err != nil {
 		return err
 	}

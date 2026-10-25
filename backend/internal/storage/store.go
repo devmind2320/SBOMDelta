@@ -514,6 +514,20 @@ func scanScan(row pgx.Row) (models.Scan, error) {
 	return out, nil
 }
 
+// lockRepositoryScans serializes scan creation for one repository until the
+// transaction ends. Without it, CreateInitialScan's "no scan exists yet"
+// check could miss a push scan inserted concurrently but not yet committed.
+// It is a transaction-level advisory lock, so it never blocks writes to the
+// repository row itself.
+func lockRepositoryScans(ctx context.Context, tx pgx.Tx, repositoryID int64) error {
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended('sbomdelta.scans.' || $1::bigint, 0))`,
+		repositoryID); err != nil {
+		return fmt.Errorf("lock repository scans: %w", err)
+	}
+	return nil
+}
+
 // CreateScan inserts a pending scan. Re-delivering the same webhook returns
 // the existing scan rather than creating a duplicate, which is what makes the
 // whole pipeline safe to retry.
@@ -524,15 +538,27 @@ func (db *DB) CreateScan(ctx context.Context, scan models.Scan) (models.Scan, er
 		ON CONFLICT (repository_id, commit_sha, (COALESCE(pull_request_id, 0))) DO NOTHING
 		RETURNING ` + scanColumns
 
-	row := db.pool.QueryRow(ctx, insert, scan.RepositoryID, scan.PullRequestID, scan.CommitSHA,
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return models.Scan{}, fmt.Errorf("begin create scan: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockRepositoryScans(ctx, tx, scan.RepositoryID); err != nil {
+		return models.Scan{}, err
+	}
+	row := tx.QueryRow(ctx, insert, scan.RepositoryID, scan.PullRequestID, scan.CommitSHA,
 		scan.BaseCommitSHA, scan.Trigger)
 	out, err := scanScan(row)
 	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return models.Scan{}, fmt.Errorf("commit create scan: %w", err)
+		}
 		return out, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return models.Scan{}, fmt.Errorf("create scan: %w", err)
 	}
+	_ = tx.Rollback(ctx)
 
 	// DO NOTHING suppressed the RETURNING clause: the scan already exists.
 	const existing = `
@@ -544,6 +570,123 @@ func (db *DB) CreateScan(ctx context.Context, scan models.Scan) (models.Scan, er
 		return models.Scan{}, fmt.Errorf("load existing scan: %w", err)
 	}
 	return out, nil
+}
+
+// needsInitialScan is true for a repository with no default-branch history:
+// no scan outside a pull request, other than a failed initial scan.
+//
+// Pull request scans do not count. They measure a proposal against its own
+// base and are never used as a branch baseline, so a repository that has
+// only those still has nothing to show for its default branch. A failed
+// initial scan does not count either, so that reconciliation retries it
+// rather than leaving the repository without a baseline until the next push.
+//
+// Correlated on the repositories table by name, like repositoryAccess.
+const needsInitialScan = `
+	NOT EXISTS (
+		SELECT 1 FROM scans s
+		WHERE s.repository_id = repositories.id
+		  AND s.pull_request_id IS NULL
+		  AND NOT (s.trigger = 'initial' AND s.status = 'failed'))`
+
+// ListRepositoriesNeedingInitialScan returns the installation's accessible
+// repositories that have no default-branch history yet, oldest first.
+func (db *DB) ListRepositoriesNeedingInitialScan(ctx context.Context, installationID int64) ([]models.Repository, error) {
+	query := `
+		SELECT ` + repositoryColumns + `
+		FROM repositories
+		WHERE installation_id = $1
+		  AND ` + repositoryAccess + ` = 'active'
+		  AND ` + needsInitialScan + `
+		ORDER BY id`
+
+	rows, err := db.pool.Query(ctx, query, installationID)
+	if err != nil {
+		return nil, fmt.Errorf("list repositories needing an initial scan: %w", err)
+	}
+	defer rows.Close()
+
+	repos := make([]models.Repository, 0)
+	for rows.Next() {
+		var repo models.Repository
+		if err := rows.Scan(repositoryTargets(&repo)...); err != nil {
+			return nil, fmt.Errorf("scan repository: %w", err)
+		}
+		repos = append(repos, repo)
+	}
+	return repos, rows.Err()
+}
+
+// NeedsInitialScan reports whether a repository still has no default-branch
+// history, by the same rule ListRepositoriesNeedingInitialScan uses.
+func (db *DB) NeedsInitialScan(ctx context.Context, repositoryID int64) (bool, error) {
+	var needs bool
+	err := db.pool.QueryRow(ctx,
+		`SELECT `+needsInitialScan+` FROM repositories WHERE id = $1`, repositoryID).Scan(&needs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("check for initial scan: %w", err)
+	}
+	return needs, nil
+}
+
+// FindInitialScan returns a repository's initial scan, if one was created.
+func (db *DB) FindInitialScan(ctx context.Context, repositoryID int64) (models.Scan, error) {
+	const query = `
+		SELECT ` + scanColumns + `
+		FROM scans
+		WHERE repository_id = $1 AND trigger = 'initial'
+		ORDER BY id
+		LIMIT 1`
+
+	out, err := scanScan(db.pool.QueryRow(ctx, query, repositoryID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.Scan{}, ErrNotFound
+	}
+	if err != nil {
+		return models.Scan{}, fmt.Errorf("find initial scan: %w", err)
+	}
+	return out, nil
+}
+
+// CreateInitialScan inserts a pending initial scan only if the repository
+// still has no scan outside a pull request, and reports whether it did. A
+// failed initial scan also blocks it: that one is retried, not duplicated.
+//
+// It takes the same per-repository lock as CreateScan before checking, so a
+// push scan created at the same moment either commits first and is seen
+// here -- and no initial scan is created alongside it -- or waits and finds
+// the initial scan already there.
+func (db *DB) CreateInitialScan(ctx context.Context, repositoryID int64, commitSHA string) (models.Scan, bool, error) {
+	const insert = `
+		INSERT INTO scans (repository_id, commit_sha, trigger, status)
+		SELECT $1, $2, 'initial', 'pending'
+		WHERE NOT EXISTS (SELECT 1 FROM scans WHERE repository_id = $1 AND pull_request_id IS NULL)
+		ON CONFLICT (repository_id, commit_sha, (COALESCE(pull_request_id, 0))) DO NOTHING
+		RETURNING ` + scanColumns
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return models.Scan{}, false, fmt.Errorf("begin create initial scan: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockRepositoryScans(ctx, tx, repositoryID); err != nil {
+		return models.Scan{}, false, err
+	}
+
+	out, err := scanScan(tx.QueryRow(ctx, insert, repositoryID, commitSHA))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.Scan{}, false, nil
+	}
+	if err != nil {
+		return models.Scan{}, false, fmt.Errorf("create initial scan: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return models.Scan{}, false, fmt.Errorf("commit initial scan: %w", err)
+	}
+	return out, true, nil
 }
 
 func (db *DB) GetScan(ctx context.Context, id int64) (models.Scan, error) {

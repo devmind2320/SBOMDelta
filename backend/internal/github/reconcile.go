@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	gh "github.com/google/go-github/v66/github"
 
 	"sbomdelta/internal/models"
+	"sbomdelta/internal/queue"
 	"sbomdelta/internal/storage"
 )
 
@@ -28,16 +30,25 @@ type RepositoryLister interface {
 type Reconciler struct {
 	lister RepositoryLister
 	db     *storage.DB
+	queue  *queue.Queue
 	logger *slog.Logger
 }
 
-func NewReconciler(lister RepositoryLister, db *storage.DB, logger *slog.Logger) *Reconciler {
-	return &Reconciler{lister: lister, db: db, logger: logger}
+func NewReconciler(lister RepositoryLister, db *storage.DB, q *queue.Queue, logger *slog.Logger) *Reconciler {
+	return &Reconciler{lister: lister, db: db, queue: q, logger: logger}
 }
 
-// Reconcile re-reads one installation's repositories. If GitHub cannot be
-// reached it returns the error and changes nothing; it never treats a failed
-// listing as "no repositories", which would revoke everything.
+// initialScanStagger spaces out initial scans across every installation.
+// Installing the App on an account with hundreds of repositories, or a worker
+// starting with several such installations, would otherwise put hundreds of
+// clones at the front of the queue at once, and every push and pull request
+// scan would wait behind them.
+const initialScanStagger = 15 * time.Second
+
+// Reconcile re-reads one installation's repositories, then queues an initial
+// scan for every accessible repository that has never been scanned. If GitHub
+// cannot be reached it returns the error and changes nothing; it never treats
+// a failed listing as "no repositories", which would revoke everything.
 func (r *Reconciler) Reconcile(ctx context.Context, githubInstallationID int64) error {
 	logger := r.logger.With("installation", githubInstallationID)
 
@@ -90,5 +101,42 @@ func (r *Reconciler) Reconcile(ctx context.Context, githubInstallationID int64) 
 	}
 	logger.Info("reconciled installation repositories",
 		"account", installation.AccountLogin, "accessible", result.Accessible, "revoked", result.Revoked)
+
+	return r.enqueueInitialScans(ctx, logger, installation.ID)
+}
+
+// enqueueInitialScans queues one initial_scan job per repository with no
+// default-branch history. The dedupe key makes this safe to repeat: every
+// worker start and every webhook reconciles again, and a repository whose job
+// is still queued, running or waiting to retry is not queued a second time.
+//
+// A job that exhausted its retries would hold its key forever, so its key is
+// released first and the repository gets a fresh job. That retries a
+// persistent failure once per reconciliation -- worker starts and
+// installation webhooks -- never in a tight loop.
+func (r *Reconciler) enqueueInitialScans(ctx context.Context, logger *slog.Logger, installationID int64) error {
+	repos, err := r.db.ListRepositoriesNeedingInitialScan(ctx, installationID)
+	if err != nil {
+		return err
+	}
+
+	queued := 0
+	for _, repo := range repos {
+		dedupeKey := fmt.Sprintf("initial:%d", repo.ID)
+		if _, err := r.queue.ReleaseDeadDedupeKey(ctx, dedupeKey); err != nil {
+			return err
+		}
+		jobID, err := r.queue.EnqueueSpaced(ctx, queue.KindInitialScan,
+			queue.InitialScanPayload{RepositoryID: repo.ID}, dedupeKey, initialScanStagger)
+		if err != nil {
+			return err
+		}
+		if jobID != 0 {
+			queued++
+		}
+	}
+	if len(repos) > 0 {
+		logger.Info("queued initial scans", "needing", len(repos), "queued", queued)
+	}
 	return nil
 }

@@ -3,6 +3,7 @@ package queue_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -256,5 +257,87 @@ func TestDequeueIsFIFO(t *testing.T) {
 		if job.ID != want {
 			t.Errorf("job %d = %d, want %d", i, job.ID, want)
 		}
+	}
+}
+
+// A dead job's dedupe key blocks the same work from ever being queued again
+// unless it is released. Releasing must not touch a key a live job holds.
+func TestReleaseDeadDedupeKey(t *testing.T) {
+	q := newTestQueue(t, 15*time.Minute)
+	ctx := context.Background()
+
+	if _, err := q.Enqueue(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: 9}, "initial:9"); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+	if released, err := q.ReleaseDeadDedupeKey(ctx, "initial:9"); err != nil || released {
+		t.Fatalf("ReleaseDeadDedupeKey() on a queued job = %v, %v; want false, nil", released, err)
+	}
+	if id, _ := q.Enqueue(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: 9}, "initial:9"); id != 0 {
+		t.Fatal("a queued job's key was released")
+	}
+
+	job, err := q.Dequeue(ctx, "worker-a")
+	if err != nil {
+		t.Fatalf("Dequeue() error = %v", err)
+	}
+	job.Attempts = job.MaxAttempts
+	if err := q.Fail(ctx, job, errors.New("github unavailable")); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	if id, _ := q.Enqueue(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: 9}, "initial:9"); id != 0 {
+		t.Fatal("precondition: a dead job should still hold its key")
+	}
+
+	if released, err := q.ReleaseDeadDedupeKey(ctx, "initial:9"); err != nil || !released {
+		t.Fatalf("ReleaseDeadDedupeKey() = %v, %v; want true, nil", released, err)
+	}
+	if id, err := q.Enqueue(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: 9}, "initial:9"); err != nil || id == 0 {
+		t.Errorf("re-Enqueue() after release = %d, %v; want a new job", id, err)
+	}
+	stats, err := q.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats() error = %v", err)
+	}
+	if stats.Dead != 1 || stats.Queued != 1 {
+		t.Errorf("stats = %+v, want the dead job kept for inspection beside the new one", stats)
+	}
+}
+
+// Spaced jobs of one kind run one spacing apart, measured from the latest one
+// still queued: only the first is runnable now, and a later call (another
+// installation's reconciliation) lines up behind them instead of at now.
+func TestEnqueueSpaced(t *testing.T) {
+	q := newTestQueue(t, 15*time.Minute)
+	ctx := context.Background()
+
+	for i := int64(1); i <= 3; i++ {
+		id, err := q.EnqueueSpaced(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: i},
+			fmt.Sprintf("initial:%d", i), time.Hour)
+		if err != nil || id == 0 {
+			t.Fatalf("EnqueueSpaced(%d) = %d, %v", i, id, err)
+		}
+	}
+	if id, err := q.EnqueueSpaced(ctx, queue.KindInitialScan, queue.InitialScanPayload{RepositoryID: 1},
+		"initial:1", time.Hour); err != nil || id != 0 {
+		t.Errorf("duplicate EnqueueSpaced() = %d, %v; want deduplicated", id, err)
+	}
+	// Other kinds are not held back by spaced jobs.
+	if _, err := q.Enqueue(ctx, queue.KindScan, queue.ScanPayload{ScanID: 1}, ""); err != nil {
+		t.Fatalf("Enqueue() error = %v", err)
+	}
+
+	var kinds []queue.Kind
+	for {
+		job, err := q.Dequeue(ctx, "worker-a")
+		if errors.Is(err, queue.ErrNoJobs) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Dequeue() error = %v", err)
+		}
+		kinds = append(kinds, job.Kind)
+	}
+	if len(kinds) != 2 {
+		t.Errorf("runnable now = %v, want the first spaced job and the scan only", kinds)
 	}
 }
