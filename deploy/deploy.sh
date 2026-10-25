@@ -88,6 +88,8 @@ DB_BACKUP=""
 ROLLING_BACK=0
 # The server addresses Nginx resolved when it last loaded its configuration.
 NGINX_UPSTREAM_IPS=""
+# What the last smoke test found wrong, for the log; empty when it passed.
+SMOKE_PROBLEM=""
 # Preflight writes nothing to disk; the build log exists only in deploy mode.
 BUILD_LOG=/dev/null
 
@@ -353,20 +355,29 @@ nginx_get() {
 }
 
 # smoke_nginx checks the API through Nginx and, given a checksum, that Nginx
-# serves that index.html. Bodies are never printed.
+# serves that index.html. On failure SMOKE_PROBLEM says which check failed --
+# the API, the homepage's status, or its checksum -- since each points at a
+# different fault. Bodies are never printed; status codes and checksums are.
 smoke_nginx() {
-	local body code ok=0
+	local body code sha
+	SMOKE_PROBLEM=""
 	body="$(mktemp)"
 	code="$(nginx_get /api/repos "$body")"
-	if [ "$code" = 200 ] && grep -q '"repositories"' "$body"; then
-		ok=1
-		if [ -n "${1:-}" ]; then
-			code="$(nginx_get / "$body")"
-			[ "$code" = 200 ] && [ "$(sha256sum <"$body" | cut -d' ' -f1)" = "$1" ] || ok=0
+	if [ "$code" != 200 ]; then
+		SMOKE_PROBLEM="/api/repos returned HTTP ${code:-none}"
+	elif ! grep -q '"repositories"' "$body"; then
+		SMOKE_PROBLEM="/api/repos returned 200 without a repositories list"
+	elif [ -n "${1:-}" ]; then
+		code="$(nginx_get / "$body")"
+		if [ "$code" != 200 ]; then
+			SMOKE_PROBLEM="the homepage (/) returned HTTP ${code:-none}"
+		else
+			sha="$(sha256sum <"$body" | cut -d' ' -f1)"
+			[ "$sha" = "$1" ] || SMOKE_PROBLEM="the homepage (/) served index.html sha256 $sha, expected $1"
 		fi
 	fi
 	rm -f -- "$body"
-	[ "$ok" -eq 1 ]
+	[ -z "$SMOKE_PROBLEM" ]
 }
 
 wait_for_nginx() {
@@ -375,6 +386,7 @@ wait_for_nginx() {
 		smoke_nginx "${1:-}" && return 0
 		sleep 3
 	done
+	log "Nginx smoke test failed $i times; last: $SMOKE_PROBLEM"
 	return 1
 }
 
@@ -401,9 +413,13 @@ rollback() {
 	trap '' TERM INT HUP
 	ROLLING_BACK=1
 	log "ROLLBACK: restoring the previous release"
+	local restored_sha=""
 	if [ "$FRONTEND_TOUCHED" -eq 1 ] && [ -n "$FRONTEND_BACKUP" ]; then
 		if as_dist_owner tar -C "$FRONTEND_DIST" -xzf - <"$FRONTEND_BACKUP"; then
 			log "ROLLBACK: frontend restored from $FRONTEND_BACKUP"
+			# The backup's recorded modes may themselves be too narrow.
+			make_dist_readable || log "ROLLBACK: could not make the restored frontend readable by Nginx; check the modes under $FRONTEND_DIST"
+			restored_sha="$(sha256sum "$FRONTEND_DIST/index.html" | cut -d' ' -f1)"
 		else
 			log "ROLLBACK: frontend restore FAILED; restore $FRONTEND_BACKUP by hand"
 		fi
@@ -442,8 +458,18 @@ rollback() {
 		fi
 		log "ROLLBACK: database migrations are not reverted; pre-deploy backup: $DB_BACKUP"
 	fi
-	if wait_for_nginx; then
-		log "ROLLBACK: the site answers through Nginx"
+	# With the frontend restored, / must serve the restored index.html, not
+	# merely answer: the API alone says nothing about what visitors get. If
+	# the frontend was touched but not restored, there is nothing to verify
+	# the homepage against, and the log must not suggest that it was.
+	if [ "$FRONTEND_TOUCHED" -eq 1 ] && [ -z "$restored_sha" ]; then
+		if wait_for_nginx; then
+			log "ROLLBACK: /api/repos answers through Nginx, but the frontend was NOT restored, so the homepage is UNVERIFIED; restore ${FRONTEND_BACKUP:-the frontend} by hand"
+		else
+			log "ROLLBACK: the site does NOT answer through Nginx, and the frontend was NOT restored; investigate immediately"
+		fi
+	elif wait_for_nginx "$restored_sha"; then
+		log "ROLLBACK: the site answers through Nginx${restored_sha:+ and serves the restored index.html}"
 	else
 		log "ROLLBACK: the site does NOT answer through Nginx; investigate immediately"
 	fi
@@ -703,7 +729,23 @@ fi
 dist_mount_matches ||
 	die "$NGINX_CONTAINER's bind mount may reference a replaced copy of $FRONTEND_DIST, so a publish would not reach it. Reattach the mount before deploying (deploy/README.md, \"Frontend bind mount\"); this script does not restart Nginx. Nothing was changed."
 DIST_OWNER="$(stat -c %U "$FRONTEND_DIST")"
-as_dist_owner() { runuser -u "$DIST_OWNER" -- "$@"; }
+# The script's umask 077 is right for backups and logs, but the frontend is
+# public and the Nginx worker is neither its owner nor in its group. Files the
+# owner writes here get the build's own modes (755/644) instead of 700/600.
+as_dist_owner() { (umask 022 && runuser -u "$DIST_OWNER" -- "$@"); }
+# make_dist_readable gives Nginx's worker what serving the frontend needs:
+# search on the web root and on directories under assets/, and read on the
+# assets and on the public files at the top of the web root -- index.html,
+# and any robots.txt or favicon kept there, which a rollback restores with
+# their recorded modes. It only adds bits and does not recurse outside
+# assets/: hidden entries (.well-known/ above all) and other subdirectories
+# keep whatever modes they have.
+make_dist_readable() {
+	as_dist_owner chmod go+rx "$FRONTEND_DIST" || return 1
+	as_dist_owner find "$FRONTEND_DIST" -mindepth 1 -maxdepth 1 -type f ! -name '.*' -exec chmod go+r {} + || return 1
+	[ ! -d "$FRONTEND_DIST/assets" ] ||
+		as_dist_owner find "$FRONTEND_DIST/assets" \( -type d -exec chmod go+rx {} + \) -o \( -type f -exec chmod go+r {} + \)
+}
 log "ok: $NGINX_CONTAINER serves $FRONTEND_DIST (same directory and index.html inodes inside the container)"
 
 # The smoke tests reach Nginx on its published HTTPS port, on this host.
@@ -736,7 +778,7 @@ log "ok: Nginx configuration is valid and unchanged since Nginx loaded it"
 # The live site must already work through Nginx: the API is proxied to the
 # server, and / is this directory's index.html.
 smoke_nginx "$(sha256sum "$FRONTEND_DIST/index.html" | cut -d' ' -f1)" ||
-	die "https://$PUBLIC_HOST/ through $NGINX_CONTAINER ($NGINX_HTTPS_IP:$NGINX_HTTPS_PORT) does not serve /api/repos and $FRONTEND_DIST/index.html"
+	die "https://$PUBLIC_HOST/ through $NGINX_CONTAINER ($NGINX_HTTPS_IP:$NGINX_HTTPS_PORT) does not serve /api/repos and $FRONTEND_DIST/index.html: $SMOKE_PROBLEM"
 log "ok: the site answers through Nginx (/api/repos and index.html)"
 
 # The server must answer directly at HEALTH_URL, which the deployment uses to
@@ -883,6 +925,9 @@ log "publishing the frontend to $FRONTEND_DIST"
 FRONTEND_TOUCHED=1
 tar -C "$NEW_DIST" --exclude=./index.html -cf - . | as_dist_owner tar -C "$FRONTEND_DIST" -xf - ||
 	die "could not copy frontend assets"
+# Before the new index.html goes live, so it never points at assets Nginx
+# cannot read. Also repairs a directory left too narrow by an earlier run.
+make_dist_readable || die "could not make the frontend readable by Nginx"
 as_dist_owner cp "$NEW_DIST/index.html" "$FRONTEND_DIST/.index.html.new"
 as_dist_owner mv -f "$FRONTEND_DIST/.index.html.new" "$FRONTEND_DIST/index.html"
 if [ -d "$FRONTEND_DIST/assets" ] && [ -d "$NEW_DIST/assets" ]; then

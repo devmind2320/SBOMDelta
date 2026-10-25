@@ -545,30 +545,94 @@ check "publish: deploy.sh's publish commands were found" \
 		printf "%s\n" "$1" | grep -qF "comm -23"' _ "$publish_block"
 check "publish: deploy.sh's backup command was found" [ -n "$backup_cmd" ]
 
-# publish_case <name> <with new assets/ 0|1>: builds an old and a new frontend,
-# then runs backup, publish and (if it is the expected command) restore,
-# printing the state after each.
+# The publish and restore commands run as the directory's owner through
+# deploy.sh's own as_dist_owner, under the script's umask 077, with runuser
+# standing in as a pass-through. make_dist_readable comes from deploy.sh too.
+owner_functions="$(awk '
+	/^as_dist_owner\(\) \{/ { print; next }
+	/^make_dist_readable\(\) \{$/ { on = 1 }
+	on { print }
+	on && /^\}$/ { on = 0 }
+' "$ROOT/deploy/deploy.sh")"
+check "publish: deploy.sh defines as_dist_owner and make_dist_readable" \
+	sh -c 'printf "%s\n" "$1" | grep -q "^as_dist_owner() {" && printf "%s\n" "$1" | grep -q "^make_dist_readable() {$"' _ "$owner_functions"
+# The definitions before this fix, kept to show the test catches the bug.
+legacy_owner_functions='as_dist_owner() { runuser -u "$DIST_OWNER" -- "$@"; }
+make_dist_readable() { :; }'
+mkdir -p "$WORK/fakerunuser"
+printf '#!/bin/sh\nwhile [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n' >"$WORK/fakerunuser/runuser"
+chmod +x "$WORK/fakerunuser/runuser"
+
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+# served_readable <dist>: "yes" if a user who is neither owner nor in the
+# group (the Nginx worker) can enter the web root and assets/ and read
+# index.html, every asset and the other public files at the top of the web
+# root; otherwise the first path that fails.
+served_readable() {
+	local path mode
+	while IFS= read -r path; do
+		mode="$(mode_of "$path")"
+		if [ -d "$path" ]; then
+			[ $((8#$mode & 5)) -eq 5 ] || { echo "no:${path#"$1"}=$mode"; return; }
+		else
+			[ $((8#$mode & 4)) -eq 4 ] || { echo "no:${path#"$1"}=$mode"; return; }
+		fi
+	done < <({
+		echo "$1"
+		echo "$1/index.html"
+		find "$1" -mindepth 1 -maxdepth 1 -type f ! -name '.*'
+		[ ! -d "$1/assets" ] || find "$1/assets"
+	})
+	echo yes
+}
+
+# publish_case <name> <with new assets/ 0|1> [legacy]: builds an old and a new
+# frontend, then runs backup, publish and (if it is the expected command)
+# restore, printing the state after each. The old frontend starts out as
+# production was found: directory 700, files 600, from an earlier run under
+# umask 077 -- robots.txt and favicon.ico included, which a restore under that
+# umask narrowed too. .well-known/ starts private (750/640), and a hidden
+# top-level file and a subdirectory outside assets/ start at 600; all three
+# must keep their modes.
 publish_case() {
-	local pub="$WORK/publish-$1"
+	local pub="$WORK/publish-$1" functions="$owner_functions"
+	[ "${3:-}" != legacy ] || functions="$legacy_owner_functions"
 	mkdir -p "$pub/dist/assets" "$pub/dist/.well-known/acme-challenge" "$pub/new"
 	echo old >"$pub/dist/index.html"
 	echo old >"$pub/dist/assets/old-1a2b.js"
 	echo shared >"$pub/dist/assets/shared-9f8e.css"
 	echo token >"$pub/dist/.well-known/acme-challenge/t"
 	echo robots >"$pub/dist/robots.txt"
+	echo icon >"$pub/dist/favicon.ico"
+	echo private >"$pub/dist/.private"
+	mkdir -p "$pub/dist/docs"
+	echo notes >"$pub/dist/docs/notes.txt"
 	echo new >"$pub/new/index.html"
 	if [ "$2" = 1 ]; then
 		mkdir -p "$pub/new/assets"
 		echo new >"$pub/new/assets/new-3c4d.js"
 		echo shared >"$pub/new/assets/shared-9f8e.css"
 	fi
+	# A fresh build: 755 directories, 644 files.
+	find "$pub/new" -type d -exec chmod 755 {} +
+	find "$pub/new" -type f -exec chmod 644 {} +
+	chmod 700 "$pub/dist" "$pub/dist/assets"
+	chmod 600 "$pub/dist/index.html" "$pub/dist/assets/"* "$pub/dist/robots.txt" "$pub/dist/favicon.ico" \
+		"$pub/dist/.private" "$pub/dist/docs/notes.txt"
+	chmod 700 "$pub/dist/docs"
+	chmod 750 "$pub/dist/.well-known" "$pub/dist/.well-known/acme-challenge"
+	chmod 640 "$pub/dist/.well-known/acme-challenge/t"
 	(
+		# The stand-in applies to this subshell only, on purpose.
+		# shellcheck disable=SC2030,SC2031
+		PATH="$WORK/fakerunuser:$PATH"
+		umask 077
 		# Read by the commands loaded with eval below.
 		# shellcheck disable=SC2034
 		FRONTEND_DIST="$pub/dist" NEW_DIST="$pub/new" FRONTEND_BACKUP="$pub/backup.tar.gz"
-		# Called by the commands loaded with eval below.
-		# shellcheck disable=SC2317,SC2329
-		as_dist_owner() { "$@"; }
+		# shellcheck disable=SC2034
+		DIST_OWNER="$(id -un)"
+		eval "$functions"
 		# shellcheck disable=SC2317,SC2329
 		die() { echo "die: $*"; exit 1; }
 		state() {
@@ -580,13 +644,21 @@ publish_case() {
 				"$([ -e "$FRONTEND_DIST/assets/shared-9f8e.css" ] && echo yes || echo no)" \
 				"$([ -e "$FRONTEND_DIST/.well-known/acme-challenge/t" ] && echo yes || echo no)" \
 				"$([ -e "$FRONTEND_DIST/robots.txt" ] && echo yes || echo no)"
+			printf '%s-modes: readable=%s well-known=%s/%s\n' "$1" "$(served_readable "$FRONTEND_DIST")" \
+				"$(mode_of "$FRONTEND_DIST/.well-known")" "$(mode_of "$FRONTEND_DIST/.well-known/acme-challenge/t")"
+			printf '%s-public: robots=%s favicon=%s\n' "$1" \
+				"$(mode_of "$FRONTEND_DIST/robots.txt")" "$(mode_of "$FRONTEND_DIST/favicon.ico")"
+			printf '%s-untouched: hidden=%s docs=%s/%s\n' "$1" "$(mode_of "$FRONTEND_DIST/.private")" \
+				"$(mode_of "$FRONTEND_DIST/docs")" "$(mode_of "$FRONTEND_DIST/docs/notes.txt")"
 		}
 		dir_inode="$(inode_of "$FRONTEND_DIST")"
 		eval "$backup_cmd"
 		eval "$publish_block"
 		state published
 		if [ "$restore_cmd" = "$expected_restore" ]; then
+			# deploy.sh's rollback: the restore, then the same repair.
 			eval "$restore_cmd"
+			make_dist_readable
 			state restored
 		fi
 	) 2>&1
@@ -605,6 +677,175 @@ check "restore: .well-known/ and files outside assets/ are kept" contains "$rest
 out="$(publish_case noassets 0)"
 check "publish: with no assets/ in the new build, nothing under assets/ is pruned" \
 	[ "$(grep '^published:' <<<"$out" || true)" = "published: dir=same index=new old=yes new=no shared=yes well-known=yes robots=yes" ]
+check "publish: with no assets/ in the new build, what is served is still readable by Nginx" \
+	contains "$out" "published-modes: readable=yes"
+
+# The rollback in deploy.sh must repair the restored frontend the same way,
+# and check that / serves the restored index.html rather than the API alone.
+rollback_function="$(awk '/^rollback\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { exit }' "$ROOT/deploy/deploy.sh")"
+check "rollback: make_dist_readable runs right after the frontend restore" \
+	sh -c 'printf "%s\n" "$1" | grep -A 3 -F "$2" | grep -q "make_dist_readable"' _ "$rollback_function" "$expected_restore"
+check "rollback: the final check passes the restored index.html checksum" \
+	grep -qF 'wait_for_nginx "$restored_sha"' <<<"$rollback_function"
+
+# deploy.sh's own rollback, with the services untouched and stand-ins for the
+# owner's commands and the smoke test. The stand-in smoke test passes on the
+# API alone when given no checksum, which is exactly how a failed frontend
+# restore could pass for a healthy site.
+# rollback_case <name> <frontend touched 0|1> <restore works 0|1> <homepage serves the restored index.html 0|1>
+rollback_case() {
+	local rb="$WORK/rollback-$1"
+	mkdir -p "$rb/dist" "$rb/saved"
+	echo published >"$rb/dist/index.html"
+	echo restored >"$rb/saved/index.html"
+	tar -C "$rb/saved" -czf "$rb/backup.tar.gz" .
+	(
+		# Read by the function loaded with eval below.
+		# shellcheck disable=SC2034
+		FRONTEND_TOUCHED="$2" FRONTEND_DIST="$rb/dist" FRONTEND_BACKUP="$rb/backup.tar.gz" \
+			SERVER_SWITCHED=0 WORKER_SWITCHED=0 WORKER_PRESENT=1 ROLLING_BACK=0 DB_BACKUP=""
+		RESTORE_WORKS="$3" HOME_SERVES="$4"
+		WANT="$(sha256sum <"$rb/saved/index.html" | cut -d' ' -f1)"
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		# shellcheck disable=SC2317,SC2329
+		as_dist_owner() { [ "$RESTORE_WORKS" = 1 ] || { echo "tar: stand-in failure" >&2; return 1; }; "$@"; }
+		# shellcheck disable=SC2317,SC2329
+		make_dist_readable() { :; }
+		# shellcheck disable=SC2317,SC2329
+		wait_for_nginx() {
+			echo "smoke: checksum=${1:-none}"
+			[ -n "${1:-}" ] || return 0
+			[ "$HOME_SERVES" = 1 ] && [ "$1" = "$WANT" ]
+		}
+		eval "$rollback_function"
+		rollback
+		echo "rollback returned"
+	) 2>&1
+}
+restored_want="$(printf 'restored\n' | sha256sum | cut -d' ' -f1)"
+
+out="$(rollback_case restore-fails 1 0 1)"
+check "rollback, restore fails: the failure is logged" contains "$out" "ROLLBACK: frontend restore FAILED"
+check "rollback, restore fails: the homepage is reported UNVERIFIED" contains "$out" "the frontend was NOT restored, so the homepage is UNVERIFIED"
+check "rollback, restore fails: no message claims the site or homepage is healthy" \
+	sh -c '! printf "%s\n" "$1" | grep -qE "the site answers through Nginx|serves the restored index.html"' _ "$out"
+check "rollback, restore fails: the rest of the rollback still runs (best effort)" contains "$out" "rollback returned"
+out="$(rollback_case restore-works 1 1 1)"
+check "rollback, restore works: the homepage is checked against the restored index.html" \
+	contains "$out" "smoke: checksum=$restored_want"
+check "rollback, restore works: success names the restored index.html" \
+	contains "$out" "the site answers through Nginx and serves the restored index.html"
+out="$(rollback_case homepage-wrong 1 1 0)"
+check "rollback, restored but / does not serve it: reported as a failure" \
+	contains "$out" "ROLLBACK: the site does NOT answer through Nginx; investigate immediately"
+out="$(rollback_case no-frontend 0 1 1)"
+check "rollback, frontend never touched: only the API is checked, and no homepage claim is made" \
+	sh -c 'printf "%s\n" "$1" | grep -q "smoke: checksum=none" && printf "%s\n" "$1" | grep -qx "ROLLBACK: the site answers through Nginx"' _ "$out"
+
+# The incident: under umask 077 the owner's tar and cp left the web root,
+# assets and index.html readable by the owner only, and Nginx answered 403.
+out="$(publish_case modes 1)"
+check "permissions: after publish, Nginx can enter the web root and assets/ and read every served file" \
+	contains "$out" "published-modes: readable=yes"
+check "permissions: after publish, .well-known/ keeps its own modes" contains "$out" "published-modes: readable=yes well-known=750/640"
+check "permissions: after restore, the restored frontend is readable by Nginx" \
+	contains "$out" "restored-modes: readable=yes"
+check "permissions: after restore, .well-known/ keeps its own modes" contains "$out" "restored-modes: readable=yes well-known=750/640"
+check "permissions: after publish, top-level robots.txt and favicon.ico are readable by Nginx" \
+	contains "$out" "published-public: robots=644 favicon=644"
+check "permissions: after restore, top-level robots.txt and favicon.ico are readable by Nginx" \
+	contains "$out" "restored-public: robots=644 favicon=644"
+check "permissions: after publish, hidden files and subdirectories outside assets/ keep their modes" \
+	contains "$out" "published-untouched: hidden=600 docs=700/600"
+check "permissions: after restore, hidden files and subdirectories outside assets/ keep their modes" \
+	contains "$out" "restored-untouched: hidden=600 docs=700/600"
+out="$(publish_case legacy 1 legacy)"
+check "permissions: the previous as_dist_owner leaves the frontend unreadable (the test catches the bug)" \
+	sh -c 'printf "%s\n" "$1" | grep -q "^published-modes: readable=no"' _ "$out"
+
+# ------------------------------------------------ Nginx smoke diagnostics --
+
+# deploy.sh's smoke test, against a stand-in curl that answers /api/repos and
+# / from files. A failure must say which check failed: an API fault, a
+# homepage status (the 403 of the incident) and a stale homepage each point
+# somewhere different, and the old message blamed the frontend for all three.
+smoke_functions="$(awk '
+	/^(nginx_get|smoke_nginx|wait_for_nginx)\(\) \{$/ { on = 1 }
+	on { print }
+	on && /^\}$/ { on = 0 }
+' "$ROOT/deploy/deploy.sh")"
+check "smoke: deploy.sh defines nginx_get, smoke_nginx and wait_for_nginx" \
+	[ "$(grep -cE '^(nginx_get|smoke_nginx|wait_for_nginx)\(\) \{$' <<<"$smoke_functions")" -eq 3 ]
+
+mkdir -p "$WORK/fakecurl" "$WORK/smoke"
+cat >"$WORK/fakecurl/curl" <<'EOF2'
+#!/usr/bin/env bash
+# curl -sS -o <file> -w '%{http_code}' --max-time N --resolve H:P:IP <url>
+out="" url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o) out="$2"; shift 2 ;;
+	-w | --max-time | --resolve) shift 2 ;;
+	-*) shift ;;
+	*) url="$1"; shift ;;
+	esac
+done
+case "$url" in
+*/api/repos) cat "$FAKE_API_BODY" >"$out"; printf '%s' "${FAKE_API_CODE:-200}" ;;
+*/) cat "$FAKE_HOME_BODY" >"$out"; printf '%s' "${FAKE_HOME_CODE:-200}" ;;
+*) echo "fake curl: unexpected url $url" >&2; exit 2 ;;
+esac
+EOF2
+chmod +x "$WORK/fakecurl/curl"
+printf '{"repositories":[]}' >"$WORK/smoke/api-ok"
+printf '{"error":"x"}' >"$WORK/smoke/api-other"
+echo '<html>new</html>' >"$WORK/smoke/index-new"
+echo '<html>old</html>' >"$WORK/smoke/index-old"
+new_sha="$(sha256sum <"$WORK/smoke/index-new" | cut -d' ' -f1)"
+old_sha="$(sha256sum <"$WORK/smoke/index-old" | cut -d' ' -f1)"
+
+# smoke <expected sha or empty>: runs wait_for_nginx with the stand-in curl
+# and no real sleeping; prints its log lines and "rc=N".
+smoke() {
+	(
+		# shellcheck disable=SC2030,SC2031
+		PATH="$WORK/fakecurl:$PATH"
+		# Read by the functions loaded with eval below.
+		# shellcheck disable=SC2034
+		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SMOKE_PROBLEM=""
+		export FAKE_API_BODY="${FAKE_API_BODY:-$WORK/smoke/api-ok}" FAKE_HOME_BODY="${FAKE_HOME_BODY:-$WORK/smoke/index-new}"
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		# shellcheck disable=SC2317,SC2329
+		sleep() { :; }
+		eval "$smoke_functions"
+		if wait_for_nginx "$1"; then echo rc=0; else echo rc=1; fi
+	)
+}
+
+out="$(smoke "$new_sha")"
+check "smoke: API and homepage both right passes" [ "$out" = "rc=0" ]
+out="$(smoke "")"
+check "smoke: without a checksum only the API is checked" [ "$out" = "rc=0" ]
+out="$(FAKE_API_CODE=502 smoke "$new_sha")"
+check "smoke: an API failure fails" exit_code_is "$out" 1
+check "smoke: ... and names /api/repos and its status, not the homepage" \
+	sh -c 'printf "%s\n" "$1" | grep -q "last: /api/repos returned HTTP 502" && ! printf "%s\n" "$1" | grep -q homepage' _ "$out"
+out="$(FAKE_API_BODY="$WORK/smoke/api-other" smoke "$new_sha")"
+check "smoke: an API answer without a repositories list is named as such" \
+	contains "$out" "last: /api/repos returned 200 without a repositories list"
+out="$(FAKE_HOME_CODE=403 smoke "$new_sha")"
+check "smoke: a homepage 403 (the incident) fails" exit_code_is "$out" 1
+check "smoke: ... and names the homepage status" contains "$out" "last: the homepage (/) returned HTTP 403"
+out="$(FAKE_HOME_CODE=403 smoke "")"
+check "smoke: a homepage 403 goes unseen without a checksum (why rollback now passes one)" [ "$out" = "rc=0" ]
+out="$(FAKE_HOME_BODY="$WORK/smoke/index-old" smoke "$new_sha")"
+check "smoke: a stale homepage fails, naming both checksums" \
+	contains "$out" "last: the homepage (/) served index.html sha256 $old_sha, expected $new_sha"
+check "smoke: ... after all 10 attempts" contains "$out" "failed 10 times"
+check "smoke: response bodies are never printed" \
+	sh -c '! printf "%s\n" "$1" | grep -q "<html>"' _ "$out"
 
 # ------------------------------------------------------- worker image --
 
