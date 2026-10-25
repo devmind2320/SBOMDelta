@@ -256,6 +256,13 @@ func (s *Service) Callback(w http.ResponseWriter, r *http.Request) {
 		redirectToLogin(w, r, "server")
 		return
 	}
+	// The token is still in hand, so this is the moment to learn which
+	// repositories the user can reach; after this it is discarded.
+	if err := s.recordRepositories(r.Context(), user, token); err != nil {
+		s.logger.Error("could not record the user's repositories", "error", err)
+		redirectToLogin(w, r, "server")
+		return
+	}
 	// Signing in again from the same browser replaces its session rather
 	// than leaving the old one valid until it expires.
 	if previous, err := r.Cookie(SessionCookie); err == nil && previous.Value != "" {
@@ -458,6 +465,189 @@ func (s *Service) fetchUser(ctx context.Context, token string) (models.User, err
 	}
 	return models.User{GitHubUserID: body.ID, Login: body.Login, AvatarURL: body.AvatarURL}, nil
 }
+
+// Listing limits. GitHub pages at most 100 entries; 100 pages of each list is
+// 10,000 installations or repositories per installation, far past any account
+// this dashboard serves, and keeps a sign-in from paging forever.
+const (
+	listPageSize = 100
+	maxListPages = 100
+	listTimeout  = 60 * time.Second
+)
+
+// Reasons a repository list could not be read, stored on the user and shown
+// on the dashboard. Fixed codes, never GitHub's text.
+const (
+	ListErrorUnauthorized = "unauthorized"
+	ListErrorRateLimited  = "rate_limited"
+	ListErrorGitHub       = "github"
+	ListErrorTooMany      = "too_many"
+)
+
+// listError is a failed repository listing, with the code recorded for it.
+type listError struct {
+	code   string
+	detail string
+}
+
+func (e *listError) Error() string { return e.code + ": " + e.detail }
+
+// recordRepositories asks GitHub which repositories the user can reach
+// through the App's installations and records that list as what the user may
+// see and scan. A listing GitHub refuses or fails is recorded as such, with
+// an empty list -- the user is still signed in and can retry -- but a
+// database failure fails the sign-in.
+func (s *Service) recordRepositories(ctx context.Context, user models.User, token string) error {
+	ctx, cancel := context.WithTimeout(ctx, listTimeout)
+	defer cancel()
+
+	repos, err := s.listAccessibleRepositories(ctx, token)
+	if err != nil {
+		code := ListErrorGitHub
+		var failed *listError
+		if errors.As(err, &failed) {
+			code = failed.code
+		}
+		s.logger.Warn("could not list the user's repositories from GitHub",
+			"login", user.Login, "reason", code, "error", err)
+		return s.db.ClearUserRepositories(context.WithoutCancel(ctx), user.ID, code, time.Now())
+	}
+	s.logger.Info("listed the user's repositories", "login", user.Login, "repositories", len(repos))
+	return s.db.ReplaceUserRepositories(context.WithoutCancel(ctx), user.ID, repos, time.Now())
+}
+
+// listAccessibleRepositories pages through the installations the user can
+// see and, for each, the repositories the user can reach in it. Together
+// these are exactly the repositories both the user and the App have access
+// to, which is what GitHub App user tokens are scoped to.
+func (s *Service) listAccessibleRepositories(ctx context.Context, token string) ([]models.AccessibleRepository, error) {
+	var installations []int64
+	err := s.paginate(ctx, token, "/user/installations", func(body []byte) (int, int, error) {
+		var page struct {
+			TotalCount    int `json:"total_count"`
+			Installations []struct {
+				ID int64 `json:"id"`
+			} `json:"installations"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return 0, 0, errors.New("installations response was not JSON")
+		}
+		for _, installation := range page.Installations {
+			if installation.ID != 0 {
+				installations = append(installations, installation.ID)
+			}
+		}
+		return len(page.Installations), page.TotalCount, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[int64]bool)
+	repos := make([]models.AccessibleRepository, 0)
+	for _, installationID := range installations {
+		path := fmt.Sprintf("/user/installations/%d/repositories", installationID)
+		err := s.paginate(ctx, token, path, func(body []byte) (int, int, error) {
+			var page struct {
+				TotalCount   int `json:"total_count"`
+				Repositories []struct {
+					ID            int64  `json:"id"`
+					Name          string `json:"name"`
+					Private       bool   `json:"private"`
+					DefaultBranch string `json:"default_branch"`
+					Owner         struct {
+						Login string `json:"login"`
+					} `json:"owner"`
+				} `json:"repositories"`
+			}
+			if err := json.Unmarshal(body, &page); err != nil {
+				return 0, 0, errors.New("repositories response was not JSON")
+			}
+			for _, repo := range page.Repositories {
+				if repo.ID == 0 || repo.Name == "" || repo.Owner.Login == "" || seen[repo.ID] {
+					continue
+				}
+				seen[repo.ID] = true
+				repos = append(repos, models.AccessibleRepository{
+					GitHubRepoID: repo.ID, GitHubInstallationID: installationID,
+					Owner: repo.Owner.Login, Name: repo.Name, Private: repo.Private, DefaultBranch: repo.DefaultBranch,
+				})
+			}
+			return len(page.Repositories), page.TotalCount, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return repos, nil
+}
+
+// paginate GETs path page by page, handing each body to read, which returns
+// how many entries the page held and the total GitHub reported. It stops at
+// a short page or once the total is reached, and refuses to go past
+// maxListPages rather than return a silently truncated list.
+func (s *Service) paginate(ctx context.Context, token, path string, read func([]byte) (int, int, error)) error {
+	seen := 0
+	for page := 1; ; page++ {
+		if page > maxListPages {
+			return &listError{code: ListErrorTooMany, detail: path + " has more than " + fmt.Sprint(maxListPages*listPageSize) + " entries"}
+		}
+		body, err := s.githubGet(ctx, token, fmt.Sprintf("%s?per_page=%d&page=%d", path, listPageSize, page))
+		if err != nil {
+			return err
+		}
+		count, total, err := read(body)
+		if err != nil {
+			return &listError{code: ListErrorGitHub, detail: err.Error()}
+		}
+		seen += count
+		if count < listPageSize || (total > 0 && seen >= total) {
+			return nil
+		}
+	}
+}
+
+// githubGet makes one authenticated GET to the GitHub API and classifies a
+// refusal. Errors name the path and status only: never the token, never the
+// response body.
+func (s *Service) githubGet(ctx context.Context, token, pathAndQuery string) ([]byte, error) {
+	path := pathAndQuery
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		path = path[:i]
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.apiBase+pathAndQuery, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request for %s: %w", path, err)
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	response, err := s.client.Do(request)
+	if err != nil {
+		return nil, &listError{code: ListErrorGitHub, detail: path + ": " + stripURL(err).Error()}
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
+	if err != nil {
+		return nil, &listError{code: ListErrorGitHub, detail: path + ": reading the response failed"}
+	}
+	switch {
+	case response.StatusCode == http.StatusOK:
+		return body, nil
+	case response.StatusCode == http.StatusUnauthorized:
+		return nil, &listError{code: ListErrorUnauthorized, detail: path + " returned HTTP 401"}
+	case response.StatusCode == http.StatusTooManyRequests ||
+		(response.StatusCode == http.StatusForbidden && response.Header.Get("X-RateLimit-Remaining") == "0"):
+		return nil, &listError{code: ListErrorRateLimited, detail: fmt.Sprintf("%s returned HTTP %d (rate limited)", path, response.StatusCode)}
+	default:
+		return nil, &listError{code: ListErrorGitHub, detail: fmt.Sprintf("%s returned HTTP %d", path, response.StatusCode)}
+	}
+}
+
+// Disabled reports whether sign-in is turned off for local development, in
+// which case every request runs as the development user.
+func (s *Service) Disabled() bool { return s.cfg.Disabled }
 
 // stripURL keeps the transport error but drops the request URL net/http
 // wraps around it, which for the token request carries nothing secret today

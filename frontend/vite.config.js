@@ -11,7 +11,9 @@ export default defineConfig({
     // will be deployed behind one host in production.
     proxy: {
       '/api': {
-        target: process.env.VITE_API_TARGET ?? 'http://localhost:8080',
+        // 127.0.0.1, not localhost: localhost may resolve to IPv4 or IPv6, and a
+        // different process on one of them would answer instead of the API.
+        target: process.env.VITE_API_TARGET ?? 'http://127.0.0.1:8080',
         changeOrigin: true,
       },
     },

@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { useSession } from '../composables/useSession.js'
+import AppIcon from '../components/AppIcon.vue'
 import {
   LOGIN_PATH,
   SIGNED_OUT_MESSAGE,
@@ -44,45 +45,48 @@ async function endDisallowedSession() {
 </script>
 
 <template>
-  <div class="flex flex-col items-center gap-4 py-20 text-center">
-    <h1 class="m-0 text-xl font-semibold text-ink">Sign in to SBOMDelta</h1>
-    <p class="m-0 max-w-md text-sm text-ink-muted">
-      Dependency data for private repositories is shown only to accounts this dashboard allows.
-    </p>
-    <p
-      v-if="error && !signedOut"
-      role="alert"
-      class="m-0 max-w-md rounded-md border border-hairline px-3 py-2 text-sm text-ink-secondary"
-    >
-      {{ error }}
-    </p>
-    <p v-if="notice" role="status" class="m-0 max-w-md text-sm text-ink-secondary">
-      {{ notice }}
-    </p>
-    <template v-if="disallowed && !signedOut">
-      <p class="m-0 max-w-md text-sm text-ink-muted">
-        To use a different GitHub account, sign out here, then sign out of GitHub (or switch accounts
-        there) before signing in again.
-      </p>
-      <button
-        type="button"
-        class="cursor-pointer rounded-md border border-hairline bg-surface-raised px-4 py-2 text-sm text-ink-secondary"
-        @click="endDisallowedSession"
+  <div class="flex justify-center py-10 sm:py-16">
+    <div class="card w-full max-w-md px-6 py-8 text-center sm:px-8">
+      <span
+        class="mx-auto flex size-11 items-center justify-center rounded-xl bg-accent-solid text-[var(--on-accent)] shadow-[var(--shadow-md)]"
       >
-        Sign out of this dashboard
-      </button>
-      <p v-if="signOutError" role="alert" class="m-0 max-w-md text-sm text-ink-secondary">
-        {{ signOutError }}
+        <AppIcon name="shield" :size="22" />
+      </span>
+      <h1 class="mt-5 mb-0 text-xl font-semibold tracking-tight text-ink">Sign in to SBOMDelta</h1>
+      <p class="mx-auto mt-2 mb-0 max-w-[40ch] text-sm leading-relaxed text-ink-muted">
+        Software supply-chain security for your repositories. Dependency data for private repositories is shown
+        only to accounts this dashboard allows.
       </p>
-    </template>
-    <!-- A full navigation, not a fetch: GitHub's consent page must load in
-         the window, and the callback sets the session cookie. -->
-    <a
-      :href="LOGIN_PATH"
-      class="rounded-md border border-hairline bg-surface-raised px-4 py-2 text-sm font-medium text-ink no-underline"
-      @click="startSignIn"
-    >
-      Sign in with GitHub
-    </a>
+
+      <div class="mt-6 flex flex-col gap-3 text-left">
+        <p v-if="error && !signedOut" role="alert" class="banner banner-danger m-0">
+          <AppIcon name="alert-circle" :size="15" class="mt-0.5" />
+          <span>{{ error }}</span>
+        </p>
+        <p v-if="notice" role="status" class="banner banner-success m-0">
+          <AppIcon name="check-circle" :size="15" class="mt-0.5" />
+          <span>{{ notice }}</span>
+        </p>
+        <template v-if="disallowed && !signedOut">
+          <p class="m-0 text-sm leading-relaxed text-ink-muted">
+            To use a different GitHub account, sign out here, then sign out of GitHub (or switch accounts there)
+            before signing in again.
+          </p>
+          <button type="button" class="btn btn-secondary w-full" @click="endDisallowedSession">
+            <AppIcon name="log-out" :size="14" />
+            Sign out of this dashboard
+          </button>
+          <p v-if="signOutError" role="alert" class="banner banner-danger m-0">{{ signOutError }}</p>
+        </template>
+      </div>
+
+      <!-- A full navigation, not a fetch: GitHub's consent page must load in
+           the window, and the callback sets the session cookie. -->
+      <a :href="LOGIN_PATH" class="btn btn-primary mt-6 min-h-10 w-full text-sm" @click="startSignIn">
+        <AppIcon name="github" :size="16" />
+        Sign in with GitHub
+      </a>
+      <p class="mt-4 mb-0 text-xs text-ink-muted">You will be redirected to GitHub to authorize this dashboard.</p>
+    </div>
   </div>
 </template>

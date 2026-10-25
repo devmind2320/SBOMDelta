@@ -347,6 +347,8 @@ func (h *WebhookHandler) handlePush(ctx context.Context, logger *slog.Logger, ev
 func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Logger, event *gh.PullRequestEvent) error {
 	switch event.GetAction() {
 	case "opened", "reopened", "synchronize", "ready_for_review":
+	case "closed", "edited":
+		return h.recordPullRequestState(ctx, logger, event)
 	default:
 		return nil
 	}
@@ -420,6 +422,36 @@ func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Log
 
 	logger = logger.With("pr", pr.GetNumber())
 	return enqueuePendingScan(ctx, h.queue, logger, scan, record.FullName())
+}
+
+// recordPullRequestState keeps a scanned pull request's state and title
+// current when it is closed, merged or retitled. Nothing is scanned: the
+// code did not change.
+func (h *WebhookHandler) recordPullRequestState(ctx context.Context, logger *slog.Logger, event *gh.PullRequestEvent) error {
+	repo := event.GetRepo()
+	pr := event.GetPullRequest()
+	if repo == nil || pr == nil {
+		return errors.New("pull_request event was missing its repository or pull request")
+	}
+	stored, err := h.db.GetRepositoryByGitHubID(ctx, repo.GetID())
+	if errors.Is(err, storage.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	state := pr.GetState()
+	if pr.GetMerged() {
+		state = "merged"
+	}
+	changed, err := h.db.UpdatePullRequestState(ctx, stored.ID, pr.GetNumber(), state, pr.GetTitle())
+	if err != nil {
+		return err
+	}
+	if changed {
+		logger.Info("recorded pull request state", "pr", pr.GetNumber(), "state", state)
+	}
+	return nil
 }
 
 // enqueuePendingScan queues a scan job for a scan that has not started. Every

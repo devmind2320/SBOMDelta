@@ -7,7 +7,7 @@ import EmptyState from './EmptyState.vue'
  *
  * Deliberately a table rather than a coloured grid: license identifiers run
  * well past the ~7 classes at which colour categories start to blur, and
- * "allowed vs prohibited" is a policy question Phase 5 answers. Until there is
+ * "allowed vs prohibited" is a policy question SBOMDelta does not answer. Until there is
  * a policy to check against, this reports composition and flags only the
  * licenses that are genuinely missing.
  */
@@ -103,8 +103,8 @@ const unknownCount = computed(() => rows.value.find((row) => row.unknown)?.count
     </div>
 
     <p class="mt-3 mb-0 text-xs leading-relaxed text-ink-muted">
-      License policy evaluation is Phase&nbsp;5. This table reports what the SBOM declares;
-      it does not decide whether a license is permitted.
+      This table reports what the SBOM declares; SBOMDelta does not evaluate a license policy
+      or decide whether a license is permitted.
       <template v-if="unknownCount">
         {{ unknownCount }} component(s) declare no license at all, which is a gap in the
         SBOM rather than a permissive default.

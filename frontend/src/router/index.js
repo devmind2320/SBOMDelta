@@ -3,8 +3,8 @@ import { setUnauthenticatedHandler } from '../api/client.js'
 import { useSession } from '../composables/useSession.js'
 import { routeDecision, takeReturnTo } from '../lib/auth.js'
 
-// Views are lazily imported so the initial bundle carries only the shell and
-// the repository list.
+// Views are lazily imported so the initial bundle carries only the shell. Each
+// route names the header section it belongs to (meta.section).
 const routes = [
   {
     path: '/login',
@@ -14,37 +14,55 @@ const routes = [
   },
   {
     path: '/',
+    name: 'dashboard',
+    component: () => import('../views/DashboardView.vue'),
+    meta: { title: 'Dashboard', section: 'dashboard' },
+  },
+  {
+    path: '/repositories',
     name: 'repositories',
     component: () => import('../views/RepositoriesView.vue'),
-    meta: { title: 'Repositories' },
+    meta: { title: 'Repositories', section: 'repositories' },
+  },
+  {
+    path: '/scans',
+    name: 'last-scans',
+    component: () => import('../views/LastScansView.vue'),
+    meta: { title: 'Last Scans', section: 'scans' },
+  },
+  {
+    path: '/impact',
+    name: 'impact',
+    component: () => import('../views/ImpactView.vue'),
+    meta: { title: 'Impact', section: 'impact' },
   },
   {
     path: '/repos/:repoId',
     name: 'repository',
     component: () => import('../views/RepositoryView.vue'),
     props: true,
-    meta: { title: 'Repository' },
+    meta: { title: 'Repository', section: 'repositories' },
   },
   {
     path: '/repos/:repoId/pulls',
     name: 'pull-requests',
     component: () => import('../views/PullRequestsView.vue'),
     props: true,
-    meta: { title: 'Pull requests' },
+    meta: { title: 'Pull requests', section: 'repositories' },
   },
   {
     path: '/pulls/:pullId',
     name: 'pull-request',
     component: () => import('../views/PullRequestView.vue'),
     props: true,
-    meta: { title: 'Pull request' },
+    meta: { title: 'Pull request', section: 'repositories' },
   },
   {
     path: '/scans/:scanId',
     name: 'scan',
     component: () => import('../views/ScanView.vue'),
     props: true,
-    meta: { title: 'Scan' },
+    meta: { title: 'Scan', section: 'repositories' },
   },
   {
     path: '/:pathMatch(.*)*',

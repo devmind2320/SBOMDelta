@@ -44,7 +44,7 @@ func TestRunRefusesRepositoryWithoutAccess(t *testing.T) {
 
 	// No app, blob store or generator: reaching any of them would panic,
 	// which is exactly what this path must not do.
-	s := New(db, nil, nil, nil, config.Scanner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(db, nil, nil, nil, nil, nil, config.Scanner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err := s.Run(ctx, scan.ID); err != nil {
 		t.Fatalf("Run() error = %v, want nil so the job is not retried", err)
 	}
@@ -64,7 +64,7 @@ func TestRunRefusesRepositoryWithoutAccess(t *testing.T) {
 // Initial, manual and backfill scans never open a check run. The scanner has
 // no GitHub app here, so reaching StartCheckRun would panic.
 func TestOpenCheckRunSkipsScansNotCausedByAPushOrPullRequest(t *testing.T) {
-	s := New(nil, nil, nil, nil, config.Scanner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s := New(nil, nil, nil, nil, nil, nil, config.Scanner{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	for _, trigger := range []models.ScanTrigger{models.TriggerInitial, models.TriggerManual, models.TriggerBackfill} {
 		scan := models.Scan{ID: 1, CommitSHA: "3333333333333333333333333333333333333333", Trigger: trigger}
 		if id := s.openCheckRun(context.Background(), s.logger, scan, models.Repository{}, repoAccess{installationID: 4242}); id != 0 {

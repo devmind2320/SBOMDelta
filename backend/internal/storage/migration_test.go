@@ -342,12 +342,16 @@ func TestMigration0006UsersAndSessions(t *testing.T) {
 		t.Errorf("sessions after deleting their user = %d (err %v), want 0", sessions, err)
 	}
 
-	down, err := migrations.FS.ReadFile("0006_users_sessions.down.sql")
-	if err != nil {
-		t.Fatalf("read down migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(down)); err != nil {
-		t.Fatalf("apply down migration: %v", err)
+	// Roll back in reverse order, as a real rollback would: 0007's tables
+	// refer to users.
+	for _, file := range []string{"0007_user_repositories.down.sql", "0006_users_sessions.down.sql"} {
+		down, err := migrations.FS.ReadFile(file)
+		if err != nil {
+			t.Fatalf("read %s: %v", file, err)
+		}
+		if _, err := pool.Exec(ctx, string(down)); err != nil {
+			t.Fatalf("apply %s: %v", file, err)
+		}
 	}
 	var remaining int
 	if err := pool.QueryRow(ctx, `
@@ -357,6 +361,101 @@ func TestMigration0006UsersAndSessions(t *testing.T) {
 	}
 	if _, err := pool.Exec(ctx, `SELECT 1 FROM repositories LIMIT 1`); err != nil {
 		t.Errorf("rolling back 0006 touched other tables: %v", err)
+	}
+}
+
+// Migration 0007 adds the per-user repository list and tracked list: rows go
+// with their user (and a tracked row with its repository), and rolling it back
+// removes exactly what it added.
+func TestMigration0007UserRepositories(t *testing.T) {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("TEST_DATABASE_URL is not set; skipping database integration tests")
+	}
+	ctx := context.Background()
+	const schema = "test_migration_0007"
+
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close(ctx)
+	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE; CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("reset schema: %v", err)
+	}
+	parsed, _ := url.Parse(base)
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	db, err := storage.Open(ctx, parsed.String())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	pool := db.Pool()
+
+	installation, err := db.UpsertInstallation(ctx, models.Installation{GitHubInstallationID: 4242, AccountLogin: "acme", AccountType: "Organization"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	githubID := int64(99001)
+	repo, err := db.UpsertRepository(ctx, models.Repository{InstallationID: &installation.ID, GitHubRepoID: &githubID, Owner: "acme", Name: "api", DefaultBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 4001, Login: "devmind2320"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, []models.AccessibleRepository{
+		{GitHubRepoID: githubID, GitHubInstallationID: 4242, Owner: "acme", Name: "api", Private: true},
+	}, time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+	if err := db.TrackRepository(ctx, user.ID, repo.ID); err != nil {
+		t.Fatalf("TrackRepository() error = %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO user_repositories (user_id, github_repo_id, github_installation_id, owner, name, private, listed_at)
+		VALUES ($1, $2, 4242, 'acme', 'api', true, now())`, user.ID, githubID); err == nil {
+		t.Error("one repository was listed twice for the same user")
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM repositories WHERE id = $1`, repo.ID); err != nil {
+		t.Fatalf("delete repository: %v", err)
+	}
+	var tracked, listed int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT COUNT(*) FROM user_tracked_repositories), (SELECT COUNT(*) FROM user_repositories)`).
+		Scan(&tracked, &listed); err != nil || tracked != 0 || listed != 1 {
+		t.Errorf("after deleting the repository: tracked %d listed %d (err %v), want 0 and the GitHub listing kept", tracked, listed, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, user.ID); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM user_repositories`).Scan(&listed); err != nil || listed != 0 {
+		t.Errorf("listed after deleting the user = %d (err %v), want 0", listed, err)
+	}
+
+	down, err := migrations.FS.ReadFile("0007_user_repositories.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply down migration: %v", err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `
+		SELECT (SELECT COUNT(*) FROM information_schema.tables
+		        WHERE table_schema = $1 AND table_name IN ('user_repositories', 'user_tracked_repositories'))
+		     + (SELECT COUNT(*) FROM information_schema.columns
+		        WHERE table_schema = $1 AND table_name = 'users' AND column_name LIKE 'repos_list%')`, schema).
+		Scan(&remaining); err != nil || remaining != 0 {
+		t.Errorf("0007 objects after rolling back = %d (err %v), want 0", remaining, err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT id, login FROM users LIMIT 1`); err != nil {
+		t.Errorf("rolling back 0007 broke the users table: %v", err)
 	}
 }
 

@@ -1,23 +1,29 @@
 <script setup>
-import { computed, toRef } from 'vue'
+import { computed, ref, toRef } from 'vue'
 import { RouterLink } from 'vue-router'
 import { api } from '../api/client.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
+import { githubUrl } from '../lib/intelligence.js'
+import { formatLastScanned } from '../lib/repositories.js'
 import {
   accessLabel,
   compactNumber,
   formatDate,
   formatDateTime,
   isAccessible,
-  relativeTime,
   scanTriggerLabel,
   shortSha,
 } from '../lib/format.js'
+import AppIcon from '../components/AppIcon.vue'
 import DataCard from '../components/DataCard.vue'
 import DriftTimeline from '../components/DriftTimeline.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ErrorState from '../components/ErrorState.vue'
+import PageHeader from '../components/PageHeader.vue'
+import RiskBadge from '../components/RiskBadge.vue'
+import RiskExplanation from '../components/RiskExplanation.vue'
 import RiskScore from '../components/RiskScore.vue'
+import LoadingState from '../components/LoadingState.vue'
 import ScanStatusBadge from '../components/ScanStatusBadge.vue'
 import StatTile from '../components/StatTile.vue'
 
@@ -36,6 +42,37 @@ const scans = useAsyncData(({ signal }) => api.listScans(repoId.value, { signal,
 
 // The newest completed default-branch scan is the repository's current state.
 const current = computed(() => timeline.data.value?.[0] ?? null)
+const currentScanId = computed(() => current.value?.scanId ?? null)
+
+// Its full record carries the risk level, delta and, when it has no score,
+// why: the vulnerability lookup is pending or failed.
+const currentScan = useAsyncData(
+  ({ signal }) => (currentScanId.value ? api.getScan(currentScanId.value, { signal }) : null),
+  { watch: [currentScanId] },
+)
+const riskReason = computed(() => {
+  const scan = currentScan.data.value
+  if (!current.value) return 'No completed scan yet, so there is nothing to score.'
+  if (scan?.enrichmentError) return `The vulnerability lookup failed: ${scan.enrichmentError}. It is retried automatically.`
+  return ''
+})
+const showExplanation = ref(false)
+
+// The same rule as the dashboard: the newest completed default-branch scan,
+// not a pull request or backfilled base scan, and its finish time. Failed or
+// running scans never move it.
+const lastScannedText = computed(() => {
+  const completed = (scans.data.value ?? []).find(
+    (scan) => scan.status === 'completed' && !scan.pullRequestId && scan.trigger !== 'backfill',
+  )
+  if (completed) return formatLastScanned(completed.finishedAt) || 'Last scanned (time not recorded)'
+  if (scans.data.value && !current.value) return 'Not scanned yet'
+  return ''
+})
+
+function scanRisk(scan) {
+  return scan.enrichedAt ? { score: scan.riskScore ?? null, level: scan.riskLevel, delta: scan.riskDelta ?? null } : null
+}
 
 const changesThisWeek = computed(() => {
   if (!timeline.data.value) return null
@@ -54,24 +91,44 @@ const componentDelta = computed(() => {
 
 <template>
   <div class="flex flex-col gap-6">
-    <div>
-      <RouterLink
-        :to="{ name: 'repositories' }"
-        class="text-xs text-ink-muted no-underline"
-      >
-        ← Repositories
-      </RouterLink>
-      <h1 class="mt-1.5 mb-0 text-xl font-semibold tracking-tight text-ink">
+    <PageHeader>
+      <template #eyebrow>
+        <RouterLink :to="{ name: 'repositories' }" class="text-ink-muted no-underline hover:text-ink">Repositories</RouterLink>
+        <span class="mx-1.5" aria-hidden="true">/</span>Report
+      </template>
+      <template #title>
         <template v-if="repository.data.value">
-          {{ repository.data.value.owner }}/{{ repository.data.value.name }}
+          <span class="font-normal text-ink-secondary">{{ repository.data.value.owner }}/</span>{{ repository.data.value.name }}
         </template>
         <template v-else>Repository</template>
-      </h1>
-      <p v-if="repository.data.value" class="mt-1 mb-0 text-sm text-ink-muted">
-        Tracking <span class="text-ink-secondary">{{ repository.data.value.defaultBranch }}</span>
-        · last scan {{ current ? relativeTime(current.createdAt) : 'never' }}
-      </p>
-    </div>
+      </template>
+      <template v-if="repository.data.value" #description>
+        <span class="inline-flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span class="inline-flex items-center gap-1">
+            <AppIcon name="branch" :size="13" />
+            <span class="mono text-ink-secondary">{{ repository.data.value.defaultBranch }}</span>
+          </span>
+          <span class="nums">{{ lastScannedText }}</span>
+        </span>
+      </template>
+      <template #actions>
+        <RouterLink :to="{ name: 'pull-requests', params: { repoId } }" class="btn btn-secondary">
+          <AppIcon name="pull-request" :size="14" />
+          Pull requests
+        </RouterLink>
+        <a
+          v-if="repository.data.value && githubUrl(repository.data.value.owner, repository.data.value.name)"
+          :href="githubUrl(repository.data.value.owner, repository.data.value.name)"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="btn btn-ghost"
+        >
+          <AppIcon name="github" :size="14" />
+          GitHub
+          <AppIcon name="external" :size="12" />
+        </a>
+      </template>
+    </PageHeader>
 
     <ErrorState v-if="repository.error.value" :error="repository.error.value" @retry="repository.reload" />
 
@@ -80,19 +137,37 @@ const componentDelta = computed(() => {
     <div
       v-else-if="repository.data.value && !isAccessible(repository.data.value)"
       role="status"
-      class="rounded-lg border border-hairline bg-surface px-4 py-3 text-sm text-ink-secondary"
+      class="banner banner-warning"
     >
-      <span class="font-medium text-ink">No longer accessible</span>
+      <AppIcon name="alert" :size="15" class="mt-0.5" />
+      <span>
+      <span class="font-semibold">No longer accessible</span>
       · {{ accessLabel(repository.data.value.access) }}<template
         v-if="repository.data.value.accessRevokedAt"
       > on {{ formatDate(repository.data.value.accessRevokedAt) }}</template>.
       The history below is kept, but this repository is no longer scanned.
+      </span>
     </div>
 
     <template v-if="!repository.error.value">
       <!-- One hero figure per view: the risk score. Everything else is a tile. -->
       <div class="grid gap-3 lg:grid-cols-[minmax(240px,1fr)_2fr]">
-        <RiskScore :score="current?.riskScore ?? null" :delta="null" />
+        <RiskScore
+          :score="currentScan.data.value?.enrichedAt ? (currentScan.data.value.riskScore ?? null) : null"
+          :delta="currentScan.data.value?.riskDelta ?? null"
+          :level="currentScan.data.value?.riskLevel ?? ''"
+          :reason="riskReason"
+        >
+          <button
+            v-if="currentScan.data.value?.enrichedAt"
+            type="button"
+            class="mt-3 inline-flex cursor-pointer items-center gap-1 border-0 bg-transparent p-0 text-xs font-medium text-accent hover:underline"
+            :aria-expanded="showExplanation"
+            @click="showExplanation = !showExplanation"
+          >
+            {{ showExplanation ? 'Hide explanation' : 'How is this scored?' }}
+          </button>
+        </RiskScore>
 
         <div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
           <StatTile
@@ -117,22 +192,15 @@ const componentDelta = computed(() => {
         </div>
       </div>
 
+      <RiskExplanation v-if="showExplanation && currentScanId" :scan-id="currentScanId" />
+
       <DataCard
         title="Dependency drift"
+        icon="package"
         subtitle="Changes per scan on the default branch, oldest first"
       >
-        <template #actions>
-          <RouterLink
-            :to="{ name: 'pull-requests', params: { repoId } }"
-            class="rounded-md border border-hairline bg-surface-raised px-2.5 py-1 text-xs text-ink-secondary no-underline"
-          >
-            Pull requests
-          </RouterLink>
-        </template>
 
-        <p v-if="timeline.loading.value" class="m-0 py-10 text-center text-sm text-ink-muted">
-          Loading…
-        </p>
+        <LoadingState v-if="timeline.loading.value" />
         <ErrorState
           v-else-if="timeline.error.value"
           :error="timeline.error.value"
@@ -145,47 +213,42 @@ const componentDelta = computed(() => {
         />
       </DataCard>
 
-      <DataCard title="Scan history" subtitle="Includes pull request and backfill scans">
-        <p v-if="scans.loading.value" class="m-0 py-6 text-center text-sm text-ink-muted">
-          Loading…
-        </p>
+      <DataCard title="Scan history" icon="history" flush subtitle="Includes pull request and backfill scans">
+        <div v-if="scans.loading.value" class="p-5"><LoadingState /></div>
         <ErrorState v-else-if="scans.error.value" :error="scans.error.value" @retry="scans.reload" />
         <EmptyState v-else-if="!scans.data.value?.length" title="No scans yet" />
 
         <div v-else class="overflow-x-auto">
-          <table class="w-full border-collapse text-sm">
+          <table class="data-table min-w-[640px]">
             <thead>
-              <tr class="border-b border-hairline text-left">
-                <th class="px-2 py-2 text-xs font-medium text-ink-muted">Commit</th>
-                <th class="px-2 py-2 text-xs font-medium text-ink-muted">Trigger</th>
-                <th class="px-2 py-2 text-xs font-medium text-ink-muted">Status</th>
-                <th class="px-2 py-2 text-right text-xs font-medium text-ink-muted">Components</th>
-                <th class="px-2 py-2 text-xs font-medium text-ink-muted">When</th>
-                <th class="px-2 py-2"></th>
+              <tr>
+                <th class="pl-4 sm:pl-5">Commit</th>
+                <th>Trigger</th>
+                <th>Status</th>
+                <th class="text-right">Components</th>
+                <th>Risk</th>
+                <th>When</th>
+                <th class="pr-4 sm:pr-5"><span class="sr-only">Actions</span></th>
               </tr>
             </thead>
             <tbody>
-              <tr
-                v-for="scan in scans.data.value"
-                :key="scan.id"
-                class="border-b border-hairline last:border-0"
-              >
-                <td class="nums px-2 py-2 text-ink">{{ shortSha(scan.commitSha) }}</td>
-                <td class="px-2 py-2 text-xs text-ink-secondary">
+              <tr v-for="scan in scans.data.value" :key="scan.id">
+                <td class="mono pl-4 text-ink sm:pl-5">{{ shortSha(scan.commitSha) }}</td>
+                <td class="text-xs text-ink-secondary capitalize">
                   {{ scanTriggerLabel(scan.trigger) }}
                 </td>
-                <td class="px-2 py-2"><ScanStatusBadge :status="scan.status" /></td>
-                <td class="nums px-2 py-2 text-right text-ink-secondary">
-                  {{ scan.componentCount }}
+                <td><ScanStatusBadge :status="scan.status" /></td>
+                <td class="nums text-right text-ink-secondary">
+                  {{ scan.status === 'completed' ? scan.componentCount : '—' }}
                 </td>
-                <td class="px-2 py-2 text-xs text-ink-muted">
+                <td>
+                  <RiskBadge v-if="scan.status === 'completed'" :risk="scanRisk(scan)" />
+                </td>
+                <td class="nums text-xs text-ink-muted">
                   {{ formatDateTime(scan.createdAt) }}
                 </td>
-                <td class="px-2 py-2 text-right">
-                  <RouterLink
-                    :to="{ name: 'scan', params: { scanId: scan.id } }"
-                    class="text-xs text-ink-secondary underline decoration-hairline"
-                  >
+                <td class="pr-4 text-right sm:pr-5">
+                  <RouterLink :to="{ name: 'scan', params: { scanId: scan.id } }" class="btn btn-ghost btn-sm">
                     View
                   </RouterLink>
                 </td>

@@ -113,6 +113,12 @@ type Worker struct {
 	// LockTimeout is how long a job may stay locked before another worker
 	// treats it as abandoned and reclaims it.
 	LockTimeout time.Duration
+	// OSVBaseURL is the OSV.dev API the worker checks components against.
+	// It is public and needs no credentials.
+	OSVBaseURL string
+	// OSVDisabled turns vulnerability analysis off, for offline development.
+	// Scans then record that their components were not checked.
+	OSVDisabled bool
 }
 
 // Load reads configuration from the environment, applying defaults suited to
@@ -167,6 +173,8 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 			Concurrency:  int(intEnv("WORKER_CONCURRENCY", 4)),
 			PollInterval: durationEnv("WORKER_POLL_INTERVAL", 2*time.Second),
 			LockTimeout:  durationEnv("WORKER_LOCK_TIMEOUT", 15*time.Minute),
+			OSVBaseURL:   env("OSV_API_BASE_URL", "https://api.osv.dev"),
+			OSVDisabled:  boolEnv("OSV_DISABLED", false),
 		},
 	}
 
@@ -209,6 +217,10 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 	}
 	if cfg.Worker.Concurrency < 1 {
 		problems = append(problems, errors.New("WORKER_CONCURRENCY must be at least 1"))
+	}
+	if osvURL, err := url.Parse(cfg.Worker.OSVBaseURL); err != nil || osvURL.Host == "" ||
+		(osvURL.Scheme != "https" && !(osvURL.Scheme == "http" && cfg.Env == "development")) {
+		problems = append(problems, fmt.Errorf("OSV_API_BASE_URL %q must be an https URL", cfg.Worker.OSVBaseURL))
 	}
 	if loadAuth {
 		cfg.Auth, problems = loadAuthConfig(cfg.Env, problems)

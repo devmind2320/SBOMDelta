@@ -74,6 +74,18 @@ jobs:
           grep -q -- '--- PASS: TestTokensAndSecretsNeverLeak' test-output.txt
           grep -q -- '--- PASS: TestLogoutFailureIsReportedAndKeepsTheSession' test-output.txt
           grep -q -- '--- PASS: TestGitHubErrorTextIsNeverEchoed' test-output.txt
+          grep -q -- '--- PASS: TestMigration0007UserRepositories' test-output.txt
+          grep -q -- '--- PASS: TestUsersSeeOnlyRepositoriesGitHubGrantsThem' test-output.txt
+          grep -q -- '--- PASS: TestSignInRecordsRepositoriesAcrossPages' test-output.txt
+          grep -q -- '--- PASS: TestManualScanDuplicateRequestsShareOneScan' test-output.txt
+          grep -q -- '--- PASS: TestMigration0008VulnerabilityIntelligence' test-output.txt
+          grep -q -- '--- PASS: TestEnrichmentIsPersistedScoredAndCompared' test-output.txt
+          grep -q -- '--- PASS: TestImpactCoversOnlyTrackedAccessibleRepositories' test-output.txt
+          grep -q -- '--- PASS: TestEnrichChecksTheBaseFirstAndScoresTheChange' test-output.txt
+          grep -q -- '--- PASS: TestEnrichFailureIsRecordedAndRetried' test-output.txt
+          grep -q -- '--- PASS: TestWebhookIsAuthenticatedIdempotentAndFollowsThePullRequest' test-output.txt
+          grep -q -- '--- PASS: TestTrackMovesARepositoryBetweenTheDashboardSections' test-output.txt
+          grep -q -- '--- PASS: TestLastScansAndImpactAreScopedToTrackedRepositories' test-output.txt
 
       - name: Run lint checks
         run: make lint

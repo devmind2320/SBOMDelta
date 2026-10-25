@@ -30,6 +30,11 @@ const (
 	// KindInitialScan gives a repository that has never been scanned its
 	// first scan, at the head of its default branch.
 	KindInitialScan Kind = "initial_scan"
+	// KindEnrich checks a completed scan's components against OSV.dev and
+	// scores its risk. Scans do this inline when they finish; the job is the
+	// retry when OSV could not be reached, and the catch-up for scans
+	// stored before vulnerability analysis existed.
+	KindEnrich Kind = "enrich"
 )
 
 // ErrNoJobs signals that the queue is empty right now.
@@ -59,6 +64,15 @@ type ReconcileInstallationPayload struct {
 type InitialScanPayload struct {
 	RepositoryID int64 `json:"repositoryId"`
 }
+
+// EnrichPayload is the body of a KindEnrich job.
+type EnrichPayload struct {
+	ScanID int64 `json:"scanId"`
+}
+
+// EnrichDedupeKey is the one dedupe key for enriching a scan, so the inline
+// retry, the startup sweep and a manual request never queue it twice.
+func EnrichDedupeKey(scanID int64) string { return fmt.Sprintf("enrich:%d", scanID) }
 
 // Queue reads and writes the jobs table.
 type Queue struct {

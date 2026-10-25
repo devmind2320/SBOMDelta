@@ -56,6 +56,9 @@ func run(logger *slog.Logger) error {
 
 	jobs := queue.New(db.Pool(), cfg.Worker.LockTimeout)
 	var webhook http.Handler
+	// scans stays a nil interface, not a typed nil, when GitHub is disabled,
+	// so the API can tell scanning is unavailable.
+	var scans api.ScanRequester
 	if cfg.GitHub.Disabled {
 		logger.Info("GitHub integration disabled for local development")
 		webhook = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,12 +66,15 @@ func run(logger *slog.Logger) error {
 		})
 	} else {
 		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
+		// A scan request resolves the default branch head as the installation,
+		// as initial scans do on the worker, then queues the usual scan job.
+		scans = ghapp.NewManualScanner(ghapp.NewApp(cfg.GitHub), db, jobs, logger)
 	}
 	if cfg.Auth.Disabled {
 		logger.Warn("dashboard sign-in disabled for local development; every request is treated as signed in")
 	}
 	authService := auth.New(cfg.Auth, cfg.GitHub.APIBaseURL, db, logger)
-	handler := api.New(db, blob, jobs, authService, logger).Routes(webhook)
+	handler := api.New(db, blob, jobs, authService, scans, logger).Routes(webhook)
 
 	server := &http.Server{
 		Addr:    cfg.HTTPAddr,

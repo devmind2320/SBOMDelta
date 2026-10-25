@@ -78,6 +78,49 @@ export const api = {
 
   logout: () => request('/api/auth/logout', { method: 'POST', notify: false }),
 
+  /**
+   * One page of the repositories GitHub reported for the signed-in user at
+   * sign-in, with { repositories, total, page, perPage, listing }.
+   */
+  listMyRepositories: ({ page = 1, perPage = 30, q = '', untrackedOnly = false, ...options } = {}) =>
+    request(
+      `/api/me/repositories?page=${page}&perPage=${perPage}&q=${encodeURIComponent(q)}` +
+        (untrackedOnly ? '&exclude=tracked' : ''),
+      options,
+    ),
+
+  /** The repositories the signed-in user tracks, with their latest scans. */
+  listTracked: (options) => request('/api/me/tracked', options).then((body) => body.repositories ?? []),
+
+  /** Scans a repository's default branch head: { scan, outcome }. */
+  requestScan: (repositoryId) => request(`/api/repos/${repositoryId}/scans`, { method: 'POST' }),
+
+  /** Adds a repository to the signed-in user's tracked list without scanning it. */
+  track: (repositoryId) => request(`/api/me/tracked/${repositoryId}`, { method: 'PUT' }),
+
+  untrack: (repositoryId) => request(`/api/me/tracked/${repositoryId}`, { method: 'DELETE' }),
+
+  /** The newest scans of the user's tracked repositories ("Last scans"). */
+  listRecentScans: ({ limit = 20, repositoryId = null, ...options } = {}) =>
+    request(
+      `/api/me/scans?limit=${limit}` + (repositoryId ? `&repositoryId=${repositoryId}` : ''),
+      options,
+    ).then((body) => body.scans ?? []),
+
+  /** A scan's risk score with its factors: { scored, assessment?, reason? }. */
+  getRisk: (scanId, options) => request(`/api/scans/${scanId}/risk`, options),
+
+  /** What a scan introduced and resolved against its base: { available, comparison?, reason? }. */
+  getVulnerabilityChanges: (scanId, options) =>
+    request(`/api/scans/${scanId}/vulnerability-changes`, options),
+
+  /** Advisories across the user's tracked repositories: { vulnerabilities, coverage }. */
+  impactVulnerabilities: (options) => request('/api/impact/vulnerabilities', options),
+
+  /** A dependency across the user's tracked repositories: { components, coverage }. */
+  impactComponents: (q, options) =>
+    request(`/api/impact/components?q=${encodeURIComponent(q)}`, options),
+
   // access is 'active' (the API default), 'inactive' or 'all'. Inactive
   // repositories are ones SBOMDelta lost access to; their history is kept.
   listRepositories: ({ access = 'active', ...options } = {}) =>
@@ -110,6 +153,7 @@ export const api = {
     request(`/api/scans/${id}/vulnerabilities`, options).then((body) => ({
       vulnerabilities: body.vulnerabilities ?? [],
       enrichmentAvailable: body.enrichmentAvailable ?? false,
+      summary: body.summary ?? null,
     })),
 
   sbomDownloadUrl: (id) => `${BASE}/api/scans/${id}/sbom`,

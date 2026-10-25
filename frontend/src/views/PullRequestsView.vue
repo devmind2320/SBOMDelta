@@ -6,7 +6,10 @@ import { useAsyncData } from '../composables/useAsyncData.js'
 import DataCard from '../components/DataCard.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ErrorState from '../components/ErrorState.vue'
+import LoadingState from '../components/LoadingState.vue'
+import PageHeader from '../components/PageHeader.vue'
 import ScanStatusBadge from '../components/ScanStatusBadge.vue'
+import VulnSummary from '../components/VulnSummary.vue'
 
 const props = defineProps({ repoId: { type: String, required: true } })
 const repoId = toRef(props, 'repoId')
@@ -19,22 +22,20 @@ const { data: pulls, error, loading, reload } = useAsyncData(
 
 <template>
   <div class="flex flex-col gap-6">
-    <div>
-      <RouterLink
-        :to="{ name: 'repository', params: { repoId } }"
-        class="text-xs text-ink-muted no-underline"
-      >
-        ← Repository
-      </RouterLink>
-      <h1 class="mt-1.5 mb-0 text-xl font-semibold tracking-tight text-ink">Pull requests</h1>
-      <p class="mt-1 mb-0 text-sm text-ink-muted">
-        Each pull request is compared against its base commit, so the numbers show only
-        what that pull request changes.
-      </p>
-    </div>
+    <PageHeader
+      title="Pull requests"
+      description="Each pull request is compared against its base commit, so the numbers show only what that pull request changes."
+    >
+      <template #eyebrow>
+        <RouterLink :to="{ name: 'repository', params: { repoId } }" class="text-ink-muted no-underline hover:text-ink">
+          Repository report
+        </RouterLink>
+        <span class="mx-1.5" aria-hidden="true">/</span>Pull requests
+      </template>
+    </PageHeader>
 
-    <DataCard title="Open and recent pull requests">
-      <p v-if="loading" class="m-0 py-6 text-center text-sm text-ink-muted">Loading…</p>
+    <DataCard title="Open and recent pull requests" icon="pull-request" flush>
+      <div v-if="loading" class="p-5"><LoadingState /></div>
       <ErrorState v-else-if="error" :error="error" @retry="reload" />
       <EmptyState
         v-else-if="!pulls?.length"
@@ -43,37 +44,39 @@ const { data: pulls, error, loading, reload } = useAsyncData(
       />
 
       <div v-else class="overflow-x-auto">
-        <table class="w-full border-collapse text-sm">
+        <table class="data-table min-w-[720px]">
           <thead>
-            <tr class="border-b border-hairline text-left">
-              <th class="px-2 py-2 text-xs font-medium text-ink-muted">PR</th>
-              <th class="px-2 py-2 text-xs font-medium text-ink-muted">Title</th>
-              <th class="px-2 py-2 text-xs font-medium text-ink-muted">Author</th>
-              <th class="px-2 py-2 text-xs font-medium text-ink-muted">Scan</th>
-              <th class="px-2 py-2 text-right text-xs font-medium text-ink-muted">Changes</th>
-              <th class="px-2 py-2"></th>
+            <tr>
+              <th class="pl-4 sm:pl-5">PR</th>
+              <th>Title</th>
+              <th>Author</th>
+              <th>Scan</th>
+              <th>Vulnerabilities</th>
+              <th class="text-right">Changes</th>
+              <th class="pr-4 sm:pr-5"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="pull in pulls" :key="pull.id" class="border-b border-hairline last:border-0">
-              <td class="nums px-2 py-2 text-ink">#{{ pull.number }}</td>
-              <td class="max-w-[34ch] px-2 py-2 text-ink-secondary">{{ pull.title || '—' }}</td>
-              <td class="px-2 py-2 text-xs text-ink-muted">{{ pull.authorLogin || '—' }}</td>
-              <td class="px-2 py-2">
+            <tr v-for="pull in pulls" :key="pull.id">
+              <td class="nums pl-4 font-semibold text-ink sm:pl-5">#{{ pull.number }}</td>
+              <td class="max-w-[34ch] text-ink-secondary">
+                {{ pull.title || '—' }}
+                <span v-if="pull.state && pull.state !== 'open'" class="chip ml-1 capitalize">{{ pull.state }}</span>
+              </td>
+              <td class="text-xs text-ink-muted">{{ pull.authorLogin || '—' }}</td>
+              <td>
                 <ScanStatusBadge v-if="pull.scanStatus" :status="pull.scanStatus" />
                 <span v-else class="text-xs text-ink-muted">Not scanned</span>
               </td>
-              <td class="nums px-2 py-2 text-right text-xs text-ink-secondary">
+              <td><VulnSummary :summary="pull.vulnerabilities ?? null" show-changes /></td>
+              <td class="nums text-right text-xs text-ink-secondary">
                 <template v-if="pull.scanId">
                   +{{ pull.added }} ~{{ pull.updated }} −{{ pull.removed }}
                 </template>
                 <template v-else>—</template>
               </td>
-              <td class="px-2 py-2 text-right">
-                <RouterLink
-                  :to="{ name: 'pull-request', params: { pullId: pull.id } }"
-                  class="text-xs text-ink-secondary underline decoration-hairline"
-                >
+              <td class="pr-4 text-right sm:pr-5">
+                <RouterLink :to="{ name: 'pull-request', params: { pullId: pull.id } }" class="btn btn-ghost btn-sm">
                   View
                 </RouterLink>
               </td>

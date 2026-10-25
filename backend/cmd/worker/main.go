@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"sbomdelta/internal/config"
 	ghapp "sbomdelta/internal/github"
+	"sbomdelta/internal/osv"
 	"sbomdelta/internal/queue"
 	"sbomdelta/internal/sbom"
 	"sbomdelta/internal/scanner"
@@ -71,7 +73,25 @@ func run(logger *slog.Logger) error {
 		app = ghapp.NewApp(cfg.GitHub)
 	}
 
-	pipeline := scanner.New(db, blob, app, generator, cfg.Scanner, logger)
+	// A nil checker leaves vulnerability analysis off; scans then record
+	// that their components were not checked rather than reading as clean.
+	var vulns scanner.VulnerabilityChecker
+	if cfg.Worker.OSVDisabled {
+		logger.Warn("vulnerability analysis disabled (OSV_DISABLED); scans will record no vulnerability data")
+	} else {
+		vulns = osv.NewClient(cfg.Worker.OSVBaseURL)
+	}
+
+	pipeline := scanner.New(db, blob, app, generator, vulns, jobs, cfg.Scanner, logger)
+
+	// Scans stored before vulnerability analysis existed, or whose lookup
+	// gave up, are checked in the background, spaced out so a large backlog
+	// does not arrive at OSV as a burst.
+	if vulns != nil {
+		if err := enqueueEnrichment(ctx, db, jobs, logger); err != nil {
+			return err
+		}
+	}
 
 	var reconciler *ghapp.Reconciler
 	var initial *ghapp.InitialScanner
@@ -88,6 +108,30 @@ func run(logger *slog.Logger) error {
 	}
 
 	return worker.New(workerID(), jobs, pipeline, reconciler, initial, cfg.Worker, logger).Run(ctx)
+}
+
+// enrichmentBacklog bounds the startup sweep; anything older is still
+// enriched when someone asks for it (a scan request or a retry).
+const enrichmentBacklog = 200
+
+func enqueueEnrichment(ctx context.Context, db *storage.DB, jobs *queue.Queue, logger *slog.Logger) error {
+	ids, err := db.ScansNeedingEnrichment(ctx, enrichmentBacklog)
+	if err != nil {
+		return err
+	}
+	queued := 0
+	for _, id := range ids {
+		jobID, err := jobs.EnqueueSpaced(ctx, queue.KindEnrich, queue.EnrichPayload{ScanID: id},
+			queue.EnrichDedupeKey(id), 3*time.Second)
+		if err != nil {
+			return err
+		}
+		if jobID != 0 {
+			queued++
+		}
+	}
+	logger.Info("queued vulnerability analysis for unanalyzed scans", "scans", queued)
+	return nil
 }
 
 func enqueueReconciliation(ctx context.Context, db *storage.DB, jobs *queue.Queue, logger *slog.Logger) error {

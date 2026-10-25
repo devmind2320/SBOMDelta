@@ -31,3 +31,18 @@ func TestHandleRejectsUnrunnableInitialScanJobs(t *testing.T) {
 		})
 	}
 }
+
+// A malformed enrich job fails loudly instead of succeeding with nothing
+// analyzed.
+func TestHandleRejectsUnrunnableEnrichJobs(t *testing.T) {
+	w := &Worker{}
+	for payload, want := range map[string]string{
+		`{}`:             "no scan id",
+		`{"scanId":"x"}`: "decode enrich payload",
+	} {
+		err := w.handle(context.Background(), &queue.Job{Kind: queue.KindEnrich, Payload: json.RawMessage(payload)})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("handle(%s) error = %v, want it to mention %q", payload, err, want)
+		}
+	}
+}

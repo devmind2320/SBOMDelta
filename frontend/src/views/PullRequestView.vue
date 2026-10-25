@@ -4,12 +4,18 @@ import { RouterLink } from 'vue-router'
 import { api } from '../api/client.js'
 import { useAsyncData } from '../composables/useAsyncData.js'
 import { shortSha, signedNumber } from '../lib/format.js'
+import { pullRequestVerdict } from '../lib/intelligence.js'
 import DataCard from '../components/DataCard.vue'
 import DriftList from '../components/DriftList.vue'
 import EmptyState from '../components/EmptyState.vue'
 import ErrorState from '../components/ErrorState.vue'
 import LicenseMatrix from '../components/LicenseMatrix.vue'
+import RiskExplanation from '../components/RiskExplanation.vue'
+import AppIcon from '../components/AppIcon.vue'
+import LoadingState from '../components/LoadingState.vue'
+import PageHeader from '../components/PageHeader.vue'
 import ScanStatusBadge from '../components/ScanStatusBadge.vue'
+import SeverityPill from '../components/SeverityPill.vue'
 import SeverityTiles from '../components/SeverityTiles.vue'
 import StatTile from '../components/StatTile.vue'
 import VulnerabilityTable from '../components/VulnerabilityTable.vue'
@@ -41,41 +47,39 @@ const vulnerabilities = useAsyncData(
   { watch: [scanId] },
 )
 
+const changes = useAsyncData(
+  ({ signal }) =>
+    scanId.value && pull.data.value?.scanStatus === 'completed'
+      ? api.getVulnerabilityChanges(scanId.value, { signal })
+      : null,
+  { watch: [scanId, () => pull.data.value?.scanStatus] },
+)
+
 const hasDrift = computed(() => (drift.data.value?.length ?? 0) > 0)
 
 /**
- * The verdict mirrors what the GitHub check run actually reports, and nothing
- * more. Drift is "review" rather than "block" because there is no risk model
- * yet to justify blocking a merge -- and a check that blocks on any dependency
- * change is a check people learn to ignore.
+ * The verdict mirrors what the GitHub check run reports (see
+ * pullRequestVerdict): critical or high vulnerabilities introduced fail,
+ * anything else that moved asks for review, and nothing is claimed about
+ * vulnerabilities that have not been looked up.
  */
-const verdict = computed(() => {
-  if (!pull.data.value?.scanId) {
-    return { label: 'Not scanned', tone: 'neutral', note: 'No scan has run for this pull request yet.' }
-  }
-  if (pull.data.value.scanStatus === 'failed') {
-    return {
-      label: 'Scan failed',
-      tone: 'critical',
-      note: 'SBOMDelta could not analyze this commit. This reports a broken scan, not a security finding.',
-    }
-  }
-  if (pull.data.value.scanStatus !== 'completed') {
-    return { label: 'In progress', tone: 'neutral', note: 'The scan is still running.' }
-  }
-  if (!hasDrift.value) {
-    return {
-      label: 'No dependency changes',
-      tone: 'good',
-      note: 'This pull request does not alter the dependency set.',
-    }
-  }
-  return {
-    label: 'Review dependency changes',
-    tone: 'warning',
-    note: 'Dependencies moved. Blocking decisions need the risk policy from Phase 5.',
-  }
-})
+const verdict = computed(() =>
+  pullRequestVerdict({
+    scanId: pull.data.value?.scanId,
+    scanStatus: pull.data.value?.scanStatus,
+    hasDrift: hasDrift.value,
+    changes: changes.data.value,
+  }),
+)
+
+// The verdict surface takes the tone's background; the icon and sentence
+// still carry the meaning.
+const VERDICT_SURFACES = {
+  good: 'border-[var(--tone-success-border)] bg-[var(--tone-success-bg)]',
+  warning: 'border-[var(--tone-warning-border)] bg-[var(--tone-warning-bg)]',
+  critical: 'border-[var(--tone-danger-border)] bg-[var(--tone-danger-bg)]',
+  neutral: 'border-hairline bg-surface',
+}
 
 const TONES = {
   good: { color: 'var(--status-good)', glyph: 'check' },
@@ -88,37 +92,52 @@ const TONES = {
 <template>
   <div class="flex flex-col gap-6">
     <ErrorState v-if="pull.error.value" :error="pull.error.value" @retry="pull.reload" />
-    <p v-else-if="pull.loading.value" class="py-10 text-center text-sm text-ink-muted">Loading…</p>
+    <div v-else-if="pull.loading.value" class="card p-5"><LoadingState :rows="4" /></div>
 
     <template v-else-if="pull.data.value">
-      <div>
-        <RouterLink
-          :to="{ name: 'pull-requests', params: { repoId: pull.data.value.repositoryId } }"
-          class="text-xs text-ink-muted no-underline"
-        >
-          ← Pull requests
-        </RouterLink>
-        <h1 class="mt-1.5 mb-0 text-xl font-semibold tracking-tight text-ink">
-          <span class="nums text-ink-muted">#{{ pull.data.value.number }}</span>
+      <PageHeader>
+        <template #eyebrow>
+          <RouterLink
+            :to="{ name: 'pull-requests', params: { repoId: pull.data.value.repositoryId } }"
+            class="text-ink-muted no-underline hover:text-ink"
+          >
+            Pull requests
+          </RouterLink>
+          <span class="mx-1.5" aria-hidden="true">/</span>#{{ pull.data.value.number }}
+        </template>
+        <template #title>
+          <span class="nums font-normal text-ink-muted">#{{ pull.data.value.number }}</span>
           {{ pull.data.value.title || 'Untitled pull request' }}
-        </h1>
-        <p class="mt-1 mb-0 text-sm text-ink-muted">
-          {{ pull.data.value.authorLogin || 'unknown author' }} ·
-          <span class="nums">{{ shortSha(pull.data.value.baseSha) }}</span> →
-          <span class="nums">{{ shortSha(pull.data.value.headSha) }}</span>
-          <template v-if="pull.data.value.scanStatus">
-            · <ScanStatusBadge :status="pull.data.value.scanStatus" />
-          </template>
-        </p>
-      </div>
+        </template>
+        <template #description>
+          <span class="flex flex-wrap items-center gap-2">
+            <span class="inline-flex items-center gap-1">
+              <AppIcon name="user" :size="13" />
+              {{ pull.data.value.authorLogin || 'unknown author' }}
+            </span>
+            <span class="inline-flex items-center gap-1">
+              <AppIcon name="pull-request" :size="13" />
+              <span class="mono">{{ shortSha(pull.data.value.baseSha) }}</span> →
+              <span class="mono">{{ shortSha(pull.data.value.headSha) }}</span>
+            </span>
+            <ScanStatusBadge v-if="pull.data.value.scanStatus" :status="pull.data.value.scanStatus" />
+            <span v-if="pull.data.value.state && pull.data.value.state !== 'open'" class="chip capitalize">
+              {{ pull.data.value.state }}
+            </span>
+          </span>
+        </template>
+      </PageHeader>
 
       <!-- Hero: the risk delta is the number this page is about. -->
       <div class="grid gap-3 lg:grid-cols-[minmax(260px,1fr)_2fr]">
-        <div class="rounded-lg border border-hairline bg-surface px-5 py-4">
-          <p class="m-0 text-xs text-ink-muted">Risk delta</p>
+        <div class="card px-5 py-4">
+          <p class="eyebrow m-0">Risk delta against the base</p>
           <template v-if="typeof pull.data.value.riskDelta === 'number'">
             <p class="mt-1 mb-0 text-5xl leading-none font-semibold tracking-tight text-ink">
-              {{ signedNumber(pull.data.value.riskDelta) }}
+              {{ signedNumber(Math.round(pull.data.value.riskDelta * 10) / 10) }}
+            </p>
+            <p v-if="typeof pull.data.value.riskScore === 'number'" class="mt-2 mb-0 text-xs text-ink-muted">
+              Score {{ pull.data.value.riskScore }} ({{ pull.data.value.riskLevel }}) at the head commit
             </p>
           </template>
           <template v-else>
@@ -126,8 +145,17 @@ const TONES = {
               Not scored
             </p>
             <p class="mt-2 mb-0 max-w-[34ch] text-xs leading-relaxed text-ink-muted">
-              Not scored. The risk engine is Phase&nbsp;5 — this page reports the dependency
-              changes it would score.
+              <template v-if="pull.data.value.vulnerabilities?.status === 'failed'">
+                The vulnerability lookup failed: {{ pull.data.value.vulnerabilities.error }}
+              </template>
+              <template v-else-if="typeof pull.data.value.riskScore === 'number'">
+                The head commit scores {{ pull.data.value.riskScore }} ({{ pull.data.value.riskLevel }}); the
+                base commit has no score to compare with yet.
+              </template>
+              <template v-else>
+                This pull request's scan has not been checked for vulnerabilities yet, so there is no risk to
+                compare.
+              </template>
             </p>
           </template>
         </div>
@@ -155,7 +183,11 @@ const TONES = {
       </div>
 
       <!-- Verdict carries an icon and a sentence, never colour alone. -->
-      <div class="flex items-start gap-2.5 rounded-lg border border-hairline bg-surface px-4 py-3">
+      <div
+        class="flex items-start gap-2.5 rounded-xl border px-4 py-3"
+        :class="VERDICT_SURFACES[verdict.tone]"
+        role="status"
+      >
         <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" class="mt-0.5 shrink-0">
           <template v-if="TONES[verdict.tone].glyph === 'check'">
             <circle cx="8" cy="8" r="6.75" fill="none" :stroke="TONES[verdict.tone].color" stroke-width="1.5" />
@@ -186,7 +218,7 @@ const TONES = {
       />
 
       <template v-else>
-        <DataCard title="What this pull request changes" subtitle="Compared against its base commit">
+        <DataCard title="What this pull request changes" icon="package" subtitle="Compared against its base commit">
           <p v-if="drift.loading.value" class="m-0 py-6 text-center text-sm text-ink-muted">
             Loading…
           </p>
@@ -194,15 +226,67 @@ const TONES = {
           <DriftList v-else :drift-events="drift.data.value ?? []" />
         </DataCard>
 
-        <DataCard title="Vulnerabilities" subtitle="Advisories affecting this pull request's dependencies">
+        <DataCard
+          title="Vulnerability changes"
+          icon="shield-alert"
+          subtitle="Advisories this pull request introduces and resolves, compared with its base commit"
+        >
+          <p v-if="changes.loading.value" class="m-0 py-4 text-center text-sm text-ink-muted">Loading…</p>
+          <ErrorState v-else-if="changes.error.value" :error="changes.error.value" @retry="changes.reload" />
+          <EmptyState
+            v-else-if="!changes.data.value || !changes.data.value.available"
+            tone="pending"
+            title="No comparison yet"
+            :note="changes.data.value?.reason ?? 'The scan has not completed.'"
+          />
+          <template v-else>
+            <p class="mt-0 mb-3 text-sm text-ink-secondary">
+              {{ changes.data.value.comparison.introduced.length }} introduced ·
+              {{ changes.data.value.comparison.resolved.length }} resolved ·
+              {{ changes.data.value.comparison.unchanged }} already present in the base
+            </p>
+            <template v-for="group in ['introduced', 'resolved']" :key="group">
+              <template v-if="changes.data.value.comparison[group].length">
+                <p class="mt-3 mb-1.5 text-xs font-medium text-ink-muted capitalize">{{ group }}</p>
+                <ul class="m-0 flex list-none flex-col gap-1.5 p-0 text-xs">
+                  <li
+                    v-for="item in changes.data.value.comparison[group]"
+                    :key="`${group}-${item.identity}-${item.osvId}`"
+                    class="flex flex-wrap items-center gap-2"
+                  >
+                    <SeverityPill :severity="item.severity" />
+                    <a
+                      :href="`https://osv.dev/vulnerability/${encodeURIComponent(item.osvId)}`"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      class="nums text-ink underline decoration-hairline"
+                    >
+                      {{ item.osvId }}
+                    </a>
+                    <span class="text-ink-secondary">{{ item.package }} {{ item.version }}</span>
+                    <span v-if="group === 'introduced'" class="text-ink-muted">
+                      {{ item.fixedVersion ? `fixed in ${item.fixedVersion}` : 'no fix published' }}
+                    </span>
+                  </li>
+                </ul>
+              </template>
+            </template>
+          </template>
+        </DataCard>
+
+        <RiskExplanation v-if="pull.data.value.scanStatus === 'completed'" :scan-id="pull.data.value.scanId" />
+
+        <DataCard title="Vulnerabilities" icon="shield" subtitle="All advisories affecting this pull request's dependencies">
           <SeverityTiles
             class="mb-4"
             :vulnerabilities="vulnerabilities.data.value?.vulnerabilities ?? []"
             :enrichment-available="vulnerabilities.data.value?.enrichmentAvailable ?? false"
+            :summary="vulnerabilities.data.value?.summary ?? null"
           />
           <VulnerabilityTable
             :vulnerabilities="vulnerabilities.data.value?.vulnerabilities ?? []"
             :enrichment-available="vulnerabilities.data.value?.enrichmentAvailable ?? false"
+            :summary="vulnerabilities.data.value?.summary ?? null"
           />
         </DataCard>
 

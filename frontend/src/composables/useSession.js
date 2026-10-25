@@ -8,6 +8,10 @@ const user = ref(null)
 // The browser has a session, but for an account the dashboard does not allow
 // (removed from the allowlist since signing in). It can still sign out.
 const disallowed = ref(false)
+// The last /api/me failure that said nothing about the session (the API is
+// unreachable, or something else answered), so the header can say so rather
+// than look signed out.
+const unavailable = ref(null)
 let pending = null
 
 /**
@@ -22,11 +26,16 @@ async function loadSession() {
     .then((me) => {
       user.value = me
       disallowed.value = false
+      unavailable.value = null
       return me
     })
     .catch((error) => {
       const state = sessionStateFor(error?.status)
-      if (!state) throw error
+      if (!state) {
+        unavailable.value = error
+        throw error
+      }
+      unavailable.value = null
       disallowed.value = state === 'not_allowed'
       return null
     })
@@ -53,5 +62,5 @@ async function signOut() {
 }
 
 export function useSession() {
-  return { user, disallowed, loadSession, reset, signOut }
+  return { user, disallowed, unavailable, loadSession, reset, signOut }
 }

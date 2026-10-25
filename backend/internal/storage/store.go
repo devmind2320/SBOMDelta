@@ -218,6 +218,21 @@ func (db *DB) GetRepository(ctx context.Context, id int64) (models.Repository, e
 	return out, nil
 }
 
+// GetRepositoryByGitHubID loads a repository by GitHub's numeric ID.
+func (db *DB) GetRepositoryByGitHubID(ctx context.Context, githubRepoID int64) (models.Repository, error) {
+	const query = `SELECT ` + repositoryColumns + ` FROM repositories WHERE github_repo_id = $1`
+
+	var out models.Repository
+	err := db.pool.QueryRow(ctx, query, githubRepoID).Scan(repositoryTargets(&out)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return models.Repository{}, ErrNotFound
+	}
+	if err != nil {
+		return models.Repository{}, fmt.Errorf("get repository by github id: %w", err)
+	}
+	return out, nil
+}
+
 // AccessFilter selects repositories by whether they are currently reachable.
 type AccessFilter string
 
@@ -231,17 +246,11 @@ const (
 // their history stays reachable, but most callers want only what SBOMDelta
 // can scan today, which is AccessFilterActive.
 func (db *DB) ListRepositories(ctx context.Context, filter AccessFilter) ([]models.Repository, error) {
-	var where string
-	switch filter {
-	case AccessFilterActive:
-		where = `WHERE ` + repositoryAccess + ` = 'active'`
-	case AccessFilterInactive:
-		where = `WHERE ` + repositoryAccess + ` <> 'active'`
-	case AccessFilterAll:
-	default:
-		return nil, fmt.Errorf("unknown access filter %q", filter)
+	where, err := accessFilterClause(filter)
+	if err != nil {
+		return nil, err
 	}
-	query := `SELECT ` + repositoryColumns + ` FROM repositories ` + where + ` ORDER BY owner, name`
+	query := `SELECT ` + repositoryColumns + ` FROM repositories WHERE TRUE` + where + ` ORDER BY owner, name`
 
 	rows, err := db.pool.Query(ctx, query)
 	if err != nil {
@@ -258,6 +267,21 @@ func (db *DB) ListRepositories(ctx context.Context, filter AccessFilter) ([]mode
 		repos = append(repos, repo)
 	}
 	return repos, rows.Err()
+}
+
+// accessFilterClause is the AND condition on the repositories table that
+// selects repositories by access.
+func accessFilterClause(filter AccessFilter) (string, error) {
+	switch filter {
+	case AccessFilterActive:
+		return ` AND ` + repositoryAccess + ` = 'active'`, nil
+	case AccessFilterInactive:
+		return ` AND ` + repositoryAccess + ` <> 'active'`, nil
+	case AccessFilterAll:
+		return "", nil
+	default:
+		return "", fmt.Errorf("unknown access filter %q", filter)
+	}
 }
 
 // GetInstallationIDForRepo returns the GitHub installation ID that grants
@@ -493,10 +517,25 @@ func (db *DB) UpsertPullRequest(ctx context.Context, pr models.PullRequest) (mod
 	return out, nil
 }
 
+// UpdatePullRequestState records a pull request being closed, merged or
+// retitled without touching its scans. A pull request SBOMDelta never
+// scanned has no row and is left that way; it reports whether one changed.
+func (db *DB) UpdatePullRequestState(ctx context.Context, repositoryID int64, number int, state, title string) (bool, error) {
+	tag, err := db.pool.Exec(ctx, `
+		UPDATE pull_requests SET state = $3, title = $4, updated_at = now()
+		WHERE repository_id = $1 AND number = $2`, repositoryID, number, state, title)
+	if err != nil {
+		return false, fmt.Errorf("update pull request state: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 const scanColumns = `
 	id, repository_id, pull_request_id, base_scan_id, commit_sha, base_commit_sha, trigger, status,
 	COALESCE(sbom_location, ''), COALESCE(sbom_sha256, ''), component_count, risk_score, risk_delta,
-	github_check_run_id, COALESCE(error, ''), enriched_at, started_at, finished_at, created_at`
+	github_check_run_id, COALESCE(error, ''), enriched_at, COALESCE(enrichment_error, ''),
+	COALESCE(risk_level, ''), vuln_components_checked, vuln_components_skipped,
+	started_at, finished_at, created_at`
 
 func scanScan(row pgx.Row) (models.Scan, error) {
 	var out models.Scan
@@ -504,6 +543,7 @@ func scanScan(row pgx.Row) (models.Scan, error) {
 	err := row.Scan(&out.ID, &out.RepositoryID, &out.PullRequestID, &out.BaseScanID, &out.CommitSHA,
 		&baseCommitSHA, &out.Trigger, &out.Status, &out.SBOMLocation, &out.SBOMSHA256, &out.ComponentCount,
 		&out.RiskScore, &out.RiskDelta, &out.GitHubCheckRunID, &out.Error, &out.EnrichedAt,
+		&out.EnrichmentError, &out.RiskLevel, &out.VulnComponentsChecked, &out.VulnComponentsSkipped,
 		&out.StartedAt, &out.FinishedAt, &out.CreatedAt)
 	if err != nil {
 		return models.Scan{}, err
@@ -511,6 +551,8 @@ func scanScan(row pgx.Row) (models.Scan, error) {
 	if baseCommitSHA != nil {
 		out.BaseCommitSHA = *baseCommitSHA
 	}
+	out.Error = RedactSecrets(out.Error)
+	out.EnrichmentError = RedactSecrets(out.EnrichmentError)
 	return out, nil
 }
 
@@ -1009,7 +1051,17 @@ func (db *DB) ListPullRequests(ctx context.Context, repositoryID int64, limit in
 		}
 		summaries = append(summaries, summary)
 	}
-	return summaries, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	pointers := make([]*models.PullRequestSummary, len(summaries))
+	for i := range summaries {
+		pointers[i] = &summaries[i]
+	}
+	if err := db.attachPullRequestInsights(ctx, pointers...); err != nil {
+		return nil, err
+	}
+	return summaries, nil
 }
 
 // GetPullRequest loads one pull request with its latest scan numbers.
@@ -1046,47 +1098,8 @@ func (db *DB) GetPullRequest(ctx context.Context, id int64) (models.PullRequestS
 	if err != nil {
 		return models.PullRequestSummary{}, fmt.Errorf("get pull request: %w", err)
 	}
+	if err := db.attachPullRequestInsights(ctx, &summary); err != nil {
+		return models.PullRequestSummary{}, err
+	}
 	return summary, nil
-}
-
-// ListVulnerabilities returns the advisories affecting a scan's components,
-// most severe first. It returns an empty slice until Phase 4 populates the
-// table, which is a real answer rather than an error.
-func (db *DB) ListVulnerabilities(ctx context.Context, scanID int64) ([]models.Vulnerability, error) {
-	const query = `
-		SELECT v.id, v.component_id, v.osv_id, v.aliases, COALESCE(v.severity, ''), v.cvss_score,
-		       COALESCE(v.cvss_vector, ''), COALESCE(v.summary, ''), COALESCE(v.fixed_version, ''),
-		       v.published_at, c.purl, c.name, c.version, c.ecosystem
-		FROM vulnerabilities v
-		JOIN components c ON c.id = v.component_id
-		WHERE c.scan_id = $1
-		ORDER BY CASE upper(COALESCE(v.severity, ''))
-		             WHEN 'CRITICAL' THEN 1
-		             WHEN 'HIGH'     THEN 2
-		             WHEN 'MODERATE' THEN 3
-		             WHEN 'MEDIUM'   THEN 3
-		             WHEN 'LOW'      THEN 4
-		             ELSE 5
-		         END,
-		         v.cvss_score DESC NULLS LAST, c.name, v.osv_id`
-
-	rows, err := db.pool.Query(ctx, query, scanID)
-	if err != nil {
-		return nil, fmt.Errorf("list vulnerabilities: %w", err)
-	}
-	defer rows.Close()
-
-	vulnerabilities := make([]models.Vulnerability, 0)
-	for rows.Next() {
-		var vulnerability models.Vulnerability
-		if err := rows.Scan(&vulnerability.ID, &vulnerability.ComponentID, &vulnerability.OSVID,
-			&vulnerability.Aliases, &vulnerability.Severity, &vulnerability.CVSSScore,
-			&vulnerability.CVSSVector, &vulnerability.Summary, &vulnerability.FixedVersion,
-			&vulnerability.PublishedAt, &vulnerability.PURL, &vulnerability.Name,
-			&vulnerability.Version, &vulnerability.Ecosystem); err != nil {
-			return nil, fmt.Errorf("scan vulnerability: %w", err)
-		}
-		vulnerabilities = append(vulnerabilities, vulnerability)
-	}
-	return vulnerabilities, rows.Err()
 }

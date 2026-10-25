@@ -3,7 +3,23 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
     <title>SBOMDelta</title>
+    <!-- Apply the theme before the app renders, so the first paint is never
+         the wrong one: a saved choice wins, otherwise the OS preference.
+         Mirrors resolveTheme() in src/lib/theme.js. -->
+    <script>
+      (function () {
+        var theme = null
+        try {
+          theme = window.localStorage.getItem('sbomdelta:theme')
+        } catch (e) {}
+        if (theme !== 'light' && theme !== 'dark') {
+          theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+        }
+        document.documentElement.setAttribute('data-theme', theme)
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

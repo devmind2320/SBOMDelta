@@ -24,13 +24,13 @@ const DELTA_TONE = {
 </script>
 
 <template>
-  <div class="rounded-lg border border-hairline bg-surface px-4 py-3.5">
+  <div class="card px-4 py-3.5">
     <div class="flex items-center gap-1.5">
       <span v-if="accent" class="size-2 shrink-0 rounded-full" :style="{ background: accent }" />
-      <p class="m-0 text-xs text-ink-muted">{{ label }}</p>
+      <p class="m-0 text-xs font-medium text-ink-muted">{{ label }}</p>
     </div>
 
-    <p class="mt-1.5 mb-0 text-2xl leading-none font-semibold text-ink">{{ value }}</p>
+    <p class="mt-2 mb-0 text-2xl leading-none font-semibold tracking-tight text-ink">{{ value }}</p>
 
     <div v-if="delta" class="mt-1.5 flex items-center gap-1">
       <svg

@@ -143,25 +143,30 @@ func (s *InitialScanner) Run(ctx context.Context, repositoryID int64) error {
 	return enqueuePendingScan(ctx, s.queue, logger, scan, repo.FullName())
 }
 
-// requeue queues an existing pending or failed initial scan. Its scan job may
-// never have been queued (a crash), may still be queued or retrying -- it
-// keeps its key, so this is a no-op -- or may have exhausted its retries and
-// still hold the scan's dedupe key, which is released here so the scan is not
-// stranded. A finished job released its key already.
+// requeue queues an existing pending or failed initial scan; see requeueScan.
 func (s *InitialScanner) requeue(ctx context.Context, logger *slog.Logger, scan models.Scan, fullName string) error {
+	return requeueScan(ctx, s.queue, logger, scan, fullName)
+}
+
+// requeueScan queues an existing scan's job. Its job may never have been
+// queued (a crash), may still be queued or retrying -- it keeps its key, so
+// this is a no-op -- or may have exhausted its retries and still hold the
+// scan's dedupe key, which is released here so the scan is not stranded. A
+// finished job released its key already.
+func requeueScan(ctx context.Context, q *queue.Queue, logger *slog.Logger, scan models.Scan, fullName string) error {
 	dedupeKey := fmt.Sprintf("scan:%d", scan.ID)
-	if _, err := s.queue.ReleaseDeadDedupeKey(ctx, dedupeKey); err != nil {
+	if _, err := q.ReleaseDeadDedupeKey(ctx, dedupeKey); err != nil {
 		return err
 	}
-	jobID, err := s.queue.Enqueue(ctx, queue.KindScan, queue.ScanPayload{ScanID: scan.ID}, dedupeKey)
+	jobID, err := q.Enqueue(ctx, queue.KindScan, queue.ScanPayload{ScanID: scan.ID}, dedupeKey)
 	if err != nil {
 		return err
 	}
 	if jobID == 0 {
-		logger.Info("initial scan job already queued", "scan", scan.ID)
+		logger.Info("scan job already queued", "scan", scan.ID)
 		return nil
 	}
-	logger.Info("queued initial scan", "scan", scan.ID, "status", scan.Status, "job", jobID,
+	logger.Info("queued scan", "scan", scan.ID, "status", scan.Status, "job", jobID,
 		"repo", fullName, "commit", short(scan.CommitSHA))
 	return nil
 }

@@ -53,7 +53,7 @@ func truncate(t *testing.T, db *storage.DB) {
 	_, err := db.Pool().Exec(context.Background(), `
 		TRUNCATE installations, repositories, commits, pull_requests, scans,
 		         components, drift_events, vulnerabilities, webhook_deliveries,
-		         sessions, users
+		         sessions, users, user_repositories, user_tracked_repositories
 		RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatalf("truncate: %v", err)

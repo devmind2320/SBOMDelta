@@ -8,23 +8,22 @@ const props = defineProps({
 // Each state ships a shape as well as a colour, so the badge survives
 // greyscale printing and colour-vision deficiency.
 const STATES = {
-  completed: { label: 'Completed', color: 'var(--status-good)', glyph: 'check' },
-  running: { label: 'Running', color: 'var(--series-added)', glyph: 'spinner' },
-  pending: { label: 'Queued', color: 'var(--ink-muted)', glyph: 'dot' },
-  failed: { label: 'Failed', color: 'var(--status-critical)', glyph: 'cross' },
+  completed: { label: 'Completed', color: 'currentColor', glyph: 'check', chip: 'chip-success' },
+  running: { label: 'Running', color: 'currentColor', glyph: 'spinner', chip: 'chip-info' },
+  pending: { label: 'Queued', color: 'currentColor', glyph: 'dot', chip: 'chip-info' },
+  failed: { label: 'Failed', color: 'currentColor', glyph: 'cross', chip: 'chip-danger' },
 }
 
 const state = computed(() => STATES[props.status] ?? {
   label: props.status || 'Unknown',
-  color: 'var(--ink-muted)',
+  color: 'currentColor',
   glyph: 'dot',
+  chip: '',
 })
 </script>
 
 <template>
-  <span
-    class="inline-flex items-center gap-1.5 rounded-full border border-hairline px-2 py-0.5 text-xs text-ink-secondary"
-  >
+  <span class="chip" :class="state.chip">
     <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
       <path
         v-if="state.glyph === 'check'"
@@ -43,7 +42,7 @@ const state = computed(() => STATES[props.status] ?? {
         stroke-width="1.75"
         stroke-linecap="round"
       />
-      <g v-else-if="state.glyph === 'spinner'">
+      <g v-else-if="state.glyph === 'spinner'" class="spin" style="transform-origin: 5px 5px">
         <circle cx="5" cy="5" r="3.5" fill="none" :stroke="state.color" stroke-width="1.5" opacity="0.3" />
         <path
           d="M5 1.5A3.5 3.5 0 0 1 8.5 5"

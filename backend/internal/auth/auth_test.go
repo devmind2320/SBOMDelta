@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -40,6 +41,41 @@ type fakeGitHub struct {
 	tokenBody     string
 	userStatus    int
 	userBody      string
+
+	// installations maps each installation the user can see to the
+	// repositories they can reach in it, in GitHub's order. Both lists are
+	// served 100 to a page, as GitHub does at per_page=100.
+	installations   []fakeInstallation
+	listStatus      int // when set, every listing request answers this
+	listHeaders     map[string]string
+	listPaths       []string // every listing request, path and query
+	listAuthHeaders []string
+}
+
+type fakeInstallation struct {
+	id    int64
+	repos []fakeRepo
+}
+
+type fakeRepo struct {
+	id      int64
+	owner   string
+	name    string
+	private bool
+}
+
+// page returns items[(page-1)*perPage:page*perPage], clamped.
+func page[T any](items []T, r *http.Request) []T {
+	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
+	number, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if perPage <= 0 || perPage > 100 {
+		perPage = 30
+	}
+	if number <= 0 {
+		number = 1
+	}
+	start := min((number-1)*perPage, len(items))
+	return items[start:min(start+perPage, len(items))]
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -60,6 +96,54 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			f.tokenForm = r.PostForm
 			w.WriteHeader(f.tokenStatus)
 			_, _ = fmt.Fprint(w, f.tokenBody)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/user/installations"):
+			f.listPaths = append(f.listPaths, r.URL.RequestURI())
+			f.listAuthHeaders = append(f.listAuthHeaders, r.Header.Get("Authorization"))
+			if r.Header.Get("Authorization") != "Bearer "+userToken {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			for key, value := range f.listHeaders {
+				w.Header().Set(key, value)
+			}
+			if f.listStatus != 0 {
+				w.WriteHeader(f.listStatus)
+				_, _ = fmt.Fprint(w, `{"message":"listing refused"}`)
+				return
+			}
+			if r.URL.Path == "/api/user/installations" {
+				type installation struct {
+					ID int64 `json:"id"`
+				}
+				all := make([]installation, 0, len(f.installations))
+				for _, in := range f.installations {
+					all = append(all, installation{ID: in.id})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(all), "installations": page(all, r)})
+				return
+			}
+			for _, in := range f.installations {
+				if r.URL.Path != fmt.Sprintf("/api/user/installations/%d/repositories", in.id) {
+					continue
+				}
+				type owner struct {
+					Login string `json:"login"`
+				}
+				type repo struct {
+					ID            int64  `json:"id"`
+					Name          string `json:"name"`
+					Private       bool   `json:"private"`
+					DefaultBranch string `json:"default_branch"`
+					Owner         owner  `json:"owner"`
+				}
+				all := make([]repo, 0, len(in.repos))
+				for _, rp := range in.repos {
+					all = append(all, repo{ID: rp.id, Name: rp.name, Private: rp.private, DefaultBranch: "main", Owner: owner{Login: rp.owner}})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"total_count": len(all), "repositories": page(all, r)})
+				return
+			}
+			http.NotFound(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/user":
 			if r.Header.Get("Authorization") != "Bearer "+userToken {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -566,6 +650,7 @@ func TestSameOriginGuardsStateChangingRequests(t *testing.T) {
 // a response, a cookie or a database row, on success or on failure.
 func TestTokensAndSecretsNeverLeak(t *testing.T) {
 	h := newHarness(t)
+	h.github.installations = []fakeInstallation{{id: 31, repos: []fakeRepo{{id: 1, owner: "devmind2320", name: "api", private: true}}}}
 	var responses strings.Builder
 	record := func(recorder *httptest.ResponseRecorder) {
 		responses.WriteString(recorder.Body.String())
@@ -579,6 +664,12 @@ func TestTokensAndSecretsNeverLeak(t *testing.T) {
 	record(success)
 	session := cookieNamed(success, auth.SessionCookie)
 	record(h.me(t, session))
+
+	// A listing GitHub refuses after the token was issued.
+	h.github.listStatus = http.StatusInternalServerError
+	state = h.login(t)
+	record(h.callback(t, "code=good-code&state="+state, state))
+	h.github.listStatus = 0
 
 	// Failures after GitHub has issued a token: refused account, /user error.
 	h.github.userBody = `{"id":5002,"login":"someone-else"}`
@@ -594,7 +685,7 @@ func TestTokensAndSecretsNeverLeak(t *testing.T) {
 	record(h.callback(t, "code=good-code&state="+state, state))
 
 	var rows strings.Builder
-	for _, table := range []string{"users", "sessions"} {
+	for _, table := range []string{"users", "sessions", "user_repositories"} {
 		dbRows, err := h.db.Pool().Query(context.Background(), `SELECT row_to_json(t)::text FROM `+table+` t`)
 		if err != nil {
 			t.Fatal(err)
@@ -635,5 +726,147 @@ func TestDisabledSignInTreatsRequestsAsDevelopmentUser(t *testing.T) {
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/me", nil))
 	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"authDisabled":true`) {
 		t.Errorf("status %d, body %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+type storedRepository struct {
+	githubRepoID, installationID int64
+	fullName                     string
+	private                      bool
+}
+
+func (h *harness) storedRepositories(t *testing.T) []storedRepository {
+	t.Helper()
+	rows, err := h.db.Pool().Query(context.Background(), `
+		SELECT github_repo_id, github_installation_id, owner || '/' || name, private
+		FROM user_repositories ORDER BY github_repo_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []storedRepository
+	for rows.Next() {
+		var repo storedRepository
+		if err := rows.Scan(&repo.githubRepoID, &repo.installationID, &repo.fullName, &repo.private); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, repo)
+	}
+	return out
+}
+
+func (h *harness) listing(t *testing.T) (*time.Time, string) {
+	t.Helper()
+	var listedAt *time.Time
+	var reason *string
+	if err := h.db.Pool().QueryRow(context.Background(),
+		`SELECT repos_listed_at, repos_list_error FROM users`).Scan(&listedAt, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if reason == nil {
+		return listedAt, ""
+	}
+	return listedAt, *reason
+}
+
+// Signing in records every repository the user can reach through the App's
+// installations, paging through each list to its end and no further.
+func TestSignInRecordsRepositoriesAcrossPages(t *testing.T) {
+	h := newHarness(t)
+	big := make([]fakeRepo, 0, 250)
+	for i := range 250 {
+		big = append(big, fakeRepo{id: int64(10000 + i), owner: "acme", name: fmt.Sprintf("svc-%03d", i), private: i%2 == 0})
+	}
+	h.github.installations = []fakeInstallation{
+		{id: 31, repos: big},
+		{id: 32, repos: []fakeRepo{{id: 7, owner: "devmind2320", name: "SBOMDelta", private: true}}},
+	}
+	h.signIn(t)
+
+	stored := h.storedRepositories(t)
+	if len(stored) != 251 {
+		t.Fatalf("stored %d repositories, want all 251", len(stored))
+	}
+	if stored[0] != (storedRepository{7, 32, "devmind2320/SBOMDelta", true}) {
+		t.Errorf("first stored = %+v, want SBOMDelta from installation 32", stored[0])
+	}
+	if last := stored[250]; last != (storedRepository{10249, 31, "acme/svc-249", false}) {
+		t.Errorf("last stored = %+v, want the last repository of page 3", last)
+	}
+
+	want := []string{
+		"/api/user/installations?per_page=100&page=1",
+		"/api/user/installations/31/repositories?per_page=100&page=1",
+		"/api/user/installations/31/repositories?per_page=100&page=2",
+		"/api/user/installations/31/repositories?per_page=100&page=3",
+		"/api/user/installations/32/repositories?per_page=100&page=1",
+	}
+	if strings.Join(h.github.listPaths, "\n") != strings.Join(want, "\n") {
+		t.Errorf("listing requests:\n%s\nwant:\n%s", strings.Join(h.github.listPaths, "\n"), strings.Join(want, "\n"))
+	}
+	for _, header := range h.github.listAuthHeaders {
+		if header != "Bearer "+userToken {
+			t.Errorf("a listing request was not made with the user's token")
+		}
+	}
+	if listedAt, reason := h.listing(t); listedAt == nil || reason != "" {
+		t.Errorf("listing = %v %q, want a time and no error", listedAt, reason)
+	}
+}
+
+// Each sign-in replaces the list: a repository the user lost access to on
+// GitHub is no longer theirs in SBOMDelta.
+func TestSignInReplacesTheRepositoryList(t *testing.T) {
+	h := newHarness(t)
+	h.github.installations = []fakeInstallation{{id: 31, repos: []fakeRepo{
+		{id: 1, owner: "devmind2320", name: "api"}, {id: 2, owner: "devmind2320", name: "web"},
+	}}}
+	h.signIn(t)
+	h.github.installations[0].repos = h.github.installations[0].repos[1:]
+	h.signIn(t)
+
+	stored := h.storedRepositories(t)
+	if len(stored) != 1 || stored[0].fullName != "devmind2320/web" {
+		t.Errorf("stored = %+v, want only devmind2320/web", stored)
+	}
+}
+
+// GitHub refusing the listing does not refuse the sign-in -- the user gets a
+// session and can retry -- but the old list is cleared, never kept stale,
+// and the reason is recorded as a fixed code.
+func TestSignInSurvivesARefusedRepositoryListing(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		headers map[string]string
+		reason  string
+	}{
+		{"rate limited", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}, auth.ListErrorRateLimited},
+		{"too many requests", http.StatusTooManyRequests, nil, auth.ListErrorRateLimited},
+		{"authorization revoked", http.StatusUnauthorized, nil, auth.ListErrorUnauthorized},
+		{"forbidden", http.StatusForbidden, nil, auth.ListErrorGitHub},
+		{"GitHub error", http.StatusBadGateway, nil, auth.ListErrorGitHub},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.github.installations = []fakeInstallation{{id: 31, repos: []fakeRepo{{id: 1, owner: "devmind2320", name: "api"}}}}
+			h.signIn(t)
+
+			h.github.listStatus, h.github.listHeaders = tt.status, tt.headers
+			session := h.signIn(t)
+			if code := h.me(t, session).Code; code != http.StatusOK {
+				t.Errorf("session after a refused listing: status %d, want 200", code)
+			}
+			if stored := h.storedRepositories(t); len(stored) != 0 {
+				t.Errorf("stored = %+v, want the stale list cleared", stored)
+			}
+			if _, reason := h.listing(t); reason != tt.reason {
+				t.Errorf("reason = %q, want %q", reason, tt.reason)
+			}
+			if strings.Contains(h.logs.String(), "listing refused") {
+				t.Error("GitHub's response body reached the logs")
+			}
+		})
 	}
 }

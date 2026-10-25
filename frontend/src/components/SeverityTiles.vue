@@ -12,9 +12,12 @@ import { severityRole } from '../lib/format.js'
  */
 const props = defineProps({
   vulnerabilities: { type: Array, default: () => [] },
-  // False until Phase 4 enrichment runs. Drives the honest-empty distinction:
-  // "nothing found" and "never looked" must not render the same.
+  // False until the scan has been checked against OSV. Drives the
+  // honest-empty distinction: "nothing found" and "never looked" must not
+  // render the same.
   enrichmentAvailable: { type: Boolean, default: false },
+  // The API's summary: why the lookup failed, and coverage.
+  summary: { type: Object, default: null },
 })
 
 const ROLES = [
@@ -40,7 +43,7 @@ const counts = computed(() => {
       <div
         v-for="tile in ROLES"
         :key="tile.role"
-        class="rounded-lg border border-hairline bg-surface px-3.5 py-3"
+        class="card px-3.5 py-3"
       >
         <div class="flex items-center gap-1.5">
           <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
@@ -73,12 +76,25 @@ const counts = computed(() => {
 
     <p
       v-if="!enrichmentAvailable"
-      class="mt-3 mb-0 rounded-md border border-hairline bg-surface-raised px-3 py-2 text-xs leading-relaxed text-ink-muted"
+      class="banner banner-warning mt-3 mb-0 block text-xs"
     >
-      <strong class="font-medium text-ink-secondary">Not analyzed yet.</strong>
-      Vulnerability enrichment against OSV is Phase&nbsp;4. These are dashes rather than
-      zeroes on purpose — a zero here would read as “no known vulnerabilities”, which this
-      scan has not established.
+      <template v-if="summary?.status === 'failed'">
+        <strong class="font-semibold">Vulnerability check unavailable.</strong>
+        {{ summary.error }} It is retried automatically.
+      </template>
+      <template v-else>
+        <strong class="font-semibold">Not analyzed yet.</strong>
+        This scan's components have not been checked against OSV.dev yet.
+      </template>
+      These are dashes rather than zeroes on purpose — a zero here would read as “no known
+      vulnerabilities”, which this scan has not established.
+    </p>
+    <p
+      v-else-if="summary?.componentsSkipped > 0"
+      class="mt-3 mb-0 text-xs text-ink-muted"
+    >
+      {{ summary.componentsChecked }} components checked against OSV.dev;
+      {{ summary.componentsSkipped }} could not be (no version, or an ecosystem OSV does not cover).
     </p>
     <p
       v-else-if="counts.unknown > 0"

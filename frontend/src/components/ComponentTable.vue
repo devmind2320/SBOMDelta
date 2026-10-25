@@ -43,11 +43,11 @@ function licenseLabel(component) {
         v-model="query"
         type="search"
         placeholder="Filter by name or version"
-        class="min-w-[180px] flex-1 rounded-md border border-hairline bg-surface-raised px-2.5 py-1.5 text-sm text-ink placeholder:text-ink-muted"
+        class="input min-w-[180px] flex-1"
       />
       <select
         v-model="ecosystem"
-        class="rounded-md border border-hairline bg-surface-raised px-2 py-1.5 text-sm text-ink"
+        class="input w-auto"
         aria-label="Filter by ecosystem"
       >
         <option v-for="option in ecosystems" :key="option" :value="option">

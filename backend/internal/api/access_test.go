@@ -15,6 +15,7 @@ import (
 	"sbomdelta/internal/api"
 	"sbomdelta/internal/auth"
 	"sbomdelta/internal/config"
+	ghapp "sbomdelta/internal/github"
 	"sbomdelta/internal/models"
 	"sbomdelta/internal/queue"
 	"sbomdelta/internal/storage"
@@ -29,10 +30,59 @@ type fixture struct {
 	active  models.Repository
 	revoked models.Repository
 	scan    models.Scan
-	// session is a signed-in allowed user's cookie, sent by do().
+	// session is a signed-in allowed user's cookie, sent by do(). That user
+	// has both fixture repositories in their list from GitHub.
 	session *http.Cookie
+	// user is the signed-in user behind session.
+	user models.User
 	// webhookCalls counts requests that reached the webhook handler.
 	webhookCalls *int
+	// scans stands in for the manual scanner.
+	scans *fakeScans
+}
+
+// fakeScans records scan requests and answers with what the test set.
+type fakeScans struct {
+	requested []int64
+	scan      models.Scan
+	outcome   ghapp.ScanOutcome
+	err       error
+}
+
+func (f *fakeScans) Request(_ context.Context, repositoryID int64) (models.Scan, ghapp.ScanOutcome, error) {
+	f.requested = append(f.requested, repositoryID)
+	if f.err != nil {
+		return models.Scan{}, "", f.err
+	}
+	scan := f.scan
+	scan.RepositoryID = repositoryID
+	return scan, f.outcome, nil
+}
+
+// grant records the repositories GitHub would report for a user at sign-in.
+func grant(t *testing.T, db *storage.DB, user models.User, repos ...models.Repository) {
+	t.Helper()
+	listed := make([]models.AccessibleRepository, 0, len(repos))
+	for _, repo := range repos {
+		listed = append(listed, models.AccessibleRepository{
+			GitHubRepoID: *repo.GitHubRepoID, GitHubInstallationID: 4242,
+			Owner: repo.Owner, Name: repo.Name, Private: true, DefaultBranch: repo.DefaultBranch,
+		})
+	}
+	if err := db.ReplaceUserRepositories(context.Background(), user.ID, listed, time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+}
+
+func userNamed(t *testing.T, db *storage.DB, login string) models.User {
+	t.Helper()
+	var user models.User
+	if err := db.Pool().QueryRow(context.Background(),
+		`SELECT id, github_user_id, login FROM users WHERE login = $1`, login).
+		Scan(&user.ID, &user.GitHubUserID, &user.Login); err != nil {
+		t.Fatalf("load user %s: %v", login, err)
+	}
+	return user
 }
 
 // newFixture stores one active and one revoked App repository; the revoked
@@ -78,17 +128,22 @@ func newFixture(t *testing.T) fixture {
 	public, _ := url.Parse(testPublicURL)
 	authService := auth.New(config.Auth{
 		ClientID: "Iv1.apitest", ClientSecret: "api-test-client-secret", PublicURL: public,
-		WebBaseURL: "https://github.invalid", AllowedLogins: []string{"devmind2320"}, SessionTTL: time.Hour,
+		WebBaseURL: "https://github.invalid", AllowedLogins: []string{"devmind2320", "teammate"}, SessionTTL: time.Hour,
 	}, "https://api.github.invalid/", db, logger)
 	webhookCalls := 0
 	webhook := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		webhookCalls++
 		w.WriteHeader(http.StatusAccepted)
 	})
-	handler := api.New(db, nil, queue.New(db.Pool(), time.Minute), authService, logger).Routes(webhook)
+	scans := &fakeScans{scan: models.Scan{ID: 77, Status: models.ScanPending, Trigger: models.TriggerManual,
+		CommitSHA: "6666666666666666666666666666666666666666"}, outcome: ghapp.ScanQueued}
+	handler := api.New(db, nil, queue.New(db.Pool(), time.Minute), authService, scans, logger).Routes(webhook)
 
+	session := newSession(t, db, 4001, "devmind2320")
+	user := userNamed(t, db, "devmind2320")
+	grant(t, db, user, active, revoked)
 	return fixture{db: db, handler: handler, active: active, revoked: revoked, scan: scan,
-		session: newSession(t, db, 4001, "devmind2320"), webhookCalls: &webhookCalls}
+		session: session, user: user, webhookCalls: &webhookCalls, scans: scans}
 }
 
 // newSession stores a session the way a sign-in would and returns its cookie.
@@ -195,33 +250,20 @@ func TestRevokedRepositoryHistoryStaysReadable(t *testing.T) {
 	}
 }
 
-// Queueing a scan by hand and registering a repository by URL stay off until
-// Phase 3 replaces them safely -- even for a signed-in user sending a valid
-// same-origin request, and even with a full commit SHA.
-func TestScanTriggerAndManualRegistrationAreUnavailable(t *testing.T) {
+// Registering a repository by URL stays off, even for a signed-in user
+// sending a valid same-origin request.
+func TestManualRegistrationIsUnavailable(t *testing.T) {
 	f := newFixture(t)
-	ctx := context.Background()
-
-	for _, request := range []struct{ path, body string }{
-		{"/api/repos/" + jsonID(f.active.ID) + "/scans", `{"commitSha":"5555555555555555555555555555555555555555"}`},
-		{"/api/repos/" + jsonID(f.active.ID) + "/scans", `{}`},
-		{"/api/repos/" + jsonID(f.revoked.ID) + "/scans", `{"ref":"main"}`},
-		{"/api/repos", `{"owner":"sigstore","name":"cosign"}`},
-	} {
-		status, body := f.do(t, http.MethodPost, request.path, request.body)
-		if status != http.StatusNotFound || string(body["error"]) != `"not available"` {
-			t.Errorf("POST %s = %d %s, want 404 not available", request.path, status, body["error"])
-		}
+	status, body := f.do(t, http.MethodPost, "/api/repos", `{"owner":"sigstore","name":"cosign"}`)
+	if status != http.StatusNotFound || string(body["error"]) != `"not available"` {
+		t.Errorf("POST /api/repos = %d %s, want 404 not available", status, body["error"])
 	}
-
-	var jobs, scans, repos int
-	if err := f.db.Pool().QueryRow(ctx,
-		`SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM scans), (SELECT COUNT(*) FROM repositories)`).
-		Scan(&jobs, &scans, &repos); err != nil {
-		t.Fatalf("count rows: %v", err)
+	var repos int
+	if err := f.db.Pool().QueryRow(context.Background(), `SELECT COUNT(*) FROM repositories`).Scan(&repos); err != nil {
+		t.Fatalf("count repositories: %v", err)
 	}
-	if jobs != 0 || scans != 1 || repos != 2 {
-		t.Errorf("jobs=%d scans=%d repositories=%d, want 0, the fixture's 1 and 2", jobs, scans, repos)
+	if repos != 2 {
+		t.Errorf("repositories = %d, want the fixture's 2", repos)
 	}
 }
 

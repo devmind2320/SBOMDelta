@@ -63,7 +63,7 @@ func Open(t *testing.T, schema string) *storage.DB {
 	if _, err := db.Pool().Exec(ctx, `
 		TRUNCATE installations, repositories, commits, pull_requests, scans,
 		         components, drift_events, vulnerabilities, webhook_deliveries, jobs,
-		         sessions, users
+		         sessions, users, user_repositories, user_tracked_repositories
 		RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

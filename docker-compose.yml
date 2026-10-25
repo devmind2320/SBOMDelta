@@ -101,6 +101,9 @@ services:
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_PRIVATE_KEY_PATH: /run/secrets/github-app.pem
       WORKER_CONCURRENCY: "4"
+      # Vulnerability lookups go to the public OSV.dev API; set true in .env
+      # to work offline (scans then record that they were not checked).
+      OSV_DISABLED: ${OSV_DISABLED:-false}
     volumes:
       - ./secrets:/run/secrets:ro
       - worker-scratch:/var/lib/sbomdelta

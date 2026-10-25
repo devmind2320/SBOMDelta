@@ -29,6 +29,13 @@ func dataPaths(f fixture) []string {
 		"/api/scans/" + scan + "/drift",
 		"/api/scans/" + scan + "/vulnerabilities",
 		"/api/scans/" + scan + "/sbom",
+		"/api/scans/" + scan + "/risk",
+		"/api/scans/" + scan + "/vulnerability-changes",
+		"/api/me/repositories",
+		"/api/me/tracked",
+		"/api/me/scans",
+		"/api/impact/vulnerabilities",
+		"/api/impact/components?q=lodash",
 	}
 }
 

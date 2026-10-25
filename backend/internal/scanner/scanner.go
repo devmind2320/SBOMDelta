@@ -15,6 +15,8 @@ import (
 	"sbomdelta/internal/diff"
 	ghapp "sbomdelta/internal/github"
 	"sbomdelta/internal/models"
+	"sbomdelta/internal/osv"
+	"sbomdelta/internal/queue"
 	"sbomdelta/internal/sbom"
 	"sbomdelta/internal/storage"
 )
@@ -24,12 +26,24 @@ type Scanner struct {
 	blob      *storage.BlobStore
 	app       *ghapp.App
 	generator *sbom.Generator
-	cfg       config.Scanner
-	logger    *slog.Logger
+	// vulns checks components against a vulnerability database; nil when
+	// vulnerability analysis is turned off.
+	vulns VulnerabilityChecker
+	// jobs queues a retry when the vulnerability lookup fails. May be nil
+	// in tests, in which case no retry is queued.
+	jobs   *queue.Queue
+	cfg    config.Scanner
+	logger *slog.Logger
 }
 
-func New(db *storage.DB, blob *storage.BlobStore, app *ghapp.App, generator *sbom.Generator, cfg config.Scanner, logger *slog.Logger) *Scanner {
-	return &Scanner{db: db, blob: blob, app: app, generator: generator, cfg: cfg, logger: logger}
+// VulnerabilityChecker reports the known vulnerabilities in a set of
+// components. *osv.Client satisfies it.
+type VulnerabilityChecker interface {
+	Check(ctx context.Context, components []sbom.Component) (osv.Report, error)
+}
+
+func New(db *storage.DB, blob *storage.BlobStore, app *ghapp.App, generator *sbom.Generator, vulns VulnerabilityChecker, jobs *queue.Queue, cfg config.Scanner, logger *slog.Logger) *Scanner {
+	return &Scanner{db: db, blob: blob, app: app, generator: generator, vulns: vulns, jobs: jobs, cfg: cfg, logger: logger}
 }
 
 // Run executes one scan. Failures are recorded on the scan row and reported on
@@ -75,9 +89,13 @@ func (s *Scanner) Run(ctx context.Context, scanID int64) error {
 		return err
 	}
 
+	// The dependency analysis is saved. Checking for vulnerabilities is a
+	// separate, best-effort step: if OSV cannot be reached the scan still
+	// counts, the failure is recorded on it, and a retry is queued.
+	s.enrichAfterScan(ctx, logger, scan.ID)
+
 	if checkRunID != 0 {
-		baseline := result.BaseScanID == nil
-		if err := s.app.CompleteCheckRun(ctx, access.installationID, checkRunID, repo, result.Diff, baseline); err != nil {
+		if err := s.publishCheck(ctx, scan.ID, repo, access.installationID, checkRunID); err != nil {
 			// The analysis is saved; a check-run write failure should not
 			// invalidate it, so log and move on.
 			logger.Error("could not publish check run result", "error", err)

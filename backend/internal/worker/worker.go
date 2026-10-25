@@ -134,6 +134,15 @@ func (w *Worker) handle(ctx context.Context, job *queue.Job) error {
 			return errors.New("cannot run initial scan: GitHub integration is disabled on this worker")
 		}
 		return w.initial.Run(ctx, payload.RepositoryID)
+	case queue.KindEnrich:
+		var payload queue.EnrichPayload
+		if err := json.Unmarshal(job.Payload, &payload); err != nil {
+			return fmt.Errorf("decode enrich payload: %w", err)
+		}
+		if payload.ScanID == 0 {
+			return errors.New("enrich job carried no scan id")
+		}
+		return w.scanner.Enrich(ctx, payload.ScanID)
 	default:
 		return fmt.Errorf("unknown job kind %q", job.Kind)
 	}

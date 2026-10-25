@@ -9,20 +9,18 @@ const props = defineProps({
 // Status colours are sub-3:1 against the light surface by design, so the glyph
 // and the written label carry the meaning and the colour only reinforces it.
 const ROLES = {
-  critical: { label: 'Critical', color: 'var(--status-critical)', glyph: 'alert' },
-  serious: { label: 'High', color: 'var(--status-serious)', glyph: 'alert' },
-  warning: { label: 'Medium', color: 'var(--status-warning)', glyph: 'warn' },
-  low: { label: 'Low', color: 'var(--ink-muted)', glyph: 'info' },
-  unknown: { label: 'Unscored', color: 'var(--ink-muted)', glyph: 'info' },
+  critical: { label: 'Critical', color: 'var(--status-critical)', glyph: 'alert', chip: 'chip-danger' },
+  serious: { label: 'High', color: 'var(--status-serious)', glyph: 'alert', chip: 'chip-warning' },
+  warning: { label: 'Medium', color: 'var(--status-warning)', glyph: 'warn', chip: '' },
+  low: { label: 'Low', color: 'var(--ink-muted)', glyph: 'info', chip: '' },
+  unknown: { label: 'Unscored', color: 'var(--ink-muted)', glyph: 'info', chip: '' },
 }
 
 const role = computed(() => ROLES[severityRole(props.severity)] ?? ROLES.unknown)
 </script>
 
 <template>
-  <span
-    class="inline-flex items-center gap-1.5 rounded-full border border-hairline px-2 py-0.5 text-xs font-medium text-ink-secondary"
-  >
+  <span class="chip font-semibold" :class="role.chip">
     <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
       <template v-if="role.glyph === 'alert'">
         <circle cx="5.5" cy="5.5" r="4.5" :fill="role.color" />
