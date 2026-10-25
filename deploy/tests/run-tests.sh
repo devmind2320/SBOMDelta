@@ -709,7 +709,7 @@ rollback_case() {
 	tar -C "$rb/saved" -czf "$rb/backup.tar.gz" .
 	(
 		# Read by the function loaded with eval below.
-		# shellcheck disable=SC2034
+		# shellcheck disable=SC2034,SC2030
 		FRONTEND_TOUCHED="$2" FRONTEND_DIST="$rb/dist" FRONTEND_BACKUP="$rb/backup.tar.gz" \
 			SERVER_SWITCHED=0 WORKER_SWITCHED=0 WORKER_PRESENT=1 ROLLING_BACK=0 DB_BACKUP="" \
 			PREVIOUS_API="${RB_PREVIOUS_API:-}" API_EXPECT=signin
@@ -834,8 +834,9 @@ smoke() {
 		# Read by the functions loaded with eval below.
 		# shellcheck disable=SC2034
 		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SMOKE_PROBLEM=""
-		# shellcheck disable=SC2034
+		# shellcheck disable=SC2034,SC2031
 		API_EXPECT="${API_EXPECT-repos}" SIGNIN_REFUSAL="$signin_refusal"
+		# shellcheck disable=SC2030
 		export FAKE_API_BODY="${FAKE_API_BODY:-$WORK/smoke/api-ok}" FAKE_HOME_BODY="${FAKE_HOME_BODY:-$WORK/smoke/index-new}"
 		# shellcheck disable=SC2317,SC2329
 		log() { printf '%s\n' "$*"; }
@@ -922,9 +923,11 @@ done
 # What smoke_nginx saw is what rollback will require of the restored server.
 seen_of() {
 	(
+		# shellcheck disable=SC2030,SC2031
 		PATH="$WORK/fakecurl:$PATH"
 		# shellcheck disable=SC2034
 		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 API_EXPECT=repos SIGNIN_REFUSAL="$signin_refusal"
+		# shellcheck disable=SC2030,SC2031
 		export FAKE_API_BODY="$1" FAKE_API_CODE="$2" FAKE_HOME_BODY="$WORK/smoke/index-new"
 		eval "$smoke_functions"
 		smoke_nginx "" || true
@@ -979,6 +982,7 @@ chmod +x "$WORK/fakedocker/docker"
 # the stand-in docker, and current-sha in the given state beside it.
 expectation_of() {
 	(
+		# shellcheck disable=SC2030,SC2031
 		PATH="$WORK/fakedocker:$PATH" SIGNIN_LABEL="$signin_label_key"
 		BACKUP_DIR="$WORK/label-backups"
 		rm -rf "$BACKUP_DIR" && mkdir -p "$BACKUP_DIR"
@@ -1029,9 +1033,12 @@ check "label: the result marker reports the running image's expectation" \
 # lifecycle <old image> <old answer> <new image> <new answer> <restored answer> <current-sha state>
 lifecycle() {
 	(
+		# SIGNIN_LABEL is read by the label function loaded with eval below.
+		# shellcheck disable=SC2030,SC2031,SC2034
 		PATH="$WORK/fakedocker:$WORK/fakecurl:$PATH" SIGNIN_LABEL="$signin_label_key"
 		# shellcheck disable=SC2034
 		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SIGNIN_REFUSAL="$signin_refusal"
+		# shellcheck disable=SC2031
 		export FAKE_HOME_BODY="$WORK/smoke/index-new"
 		# shellcheck disable=SC2317,SC2329
 		log() { :; }
@@ -1040,6 +1047,7 @@ lifecycle() {
 		eval "$smoke_functions"
 		eval "$label_function"
 		answer() { # signin | repos | foreign
+			# shellcheck disable=SC2031
 			case "$1" in
 			signin) export FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" ;;
 			repos) export FAKE_API_CODE=200 FAKE_API_BODY="$WORK/smoke/api-ok" ;;
@@ -1137,6 +1145,7 @@ cd_check() {
 	local index_sha="$new_sha"
 	[ "${5:-1}" = 1 ] || index_sha="$old_sha"
 	(
+		# shellcheck disable=SC2031
 		cd "$WORK/cdrepo" &&
 			PATH="$WORK/fakecd:$PATH" PUBLIC_URL=https://sbomdelta.example RESULT="$1" SHA="$2" API="$3" \
 				INDEX_SHA="$index_sha" CD_API_CODE="$code" CD_API_BODY="$body" CD_HOME_BODY="$WORK/smoke/index-new" \
@@ -1246,7 +1255,7 @@ check "config docs: the procedure passes the destructive-command guard" "$ROOT/d
 check "config docs: the procedure is valid bash" bash -n "$WORK/config-apply.sh"
 
 # Every in-page link in the deployment README must reach a heading.
-anchors="$(grep -E '^#{1,6} ' "$readme" | sed -E 's/^#+ //' | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9 -]//g; s/ /-/g')"
+anchors="$(grep -E '^#{1,6} ' "$readme" | sed -E 's/^#+ //' | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9 -]//g; s/ /-/g')"
 missing_anchors=""
 while IFS= read -r link; do
 	grep -qx -- "$link" <<<"$anchors" || missing_anchors="$missing_anchors $link"
@@ -1276,8 +1285,13 @@ printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/open-read"
 chmod 0644 "$WORK/signin/open-read"
 printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/locked"
 chmod 0000 "$WORK/signin/locked"
-GOOD_ENV=(GITHUB_CLIENT_ID=Iv1.clientid0001 ALLOWED_GITHUB_LOGINS=alice,bob
-	PUBLIC_URL=https://sbomdelta.website GITHUB_CLIENT_SECRET_PATH="$WORK/signin/secret")
+# One element per setting; the logins value is itself a comma-separated list.
+GOOD_ENV=(
+	GITHUB_CLIENT_ID=Iv1.clientid0001
+	"ALLOWED_GITHUB_LOGINS=alice,bob"
+	PUBLIC_URL=https://sbomdelta.website
+	GITHUB_CLIENT_SECRET_PATH="$WORK/signin/secret"
+)
 # signin_case <docker exec works 0|1> <env assignments...>
 signin_case() {
 	local works="$1"
@@ -1292,6 +1306,7 @@ signin_case() {
 			[ "$1" = exec ] || return 99
 			shift 2
 			# (bash 3.2 treats an empty array as unset under set -u)
+			# shellcheck disable=SC2031
 			env -i PATH="$PATH" ${CASE_ENV[@]+"${CASE_ENV[@]}"} "$@"
 		}
 		eval "$signin_script"
