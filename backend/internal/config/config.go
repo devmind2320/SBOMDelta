@@ -7,7 +7,9 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,9 +21,11 @@ type Config struct {
 	// DatabaseURL is a libpq-style connection string.
 	DatabaseURL string
 	GitHub      GitHub
-	Blob        Blob
-	Scanner     Scanner
-	Worker      Worker
+	// Auth is loaded and validated only for the API server.
+	Auth    Auth
+	Blob    Blob
+	Scanner Scanner
+	Worker  Worker
 }
 
 type GitHub struct {
@@ -37,6 +41,37 @@ type GitHub struct {
 	APIBaseURL    string
 	// AppSlug is used to build human-facing links back to the app.
 	AppSlug string
+}
+
+// Auth configures dashboard sign-in through the GitHub App's user
+// authorization flow.
+type Auth struct {
+	// Disabled serves the dashboard without sign-in, as a fixed development
+	// user. Like GitHub.Disabled it is refused outside APP_ENV=development.
+	Disabled bool
+	// ClientID and ClientSecret are the GitHub App's own OAuth credentials,
+	// from its settings page. They identify users; they never grant access to
+	// repositories, which still comes from installation tokens.
+	ClientID     string
+	ClientSecret string
+	// PublicURL is the origin browsers use to reach the dashboard, such as
+	// https://sbomdelta.example. The OAuth callback is built from it and
+	// state-changing requests must come from it.
+	PublicURL *url.URL
+	// WebBaseURL is where GitHub's OAuth pages live: github.com, or a GitHub
+	// Enterprise Server host.
+	WebBaseURL string
+	// AllowedLogins is who may sign in, lowercased. Everyone else is refused.
+	AllowedLogins []string
+	// SessionTTL is how long a sign-in lasts before it must be repeated.
+	SessionTTL time.Duration
+}
+
+// SecureCookies reports whether session cookies must carry the Secure
+// attribute: always, unless the dashboard is served over plain HTTP, which
+// only local development does.
+func (a Auth) SecureCookies() bool {
+	return a.PublicURL == nil || a.PublicURL.Scheme != "http"
 }
 
 type Blob struct {
@@ -84,23 +119,24 @@ type Worker struct {
 // local development. It returns every validation problem at once rather than
 // failing on the first, so a misconfigured deployment needs one round trip.
 func Load() (*Config, error) {
-	return load(false)
+	return load(false, false)
 }
 
 // LoadAPI permits explicitly disabling GitHub integration for local dashboard
-// development. Other environments retain the credential checks.
+// development. Other environments retain the credential checks. It also loads
+// the sign-in settings, which only the API server uses.
 func LoadAPI() (*Config, error) {
-	return load(true)
+	return load(true, true)
 }
 
 // LoadWorker permits the same opt-out as LoadAPI. A worker with GitHub
 // disabled can still run manual scans of repositories registered by hand; it
 // refuses only the scans that genuinely need an installation token.
 func LoadWorker() (*Config, error) {
-	return load(true)
+	return load(true, false)
 }
 
-func load(allowGitHubDisable bool) (*Config, error) {
+func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 	cfg := &Config{
 		Env:         env("APP_ENV", "development"),
 		HTTPAddr:    env("HTTP_ADDR", ":8080"),
@@ -174,11 +210,126 @@ func load(allowGitHubDisable bool) (*Config, error) {
 	if cfg.Worker.Concurrency < 1 {
 		problems = append(problems, errors.New("WORKER_CONCURRENCY must be at least 1"))
 	}
+	if loadAuth {
+		cfg.Auth, problems = loadAuthConfig(cfg.Env, problems)
+	}
 
 	if len(problems) > 0 {
 		return nil, errors.Join(problems...)
 	}
 	return cfg, nil
+}
+
+// githubLogin matches GitHub's username rules: letters, digits and single
+// hyphens, not at either end, at most 39 characters.
+var githubLogin = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,38}$`)
+
+// loadAuthConfig reads the sign-in settings. Nothing here has a usable
+// default: an empty allowlist or a missing secret is an error, never "allow
+// everyone".
+func loadAuthConfig(appEnv string, problems []error) (Auth, []error) {
+	auth := Auth{
+		ClientID:   os.Getenv("GITHUB_CLIENT_ID"),
+		WebBaseURL: strings.TrimRight(env("GITHUB_WEB_BASE_URL", "https://github.com"), "/"),
+		SessionTTL: durationEnv("SESSION_TTL", 12*time.Hour),
+	}
+
+	if value := os.Getenv("AUTH_DISABLED"); value != "" {
+		disabled, err := strconv.ParseBool(value)
+		if err != nil {
+			problems = append(problems, errors.New("AUTH_DISABLED must be true or false"))
+		}
+		auth.Disabled = disabled
+	}
+	if auth.Disabled {
+		if appEnv != "development" {
+			problems = append(problems, errors.New("AUTH_DISABLED is only allowed when APP_ENV=development"))
+		}
+		return auth, problems
+	}
+
+	if auth.ClientID == "" {
+		problems = append(problems, errors.New("GITHUB_CLIENT_ID is required (the GitHub App's Client ID)"))
+	}
+	secret, err := loadClientSecret()
+	if err != nil {
+		problems = append(problems, err)
+	}
+	auth.ClientSecret = secret
+
+	raw := os.Getenv("PUBLIC_URL")
+	switch parsed, err := url.Parse(raw); {
+	case raw == "":
+		problems = append(problems, errors.New("PUBLIC_URL is required, e.g. https://sbomdelta.example"))
+	case err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" ||
+		(parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.User != nil:
+		problems = append(problems, fmt.Errorf("PUBLIC_URL %q must be a bare origin such as https://sbomdelta.example", raw))
+	case parsed.Scheme == "http" && appEnv != "development":
+		problems = append(problems, errors.New("PUBLIC_URL must use https outside APP_ENV=development"))
+	case strings.TrimSuffix(raw, "/") != canonicalOrigin(parsed):
+		// Browsers send the Origin header, and GitHub compares the callback
+		// URL, in exactly one spelling. Any other would refuse every sign-out
+		// and every sign-in, so it is an error here rather than at runtime.
+		problems = append(problems, fmt.Errorf("PUBLIC_URL %q is not written the way browsers send it; use %q (lowercase, no default port)",
+			raw, canonicalOrigin(parsed)))
+	default:
+		auth.PublicURL = &url.URL{Scheme: parsed.Scheme, Host: parsed.Host}
+	}
+
+	for _, login := range strings.Split(os.Getenv("ALLOWED_GITHUB_LOGINS"), ",") {
+		login = strings.ToLower(strings.TrimSpace(login))
+		if login == "" {
+			continue
+		}
+		if !githubLogin.MatchString(login) {
+			problems = append(problems, fmt.Errorf("ALLOWED_GITHUB_LOGINS contains %q, which is not a GitHub login", login))
+			continue
+		}
+		auth.AllowedLogins = append(auth.AllowedLogins, login)
+	}
+	if len(auth.AllowedLogins) == 0 {
+		problems = append(problems, errors.New("ALLOWED_GITHUB_LOGINS is required: a comma-separated list of GitHub logins that may sign in"))
+	}
+
+	if auth.SessionTTL < 5*time.Minute || auth.SessionTTL > 30*24*time.Hour {
+		problems = append(problems, errors.New("SESSION_TTL must be between 5m and 720h"))
+	}
+	return auth, problems
+}
+
+// canonicalOrigin is the serialization browsers use for an origin: lowercase
+// scheme and host, and no port when it is the scheme's default.
+func canonicalOrigin(u *url.URL) string {
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" && !(u.Scheme == "https" && port == "443") && !(u.Scheme == "http" && port == "80") {
+		host += ":" + port
+	}
+	return strings.ToLower(u.Scheme) + "://" + host
+}
+
+// loadClientSecret follows loadPrivateKey: inline for container platforms, a
+// file for everything else, so the secret need not sit in an environment
+// file.
+func loadClientSecret() (string, error) {
+	if inline := os.Getenv("GITHUB_CLIENT_SECRET"); inline != "" {
+		return inline, nil
+	}
+	path := os.Getenv("GITHUB_CLIENT_SECRET_PATH")
+	if path == "" {
+		return "", errors.New("one of GITHUB_CLIENT_SECRET or GITHUB_CLIENT_SECRET_PATH is required (a client secret generated on the GitHub App's settings page)")
+	}
+	secret, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read GITHUB_CLIENT_SECRET_PATH: %w", err)
+	}
+	value := strings.TrimSpace(string(secret))
+	if value == "" {
+		return "", errors.New("GITHUB_CLIENT_SECRET_PATH points at an empty file")
+	}
+	return value, nil
 }
 
 // loadPrivateKey accepts the key either as a file path or inline. Inline is

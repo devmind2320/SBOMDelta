@@ -23,7 +23,9 @@ prepares the run and `deploy/deploy.sh` does the work.
 4. CD **waits for the command to finish**, shows its output (redacted), and
    fails unless the command succeeded **and** printed a result marker that
    fits the run. It then checks the public site from outside: `/api/repos`
-   answers, and `index.html` matches the build that was published.
+   answers (with repositories, or with the server's own JSON `401` once
+   dashboard sign-in is deployed), and `index.html` matches the build that
+   was published.
 
 Only one deployment runs at a time. GitHub's concurrency group queues runs,
 and the host lock (`/run/lock/sbomdelta-deploy.lock`) covers what GitHub
@@ -71,7 +73,19 @@ development file, which is exactly why git is kept out of that directory.
   `depends_on: {server: {restart: true}}` outside the worker);
 - the server and worker run the configuration Compose resolves now (their
   `com.docker.compose.config-hash` labels match `compose config --hash`), so
-  recreating them changes only the image;
+  recreating them changes only the image. A deliberate change to the
+  production `docker-compose.yml` or `.env` therefore has to be applied on
+  the current image first; see
+  [Changing the production configuration](#changing-the-production-configuration);
+- the running server already has the dashboard sign-in settings the new
+  server needs to start (`GITHUB_CLIENT_ID`, `ALLOWED_GITHUB_LOGINS`,
+  `PUBLIC_URL` equal to `https://sbomdelta.website`, no `AUTH_DISABLED`), and
+  its client secret file exists, is a regular file, is not empty and is
+  readable **by the server's own user, through its real mounts**: the check
+  runs inside the server container with `docker exec`, as the image's user
+  (uid 10001). It prints setting names, the secret's path and that uid --
+  never a value or the secret. A world-writable secret file fails; a
+  world-readable one is a warning;
 - the Postgres data volume exists; `.env` and the GitHub App key exist
   (checked for presence only, never read); Postgres is healthy;
 - there is free disk for the backup and the image builds;
@@ -87,10 +101,11 @@ development file, which is exactly why git is kept out of that directory.
   A mismatch, or any failure to read the inodes, stops the preflight; see
   [Frontend bind mount](#frontend-bind-mount). The script never restarts
   Nginx;
-- the site already works **through Nginx**: `https://sbomdelta.website/api/repos`
-  answers with repositories and `/` is the current `index.html`. The requests
-  go to Nginx on this host, so TLS, the server name and the proxying are all
-  exercised;
+- the site already works **through Nginx**: `/` is the current `index.html`,
+  and an anonymous `https://sbomdelta.website/api/repos` answers the way the
+  running server must (see [API smoke expectations](#api-smoke-expectations)).
+  The requests go to Nginx on this host, so TLS, the server name and the
+  proxying are all exercised;
 - the running server reports healthy at `http://127.0.0.1:8080/healthz`
   (`HEALTH_URL`). This is a hard failure: the deployment uses that URL to
   decide whether the new server is healthy, so if it cannot be reached now, a
@@ -112,7 +127,8 @@ happens before the server is recreated, so before any migration runs.
 Compose file and project. It applies migrations on start. The script waits for
 `/healthz` to report `ok`, confirms the newest migration is recorded in the
 database it just backed up, points Nginx at the new container if its address
-changed, and then requires `/api/repos` to answer **through Nginx**.
+changed, and then requires an anonymous `/api/repos` **through Nginx** to get
+the server's exact sign-in refusal, `401 {"error":"authentication required"}`.
 
 **Worker.** Created, or recreated and started, only after that, and required
 to run steadily without restarting. A worker that was stopped before the
@@ -123,11 +139,13 @@ assets first, `index.html` last, then stale files under `assets/` pruned. The
 directory is never replaced (that would break the bind mount). Nothing outside
 `assets/` is deleted, so `.well-known/` and any other files stay. The script
 confirms the Nginx container sees the new `index.html`, then runs the final
-smoke test through Nginx: `/api/repos` answers and `/` is the new build.
+smoke test through Nginx: `/api/repos` refuses anonymous requests with that
+exact response, and `/` is the new build.
 
-**Record.** The deployed commit goes to `current-sha` and
-`deploy-history.log` in the backup directory, and the run prints its result
-marker.
+**Record.** The deployed commit goes to `current-sha` (used only to skip
+older commits) and `deploy-history.log` in the backup directory, and the run
+prints its result marker, including `api=`: how the running server image
+answers an anonymous `/api/repos`.
 
 If anything fails after the switchover, **including a failed smoke test
 through Nginx**, the previous server and worker images and the previous
@@ -143,6 +161,41 @@ is the problem.
 
 Automatic deployments skip a commit that is older than the one already
 deployed, so a late CI result cannot roll production backwards.
+
+### API smoke expectations
+
+Every smoke test requests `/api/repos` without signing in. Only two answers
+count: the sign-in refusal of a server with dashboard sign-in -- HTTP 401 with
+exactly the body `{"error":"authentication required"}` -- and the anonymous
+repository list of a server that predates sign-in. Any other 401 (from Nginx,
+a load balancer, another application, or with any other body) fails.
+
+How each server must answer is read from **its own image**. From the release
+that added sign-in, the server image carries the label
+`org.sbomdelta.dashboard-signin=required` (`backend/Dockerfile`). An image
+with that label must give the refusal; an image without it predates sign-in
+and must list repositories. Any other label value, or an image that cannot be
+inspected, stops the deployment rather than guessing. The label travels with
+the image, so it holds whichever image is running, being rolled back to, or
+newly built -- and nothing on the host can make it stale. `current-sha` plays
+no part in it.
+
+| Check | Server being checked | Required answer |
+|---|---|---|
+| Preflight | the running server, by its image's label | the refusal if labelled, the repository list if not |
+| After the build, before anything is switched | the new image | must carry the label, or the deployment stops |
+| After the switch, and the final smoke test | the new server | **the sign-in refusal**; a repository list fails |
+| Rollback | the previous image, by the label read in preflight | what that image declares; with nothing read, no answer passes |
+| CD's check from outside, after a deploy | the deployed image: `api=` in the result marker, which `deploy.sh` reads from the label; checked against the label in that commit's `backend/Dockerfile` | what the image declares; a signed-in image that lists repositories fails at once, and a disagreement between the two fails |
+| CD's check after `skipped-older` (nothing deployed) | whatever runs | either real answer; anything else fails |
+
+So the first rollout of sign-in passes on its own -- the running image has no
+label and lists repositories; the new one has it and refuses -- and every
+later deployment holds the running server to the refusal, with nothing to
+change by hand. Redeploying an older commit (see [Rollback](#rollback)) works
+the same way in reverse: its `deploy.sh` predates the label and reports no
+`api=`, so CD reads that commit's `Dockerfile`, finds no label, and expects
+the repository list.
 
 ### Nginx
 
@@ -227,7 +280,9 @@ Its side effects on the host are:
   straight away;
 - read-only requests: `GET /api/repos` and `GET /` through Nginx, `GET
   /healthz` on the server, read-only database queries, `nginx -t`, and
-  `stat` of the web root inside the Nginx container.
+  `stat` of the web root inside the Nginx container;
+- inside the server container, as its own user: `test`, `grep -q` and `find -perm`
+  on the client secret file, which print only a status line per check.
 
 It does **not** create or change `/home/ec2-user/deployment-backups`. A
 deploy creates that directory (mode 700) and its `logs/` only if they are
@@ -269,6 +324,37 @@ Do it by hand:
    accessible" section, and that repository history still opens.
 5. Only then set the repository variable **`DEPLOY_AUTOMATIC`** to `true`.
    Until it is set, CI successes on `main` do not deploy.
+
+### First deployment of dashboard sign-in
+
+The release that adds sign-in needs new server settings, and the new server
+refuses to start without them. Preflight will not let a deployment change the
+configuration and the image at once, so the settings go in first, on the
+image that is running now, and the deployment then changes only the image.
+In order:
+
+1. On GitHub, in the App's settings: set the **Callback URL** to
+   `https://sbomdelta.website/api/auth/github/callback`, note the **Client
+   ID**, and generate a **client secret**.
+2. On the instance, save the client secret as
+   `/home/ec2-user/SBOMDelta/secrets/github-client-secret` (see
+   [Client secret file](#client-secret-file)).
+3. Add the [sign-in settings](#prerequisites) to the `server` service's
+   `environment:` in the production `docker-compose.yml`. Change no other
+   service.
+4. Apply them on the current image:
+   [Changing the production configuration](#changing-the-production-configuration).
+   The running server predates sign-in and ignores the new settings, so the
+   site behaves exactly as before.
+5. **Actions → CD → Run workflow**, mode **`preflight`**. It must report
+   `ok: dashboard sign-in settings present in the running server` and that the
+   server runs the configuration Compose resolves. Fix anything it reports and
+   repeat; nothing changes until it passes.
+6. Run it again with mode **`deploy`**. After the switch, an anonymous
+   `/api/repos` must get the sign-in refusal; otherwise the deployment rolls
+   back to the previous image, which still runs with the settings from step 4.
+7. Sign in at `https://sbomdelta.website` with an allowed account, and sign
+   out again.
 
 ## Configuration
 
@@ -347,6 +433,53 @@ may be missing; the first run will fail clearly at the waiting step if it is.
 - at least 5 GB free for Docker, plus twice the database size free in
   `/home/ec2-user/deployment-backups`.
 
+**Dashboard sign-in settings (required from the release that adds sign-in).**
+The server refuses to start without these. Preflight checks them in the
+running server, so a deployment stops before changing anything if they are
+missing. Add them to the `server` service and apply them on the current image
+before deploying that release ([First deployment of dashboard
+sign-in](#first-deployment-of-dashboard-sign-in)). They are not in this
+repository and must not be:
+
+| Setting | Value |
+|---|---|
+| `GITHUB_CLIENT_ID` | The GitHub App's Client ID |
+| `GITHUB_CLIENT_SECRET_PATH` | `/run/secrets/github-client-secret` (see [Client secret file](#client-secret-file)); `GITHUB_CLIENT_SECRET` inline also works but puts the secret in the environment |
+| `PUBLIC_URL` | `https://sbomdelta.website` |
+| `ALLOWED_GITHUB_LOGINS` | Comma-separated GitHub logins allowed to sign in |
+| `SESSION_TTL` (optional) | Default `12h` |
+
+The GitHub App's **Callback URL** must be
+`https://sbomdelta.website/api/auth/github/callback`. Nginx needs no change:
+it already proxies `/api/`. Never set `AUTH_DISABLED` in production; the
+server rejects it outside `APP_ENV=development`, and preflight rejects it too.
+`PUBLIC_URL` must be written exactly as browsers send the origin: lowercase,
+`https`, no port, no path. The server refuses any other spelling.
+
+#### Client secret file
+
+| | |
+|---|---|
+| Host path | `/home/ec2-user/SBOMDelta/secrets/github-client-secret` |
+| Path in the server container | `/run/secrets/github-client-secret`, through the existing `./secrets:/run/secrets:ro` bind mount (no new mount) |
+| Owner | uid `10001`, gid `10001` -- the `sbomdelta` user the server image runs as (`backend/Dockerfile`) |
+| Mode | `0400` |
+| Content | the client secret on one line; surrounding whitespace is ignored |
+
+The `secrets/` directory must already let uid 10001 reach the GitHub App key,
+so it lets it reach this file too. To create the file without the secret
+appearing on screen or in shell history (paste it at the silent prompt, then
+press Enter):
+
+```bash
+cd /home/ec2-user/SBOMDelta
+sudo bash -c 'umask 077; IFS= read -rs s && printf "%s\n" "$s" > secrets/github-client-secret'
+sudo chown 10001:10001 secrets/github-client-secret
+sudo chmod 0400 secrets/github-client-secret
+```
+
+Preflight confirms the server's user can read it, without reading it out.
+
 **Facts only the instance can confirm.** Preflight checks each of these and
 stops if one does not hold. They cannot be verified from the repository,
 because the production `docker-compose.yml` and `nginx/default.conf` exist
@@ -357,10 +490,11 @@ only on the instance:
 | The server answers at `http://127.0.0.1:8080/healthz` | The repository's development Compose file publishes `8080:8080`; the production file must too | Publish the port, or set `HEALTH_URL` |
 | `sbomdelta-nginx` publishes 443/tcp on an IPv4 host address | The smoke tests reach Nginx on the host | Check the Nginx container's ports |
 | `sbomdelta-nginx` holds the current `frontend/dist` (same directory and `index.html` inodes inside and outside the container) | A publish must reach what Nginx serves | Reattach the mount ([Frontend bind mount](#frontend-bind-mount)) |
-| `https://sbomdelta.website` through local Nginx serves `/api/repos` and `frontend/dist/index.html` | The baseline for the post-deploy smoke tests | Fix the live site first |
+| `https://sbomdelta.website` through local Nginx serves `frontend/dist/index.html`, and `/api/repos` answers as [expected](#api-smoke-expectations) | The baseline for the post-deploy smoke tests | Fix the live site first |
 | No Nginx `*.conf` changed since Nginx last loaded it | A reload must not apply unreviewed edits | Apply or revert the edit, then rerun |
 | Containers were created from exactly `docker-compose.yml`, with no override file present | Deployments use exactly that file | Merge or remove the override |
-| `com.docker.compose.config-hash` matches what root's Compose resolves | Recreating must change only the image | Usually a different Compose version for root, or a variable that resolves differently; review |
+| `com.docker.compose.config-hash` matches what root's Compose resolves | Recreating must change only the image | After a deliberate edit, apply it on the current image ([Changing the production configuration](#changing-the-production-configuration)); otherwise usually a different Compose version for root, or a variable that resolves differently; review |
+| The running server has the sign-in settings and can read its client secret file | The new server refuses to start without them | [First deployment of dashboard sign-in](#first-deployment-of-dashboard-sign-in) |
 | No service has `depends_on: {server: {restart: true}}` except the worker | Recreating the server must not restart Nginx | Remove `restart: true` |
 | `/run/secrets` on the server is a bind mount with a `*.pem` key | Presence check for the GitHub App key | Set `GITHUB_APP_KEY_FILE` |
 
@@ -388,7 +522,8 @@ production: `PROD_DIR`, `PROD_COMPOSE_FILE`, `DEPLOY_DIR` (or `--deploy-dir`),
 
 **Automatic.** Any failure after the switchover, including a failed smoke test
 through Nginx, restores the previous images and frontend, and the workflow
-fails.
+fails. The restored server must answer `/api/repos` the way its image
+declares ([API smoke expectations](#api-smoke-expectations)).
 
 **Redeploy an earlier commit.** This is the preferred way back. Run
 **Actions → CD → Run workflow** with mode `deploy` and the earlier commit's
@@ -469,6 +604,48 @@ step: the deployment scripts never do it.
 Find out what replaced the directory, and stop it: build or copy *into*
 `frontend/dist`; never move, delete or re-create the directory itself.
 
+## Changing the production configuration
+
+Preflight requires each service to run exactly the configuration the
+production `docker-compose.yml` and `.env` resolve to, so that a deployment
+changes **only the image** and nothing nobody reviewed for it. A deliberate
+configuration change is therefore its own step, done by hand **before** the
+deployment: recreate the changed service on the image it already runs. That
+proves the new configuration on its own, with the release that is known to
+work, and records it in the container's `config-hash` label, which is what
+preflight compares. Nothing about the check is relaxed.
+
+This is state-changing: the server restarts (a few seconds of `502` through
+Nginx). Run it deliberately, in a Session Manager shell, after editing only
+the service you mean to change (here `server`):
+
+<!-- config-apply:begin -->
+```bash
+cd /home/ec2-user/SBOMDelta
+P=$(docker ps --filter "label=com.docker.compose.project.working_dir=$PWD" \
+      --format '{{.Label "com.docker.compose.project"}}' | sort -u)
+C="docker compose --project-directory . -f docker-compose.yml -p $P"
+# 1. The image name must still mean the image the server runs now; stop if not.
+cid=$($C ps -q server)
+ref=$(docker inspect --format '{{.Config.Image}}' "$cid")
+[ "$(docker inspect --format '{{.Image}}' "$cid")" = "$(docker image inspect --format '{{.Id}}' "$ref")" ] &&
+  echo "server: $ref is the running image" || echo "STOP: $ref no longer names the running image"
+# 2. Recreate only the server, on that image, with the new configuration.
+$C up -d --no-deps --no-build server
+curl -fsS http://127.0.0.1:8080/healthz
+# 3. The server may have a new address; Nginx resolves it again on a reload.
+docker exec sbomdelta-nginx nginx -t && docker exec sbomdelta-nginx nginx -s reload
+curl -sS -o /dev/null -w '%{http_code}\n' https://sbomdelta.website/api/repos
+```
+<!-- config-apply:end -->
+
+`--no-build` and `--no-deps` keep it to exactly that container and that
+image; Nginx's reload changes nothing but the address it resolves (its
+configuration on disk is the one it runs, which preflight also checks). If
+`/healthz` is not `ok`, the new configuration is wrong for the current
+release too: revert the edit and run the same commands again. Then run a CD
+**preflight**; it must now pass the configuration check.
+
 ## Tests
 
 `deploy/tests/run-tests.sh` runs in CI (and locally on Linux or macOS). It
@@ -487,7 +664,24 @@ ignores service names; its container lookups against a stand-in
 other-project containers ignored, strict single containers for the other
 services, a Docker error never read as "absent"); the result-marker parser,
 including truncated output;
-redaction; and the destructive-command guard's own cases.
+redaction; the API smoke expectations (each expectation against the sign-in
+refusal, a foreign 401, a 401 with another body, a repository list and other
+failures, and an unknown or missing expectation accepting nothing); the
+image sign-in label (on the server image only, read as `signin`, absent as
+`repos`, anything else or an image that cannot be inspected an error, and the
+same answer whatever state `current-sha` is in); old and new images through
+preflight, the switch and rollback with `current-sha` missing, stale, garbage
+and unreadable; the CD workflow's public check run as written against older
+and signed-in commits and every reported `api=`;
+the configuration-hash check (a configuration applied on the current image
+passes, an unapplied edit stops with a pointer to the procedure) and that the
+documented procedure keeps to `up -d --no-deps --no-build` with the same
+Compose file and project as `deploy.sh`; the sign-in settings check run
+against real files (missing settings, a wrong `PUBLIC_URL`, `AUTH_DISABLED`,
+a missing, empty, unreadable or world-writable secret file, and no secret
+ever printed); that the sign-in refusal is the same string in `deploy.sh`,
+the CD workflow and the server's tests; and the destructive-command guard's
+own cases.
 `deploy/tests/check-destructive.sh` checks the deployment path itself.
 `deploy.sh` needs root and Docker, so beyond ShellCheck it is exercised by its
 own preflight.

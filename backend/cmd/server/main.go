@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"sbomdelta/internal/api"
+	"sbomdelta/internal/auth"
 	"sbomdelta/internal/config"
 	ghapp "sbomdelta/internal/github"
 	"sbomdelta/internal/queue"
@@ -63,7 +64,11 @@ func run(logger *slog.Logger) error {
 	} else {
 		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
 	}
-	handler := api.New(db, blob, jobs, cfg.Scanner, logger).Routes(webhook)
+	if cfg.Auth.Disabled {
+		logger.Warn("dashboard sign-in disabled for local development; every request is treated as signed in")
+	}
+	authService := auth.New(cfg.Auth, cfg.GitHub.APIBaseURL, db, logger)
+	handler := api.New(db, blob, jobs, authService, logger).Routes(webhook)
 
 	server := &http.Server{
 		Addr:    cfg.HTTPAddr,

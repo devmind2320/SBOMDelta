@@ -90,6 +90,17 @@ ROLLING_BACK=0
 NGINX_UPSTREAM_IPS=""
 # What the last smoke test found wrong, for the log; empty when it passed.
 SMOKE_PROBLEM=""
+# How /api/repos must answer an anonymous request through Nginx (see
+# smoke_nginx): "signin" for a server image with dashboard sign-in, "repos" for
+# one that predates it. It is always read from the image being checked (see
+# image_api_expectation), never from deployment records.
+API_EXPECT=""
+# The expectation of the image the server ran before this deployment, which
+# rollback restores, and of the image this deployment built.
+PREVIOUS_API=""
+NEW_API=""
+# What the last smoke test saw /api/repos answer: signin, repos, or empty.
+SMOKE_API_SEEN=""
 # Preflight writes nothing to disk; the build log exists only in deploy mode.
 BUILD_LOG=/dev/null
 
@@ -354,20 +365,56 @@ nginx_get() {
 		"https://$PUBLIC_HOST:$NGINX_HTTPS_PORT$1" 2>/dev/null || true
 }
 
+# SIGNIN_REFUSAL is the server's exact answer to an anonymous /api request
+# (auth.RequireUser). Only this body counts: any other 401 -- from Nginx, a
+# load balancer, or another application -- proves nothing about this server.
+SIGNIN_REFUSAL='{"error":"authentication required"}'
+
 # smoke_nginx checks the API through Nginx and, given a checksum, that Nginx
 # serves that index.html. On failure SMOKE_PROBLEM says which check failed --
 # the API, the homepage's status, or its checksum -- since each points at a
 # different fault. Bodies are never printed; status codes and checksums are.
+#
+# API_EXPECT says how an anonymous /api/repos must answer: "signin" (the
+# server's own JSON 401, and nothing else) or "repos" (a server that predates
+# sign-in lists repositories). Anything else, including no expectation at
+# all, fails. A server with sign-in that lists repositories anonymously fails
+# "signin": that is an authorization failure.
 smoke_nginx() {
 	local body code sha
 	SMOKE_PROBLEM=""
+	SMOKE_API_SEEN=""
+	case "$API_EXPECT" in
+	signin | repos) ;;
+	*)
+		SMOKE_PROBLEM="unknown API expectation '$API_EXPECT'"
+		return 1
+		;;
+	esac
 	body="$(mktemp)"
 	code="$(nginx_get /api/repos "$body")"
-	if [ "$code" != 200 ]; then
-		SMOKE_PROBLEM="/api/repos returned HTTP ${code:-none}"
-	elif ! grep -q '"repositories"' "$body"; then
-		SMOKE_PROBLEM="/api/repos returned 200 without a repositories list"
-	elif [ -n "${1:-}" ]; then
+	if [ "$code" = 401 ] && [ "$(tr -d '\r\n' <"$body")" = "$SIGNIN_REFUSAL" ]; then
+		SMOKE_API_SEEN=signin
+	elif [ "$code" = 200 ] && grep -q '"repositories"' "$body"; then
+		SMOKE_API_SEEN=repos
+	fi
+	case "$API_EXPECT:$SMOKE_API_SEEN" in
+	signin:signin | repos:repos) ;;
+	signin:repos)
+		SMOKE_PROBLEM="/api/repos listed repositories without sign-in (HTTP 200); this server must refuse anonymous requests" ;;
+	repos:signin)
+		SMOKE_PROBLEM="/api/repos required sign-in, but the server checked here predates it" ;;
+	*:)
+		if [ "$code" = 401 ]; then
+			SMOKE_PROBLEM="/api/repos returned 401 without the server's sign-in response"
+		elif [ "$code" != 200 ]; then
+			SMOKE_PROBLEM="/api/repos returned HTTP ${code:-none}"
+		else
+			SMOKE_PROBLEM="/api/repos returned 200 without a repositories list"
+		fi
+		;;
+	esac
+	if [ -z "$SMOKE_PROBLEM" ] && [ -n "${1:-}" ]; then
 		code="$(nginx_get / "$body")"
 		if [ "$code" != 200 ]; then
 			SMOKE_PROBLEM="the homepage (/) returned HTTP ${code:-none}"
@@ -378,6 +425,33 @@ smoke_nginx() {
 	fi
 	rm -f -- "$body"
 	[ -z "$SMOKE_PROBLEM" ]
+}
+
+# SIGNIN_LABEL is set on the server image by backend/Dockerfile from the
+# release that added dashboard sign-in. It travels with the image, so it says
+# what a server will do whichever image is running -- the current one, the
+# rollback image, or a new build -- and no host file can make it stale.
+SIGNIN_LABEL=org.sbomdelta.dashboard-signin
+
+# image_api_expectation <image> prints how a server from that image must
+# answer an anonymous /api/repos: "signin" when the image declares
+# SIGNIN_LABEL=required, "repos" when it has no such label (it predates sign-in
+# and lists repositories anonymously). Any other value, or an image that
+# cannot be inspected, is an error: guessing could accept an open API.
+image_api_expectation() {
+	local label
+	if ! label="$(docker image inspect --format "{{index .Config.Labels \"$SIGNIN_LABEL\"}}" "$1" 2>/dev/null)"; then
+		log "ERROR: could not read the labels of image $1" >&2
+		return 1
+	fi
+	case "$label" in
+	required) echo signin ;;
+	"" | "<no value>") echo repos ;;
+	*)
+		log "ERROR: image $1 has an unrecognized $SIGNIN_LABEL label" >&2
+		return 1
+		;;
+	esac
 }
 
 wait_for_nginx() {
@@ -406,12 +480,79 @@ refresh_nginx_upstream() {
 	NGINX_UPSTREAM_IPS="$ips"
 }
 
+# check_signin_settings <server container> <public origin> checks, before
+# anything changes, that the running server already has what the new server
+# needs to start: the dashboard sign-in settings, applied beforehand on the
+# current image (deploy/README.md, "Changing the production configuration"),
+# and a client secret file the server's own user can read. The check runs
+# inside the container, as the image's user and through its real mounts, and
+# prints only setting names, the secret's path and the user's uid -- never a
+# value from the environment and never the secret.
+# shellcheck disable=SC2016 # expanded inside the container, on purpose
+SIGNIN_CHECK_SCRIPT='
+[ -n "${GITHUB_CLIENT_ID:-}" ] || echo "problem: GITHUB_CLIENT_ID is not set"
+[ -n "${ALLOWED_GITHUB_LOGINS:-}" ] || echo "problem: ALLOWED_GITHUB_LOGINS is not set"
+if [ -z "${PUBLIC_URL:-}" ]; then
+	echo "problem: PUBLIC_URL is not set"
+elif [ "$PUBLIC_URL" != "$1" ] && [ "$PUBLIC_URL" != "$1/" ]; then
+	echo "problem: PUBLIC_URL is not $1"
+fi
+case "${AUTH_DISABLED:-}" in
+1 | t | T | true | TRUE | True) echo "problem: AUTH_DISABLED is set; production must not disable sign-in" ;;
+esac
+secret="${GITHUB_CLIENT_SECRET_PATH:-}"
+if [ -n "${GITHUB_CLIENT_SECRET:-}" ]; then
+	echo "ok: client secret given inline"
+elif [ -z "$secret" ]; then
+	echo "problem: neither GITHUB_CLIENT_SECRET_PATH nor GITHUB_CLIENT_SECRET is set"
+elif [ ! -e "$secret" ]; then
+	echo "problem: the client secret file $secret does not exist in the server container"
+elif [ ! -f "$secret" ]; then
+	echo "problem: the client secret path $secret is not a regular file"
+elif [ ! -r "$secret" ]; then
+	echo "problem: the client secret file $secret is not readable by the server user (uid $(id -u))"
+elif ! grep -q "[^[:space:]]" "$secret" 2>/dev/null; then
+	echo "problem: the client secret file $secret is empty"
+else
+	echo "ok: client secret file $secret is readable by the server user (uid $(id -u))"
+	if [ -n "$(find "$secret" -prune -perm -0002 2>/dev/null)" ]; then
+		echo "problem: the client secret file $secret is writable by everyone"
+	elif [ -n "$(find "$secret" -prune -perm -0004 2>/dev/null)" ]; then
+		echo "warn: the client secret file $secret is readable by everyone; mode 0400 owned by uid $(id -u) is enough"
+	fi
+fi
+'
+check_signin_settings() {
+	local report line problems=0 secret_ok=0
+	report="$(docker exec "$1" sh -c "$SIGNIN_CHECK_SCRIPT" sh "$2" 2>/dev/null)" || report=""
+	if [ -z "$report" ]; then
+		log "ERROR: could not check the dashboard sign-in settings inside the server container"
+		return 1
+	fi
+	while IFS= read -r line; do
+		case "$line" in
+		"problem: "*) log "ERROR: ${line#problem: }"; problems=$((problems + 1)) ;;
+		"warn: "*) log "WARNING: ${line#warn: }" ;;
+		"ok: "*) log "${line}"; secret_ok=1 ;;
+		esac
+	done <<<"$report"
+	if [ "$problems" -gt 0 ] || [ "$secret_ok" -ne 1 ]; then
+		log "ERROR: the new server would refuse to start. Add the dashboard sign-in settings to the server service and apply them on the current image first (deploy/README.md, \"Changing the production configuration\"). Nothing was changed."
+		return 1
+	fi
+	log "ok: dashboard sign-in settings present in the running server"
+}
+
 # ---------------------------------------------------------------- rollback --
 
 rollback() {
 	set +e
 	trap '' TERM INT HUP
 	ROLLING_BACK=1
+	# The restored server is the image the server ran before, so it must answer
+	# /api/repos the way that image does. Preflight read that from the image
+	# before anything was switched; without it, no answer is accepted.
+	API_EXPECT="${PREVIOUS_API:-unknown}"
 	log "ROLLBACK: restoring the previous release"
 	local restored_sha=""
 	if [ "$FRONTEND_TOUCHED" -eq 1 ] && [ -n "$FRONTEND_BACKUP" ]; then
@@ -658,19 +799,31 @@ done < <(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" \
 # example if root's Compose differs from the one that started production, or
 # a variable resolves differently). Only hashes are compared, never printed
 # configuration.
-compose_version="$(docker compose version --short 2>/dev/null || true)"
+#
+# A deliberate configuration change -- such as the dashboard sign-in settings
+# -- is therefore applied on its own first, by recreating the service on the
+# image it already runs (deploy/README.md, "Changing the production
+# configuration"). The deployment then changes only the image, as this check
+# requires.
+check_config_hash() {
+	local service cid running_hash running_version wanted_hash compose_version
+	compose_version="$(docker compose version --short 2>/dev/null || true)"
+	for service in "$@"; do
+		cid="$(container_for "$service")" || { log "ERROR: cannot identify the $service container"; return 1; }
+		running_hash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid")"
+		running_version="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.version"}}' "$cid")"
+		wanted_hash="$(compose config --hash "$service" 2>/dev/null | awk '{print $NF}')"
+		if [ -z "$wanted_hash" ] || [ "$running_hash" != "$wanted_hash" ]; then
+			log "ERROR: '$service' runs a different configuration than the production Compose file resolves to now (Compose $compose_version here, $running_version created it)."
+			log "ERROR: if you changed that file or .env on purpose, apply the change on the current image first (deploy/README.md, \"Changing the production configuration\"); otherwise review the difference. Nothing was changed."
+			return 1
+		fi
+	done
+	log "ok: $* run the configuration Compose resolves (Compose $compose_version)"
+}
 hash_services=("$SERVER_SERVICE")
 [ "$WORKER_PRESENT" -eq 0 ] || hash_services+=("$WORKER_SERVICE")
-for service in "${hash_services[@]}"; do
-	cid="$(container_for "$service")" || die "cannot identify the $service container"
-	running_hash="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$cid")"
-	running_version="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.version"}}' "$cid")"
-	wanted_hash="$(compose config --hash "$service" 2>/dev/null | awk '{print $NF}')"
-	if [ -z "$wanted_hash" ] || [ "$running_hash" != "$wanted_hash" ]; then
-		die "'$service' runs a different configuration than the production Compose file resolves to now (Compose $compose_version here, $running_version created it); review before deploying"
-	fi
-done
-log "ok: ${hash_services[*]} run the configuration Compose resolves (Compose $compose_version)"
+check_config_hash "${hash_services[@]}" || exit 1
 
 # Persistent database storage must already exist.
 read -r pg_type pg_volume <<<"$(mount_source "$PG_CID" /var/lib/postgresql/data)"
@@ -693,6 +846,8 @@ if [ -z "$GITHUB_APP_KEY_FILE" ] || [ ! -s "$GITHUB_APP_KEY_FILE" ]; then
 	die "GitHub App private key not found"
 fi
 log "ok: .env and GitHub App key present"
+
+check_signin_settings "$SERVER_CID" "https://$PUBLIC_HOST" || exit 1
 
 pg_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$PG_CID")"
 case "$pg_health" in
@@ -776,10 +931,15 @@ newest_config="$(docker exec "$NGINX_CONTAINER" sh -c \
 log "ok: Nginx configuration is valid and unchanged since Nginx loaded it"
 
 # The live site must already work through Nginx: the API is proxied to the
-# server, and / is this directory's index.html.
+# server, and / is this directory's index.html. How the API must answer is
+# read from the image the server runs, which is also the image a rollback
+# restores (see image_api_expectation).
+PREVIOUS_API="$(image_api_expectation "$SERVER_OLD_ID")" || die "cannot tell whether the running server image requires sign-in"
+API_EXPECT="$PREVIOUS_API"
+log "running server image's /api/repos must answer: $API_EXPECT"
 smoke_nginx "$(sha256sum "$FRONTEND_DIST/index.html" | cut -d' ' -f1)" ||
 	die "https://$PUBLIC_HOST/ through $NGINX_CONTAINER ($NGINX_HTTPS_IP:$NGINX_HTTPS_PORT) does not serve /api/repos and $FRONTEND_DIST/index.html: $SMOKE_PROBLEM"
-log "ok: the site answers through Nginx (/api/repos and index.html)"
+log "ok: the site answers through Nginx (/api/repos: $SMOKE_API_SEEN, and index.html)"
 
 # The server must answer directly at HEALTH_URL, which the deployment uses to
 # decide whether the new server is healthy. If it cannot be reached now, a
@@ -841,7 +1001,11 @@ bounded docker build --target worker -t "$WORKER_REPO:$NEW_TAG" "$DEPLOY_DIR/bac
 	die "worker image build failed"
 SERVER_NEW_ID="$(docker image inspect --format '{{.Id}}' "$SERVER_REPO:$NEW_TAG")"
 WORKER_NEW_ID="$(docker image inspect --format '{{.Id}}' "$WORKER_REPO:$NEW_TAG")"
-log "ok: images built"
+# This release has dashboard sign-in, so its image must say so; an unlabelled
+# build would be checked against the wrong expectation after the switch.
+NEW_API="$(image_api_expectation "$SERVER_NEW_ID")" || die "cannot read the new server image's sign-in label"
+[ "$NEW_API" = signin ] || die "the new server image does not declare $SIGNIN_LABEL=required"
+log "ok: images built (the new server image requires sign-in)"
 
 log "building the frontend in $NODE_IMAGE"
 bounded docker run --rm --user "$BUILD_UID:$BUILD_GID" \
@@ -904,6 +1068,8 @@ log "ok: server healthy"
 log "ok: migration $EXPECTED_MIGRATION applied"
 
 refresh_nginx_upstream || die "could not point Nginx at the new server"
+# From here on every check is of the new server image.
+API_EXPECT="$NEW_API"
 wait_for_nginx || die "the new server does not answer through Nginx"
 log "ok: the new server answers through Nginx"
 
@@ -957,4 +1123,6 @@ printf '%s %s project=%s db_backup=%s ci_override=%s\n' "$TS" "$SHA" "$PROJECT" 
 docker rmi "$SERVER_REPO:$NEW_TAG" "$WORKER_REPO:$NEW_TAG" >/dev/null 2>&1 || true
 
 log "deployed ${SHA:0:12} successfully"
-result deployed "index_sha256=$INDEX_SHA"
+# api= is how the running server image answers an anonymous /api/repos, for
+# the CD workflow's check from outside (deploy/ssm-result.sh).
+result deployed "index_sha256=$INDEX_SHA api=$NEW_API"

@@ -126,10 +126,15 @@ Under **Settings → Developer settings → GitHub Apps → New GitHub App**:
 |---------------------|-------------------------------------------------|
 | Webhook URL | your public tunnel, e.g. `https://<id>.ngrok.app/webhooks/github` |
 | Webhook secret | any random string — you will need it below |
+| Callback URL | your `PUBLIC_URL` plus `/api/auth/github/callback`, e.g. `http://localhost:5173/api/auth/github/callback` |
 | Repository permissions | **Contents:** Read-only · **Pull requests:** Read-only · **Checks:** Read & write · **Metadata:** Read-only |
 | Subscribe to events | **Push**, **Pull request** |
 
-Generate a private key, and save it as `secrets/github-app.pem`.
+Generate a private key, and save it as `secrets/github-app.pem`. For dashboard sign-in,
+also note the app's **Client ID** and generate a **client secret**; save the secret as
+`secrets/github-client-secret`. "Request user authorization (OAuth) during installation"
+is not needed, and the user token GitHub issues at sign-in is used once, to read who
+signed in, then discarded — it never reaches the database or the logs.
 
 ### 2. Configure
 
@@ -140,6 +145,21 @@ mkdir -p secrets && mv ~/Downloads/*.private-key.pem secrets/github-app.pem
 
 `.env` and `secrets/` are gitignored. The server refuses to start without a webhook
 secret — without one, signatures cannot be verified.
+
+**Sign-in.** The dashboard and every `/api` data endpoint require signing in with GitHub.
+The API server needs `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (or
+`GITHUB_CLIENT_SECRET_PATH`), `PUBLIC_URL` and `ALLOWED_GITHUB_LOGINS`, and refuses to
+start without them; see `.env.example`. Only the logins in `ALLOWED_GITHUB_LOGINS` can
+sign in, and the list is rechecked on every request. `PUBLIC_URL` must be written the way
+browsers send an origin (lowercase, no default port, no path). For local work without a
+GitHub App, `docker-compose.yml` sets `AUTH_DISABLED=true`, which the server accepts only
+with `APP_ENV=development`.
+
+Signing in again from the same browser replaces its previous session. A failed sign-out
+says so and leaves you signed in, rather than only forgetting the cookie. If an account is
+removed from the allowlist while signed in, the dashboard shows the sign-in page with the
+reason and a button to end that session. After signing in, or after an expired session
+sends you to sign in, you return to the page you were on.
 
 ### 3. Start the stack
 
@@ -189,10 +209,19 @@ TEST_DATABASE_URL='postgres://sbomdelta:sbomdelta@localhost:5432/sbomdelta?sslmo
 
 ## API
 
+Everything under `/api` except the three sign-in endpoints needs a session; without one
+the answer is `401 {"error":"authentication required"}`, and a signed-in login no longer
+on the allowlist gets `403`. State-changing requests must also send
+`X-SBOMDelta-Request: 1` from the dashboard's own origin. No CORS headers are sent.
+
 | Method | Path | Purpose |
 |--------|-----------------------------------|----------------------------------------|
 | `POST` | `/webhooks/github` | GitHub event receiver (signature-verified) |
-| `GET` | `/healthz` | Liveness plus queue depth |
+| `GET` | `/healthz` | Liveness plus queue depth (public) |
+| `GET` | `/api/auth/github/login` | Start signing in with GitHub (public) |
+| `GET` | `/api/auth/github/callback` | GitHub's redirect back (public, state-checked) |
+| `POST` | `/api/auth/logout` | Sign out |
+| `GET` | `/api/me` | Who is signed in |
 | `GET` | `/api/repos` | Installed repositories |
 | `GET` | `/api/repos/{id}` | One repository |
 | `GET` | `/api/repos/{id}/scans` | Scan history |
@@ -204,6 +233,10 @@ TEST_DATABASE_URL='postgres://sbomdelta:sbomdelta@localhost:5432/sbomdelta?sslmo
 | `GET` | `/api/scans/{id}/drift` | What changed in this scan |
 | `GET` | `/api/scans/{id}/vulnerabilities` | Advisories, plus whether enrichment has run |
 | `GET` | `/api/scans/{id}/sbom` | Redirect to a presigned SBOM download |
+
+`POST /api/repos/{id}/scans` and `POST /api/repos` answer `404 not available` for now:
+queueing a scan by hand and registering a repository by URL return once they can be
+offered safely.
 
 ---
 
@@ -323,9 +356,14 @@ errors are redacted before they reach a log line or a check body, and git is run
   that column.
 - **License policy is reporting only.** The dashboard lists what the SBOM declares and
   flags copyleft families for review; it does not decide whether a license is permitted.
-- **The dashboard has no authentication.** It reads an API that is itself unauthenticated
-  apart from webhook signature verification. Anything beyond local use needs auth in
-  front of both.
+- **Sign-in is single-tenant.** Everyone in `ALLOWED_GITHUB_LOGINS` sees every repository
+  the App can reach; there is no per-user repository authorization yet. The allowlist
+  matches logins, and GitHub logins can be renamed and later claimed by someone else, so
+  remove a departed login from the list rather than relying on the account. The login
+  a session is checked against is the one recorded at sign-in, so someone who renames
+  their account stays signed in until the session expires (`SESSION_TTL`).
+- **No scans on demand.** The scan-trigger and manual-registration endpoints are switched
+  off; scans come from pushes, pull requests and initial scans.
 - **Only the default branch is tracked for pushes.** Feature branches are covered through
   their pull requests.
 - **`git clone` shells out**, so a repository whose dependency manifests need a build step

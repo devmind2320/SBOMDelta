@@ -67,6 +67,13 @@ jobs:
           grep -q -- '--- PASS: TestMigration0005AddsInitialTrigger' test-output.txt
           grep -q -- '--- PASS: TestReconcileAfterNarrowingAccess' test-output.txt
           grep -q -- '--- PASS: TestConcurrentInitialAndPushScansCreateOneBaseline' test-output.txt
+          grep -q -- '--- PASS: TestMigration0006UsersAndSessions' test-output.txt
+          grep -q -- '--- PASS: TestEveryDataEndpointRequiresSignIn' test-output.txt
+          grep -q -- '--- PASS: TestAuthorizationBypassAttempts' test-output.txt
+          grep -q -- '--- PASS: TestCallbackRejectsMissingOrMismatchedState' test-output.txt
+          grep -q -- '--- PASS: TestTokensAndSecretsNeverLeak' test-output.txt
+          grep -q -- '--- PASS: TestLogoutFailureIsReportedAndKeepsTheSession' test-output.txt
+          grep -q -- '--- PASS: TestGitHubErrorTextIsNeverEchoed' test-output.txt
 
       - name: Run lint checks
         run: make lint

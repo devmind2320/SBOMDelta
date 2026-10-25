@@ -1,61 +1,78 @@
 // Package api serves the dashboard's read endpoints and the GitHub webhook.
+//
+// Every /api route except sign-in sits behind auth.RequireUser, and every
+// state-changing request behind auth.SameOrigin. The webhook is outside both:
+// GitHub proves itself with an HMAC signature, verified by the handler.
 package api
 
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
-	"sbomdelta/internal/config"
-	"sbomdelta/internal/models"
+	"sbomdelta/internal/auth"
 	"sbomdelta/internal/queue"
-	"sbomdelta/internal/sbom"
 	"sbomdelta/internal/storage"
 )
 
 type API struct {
-	db   *storage.DB
-	blob *storage.BlobStore
-	// scanner config is needed only to resolve a ref to a commit before
-	// queueing; the scan itself still happens on the worker.
-	scanner config.Scanner
-	queue   *queue.Queue
-	logger  *slog.Logger
+	db     *storage.DB
+	blob   *storage.BlobStore
+	queue  *queue.Queue
+	auth   *auth.Service
+	logger *slog.Logger
 }
 
-func New(db *storage.DB, blob *storage.BlobStore, q *queue.Queue, scanner config.Scanner, logger *slog.Logger) *API {
-	return &API{db: db, blob: blob, queue: q, scanner: scanner, logger: logger}
+func New(db *storage.DB, blob *storage.BlobStore, q *queue.Queue, authService *auth.Service, logger *slog.Logger) *API {
+	return &API{db: db, blob: blob, queue: q, auth: authService, logger: logger}
 }
 
 // Routes builds the HTTP handler. The webhook is mounted by the caller so that
 // its dependencies stay in the github package.
+//
+// The data routes live on their own mux, mounted at /api/ behind sign-in, so a
+// route added there later is protected without anyone remembering to wrap it.
+// Only the sign-in endpoints are registered outside it, by exact path.
 func (a *API) Routes(webhook http.Handler) http.Handler {
+	data := http.NewServeMux()
+	data.HandleFunc("GET /api/me", a.auth.Me)
+	data.HandleFunc("GET /api/repos", a.listRepositories)
+	data.HandleFunc("GET /api/repos/{id}", a.getRepository)
+	data.HandleFunc("GET /api/repos/{id}/scans", a.listScans)
+	data.HandleFunc("GET /api/repos/{id}/drift", a.driftTimeline)
+	data.HandleFunc("GET /api/repos/{id}/pulls", a.listPullRequests)
+	data.HandleFunc("GET /api/pulls/{id}", a.getPullRequest)
+	data.HandleFunc("GET /api/scans/{id}", a.getScan)
+	data.HandleFunc("GET /api/scans/{id}/components", a.listComponents)
+	data.HandleFunc("GET /api/scans/{id}/drift", a.listDrift)
+	data.HandleFunc("GET /api/scans/{id}/vulnerabilities", a.listVulnerabilities)
+	data.HandleFunc("GET /api/scans/{id}/sbom", a.downloadSBOM)
+	// Queueing a scan by hand and registering a repository by URL are off
+	// until they can be offered safely: the old scan endpoint trusted any
+	// caller-supplied commit, could re-run a finished scan over its results,
+	// and resolved refs anonymously; registration let anyone make the worker
+	// clone any public repository.
+	data.HandleFunc("POST /api/repos/{id}/scans", unavailable)
+	data.HandleFunc("POST /api/repos", unavailable)
+
 	mux := http.NewServeMux()
-
 	mux.Handle("POST /webhooks/github", webhook)
-
 	mux.HandleFunc("GET /healthz", a.health)
-	mux.HandleFunc("GET /api/repos", a.listRepositories)
-	mux.HandleFunc("POST /api/repos", a.registerRepository)
-	mux.HandleFunc("GET /api/repos/{id}", a.getRepository)
-	mux.HandleFunc("GET /api/repos/{id}/scans", a.listScans)
-	mux.HandleFunc("POST /api/repos/{id}/scans", a.triggerScan)
-	mux.HandleFunc("GET /api/repos/{id}/drift", a.driftTimeline)
-	mux.HandleFunc("GET /api/repos/{id}/pulls", a.listPullRequests)
-	mux.HandleFunc("GET /api/pulls/{id}", a.getPullRequest)
-	mux.HandleFunc("GET /api/scans/{id}", a.getScan)
-	mux.HandleFunc("GET /api/scans/{id}/components", a.listComponents)
-	mux.HandleFunc("GET /api/scans/{id}/drift", a.listDrift)
-	mux.HandleFunc("GET /api/scans/{id}/vulnerabilities", a.listVulnerabilities)
-	mux.HandleFunc("GET /api/scans/{id}/sbom", a.downloadSBOM)
+	mux.HandleFunc("GET /api/auth/github/login", a.auth.Login)
+	mux.HandleFunc("GET "+auth.CallbackPath, a.auth.Callback)
+	mux.HandleFunc("POST /api/auth/logout", a.auth.Logout)
+	mux.Handle("/api/", a.auth.RequireUser(data))
 
-	return a.withLogging(a.withCORS(mux))
+	// No CORS headers are sent at all: the dashboard is served from the same
+	// origin as the API, and no other origin should be able to read it.
+	return a.withLogging(a.auth.SameOrigin(mux))
+}
+
+func unavailable(w http.ResponseWriter, _ *http.Request) {
+	writeError(w, http.StatusNotFound, "not available")
 }
 
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
@@ -299,152 +316,6 @@ func (a *API) listVulnerabilities(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// registerRepository adds a repository by hand, without the GitHub App.
-//
-// The scan pipeline does not actually need GitHub: given a clone URL and a
-// commit it produces the same SBOM, diff and drift history. This endpoint
-// exists so a public repository can be tracked directly, and so the product
-// can be run and demonstrated before an App is installed anywhere.
-func (a *API) registerRepository(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Owner         string `json:"owner"`
-		Name          string `json:"name"`
-		CloneURL      string `json:"cloneUrl"`
-		DefaultBranch string `json:"defaultBranch"`
-	}
-	if !decodeJSON(w, r, &body) {
-		return
-	}
-
-	body.Owner = strings.TrimSpace(body.Owner)
-	body.Name = strings.TrimSpace(body.Name)
-	if body.Owner == "" || body.Name == "" {
-		writeError(w, http.StatusBadRequest, "owner and name are required")
-		return
-	}
-	if body.DefaultBranch == "" {
-		body.DefaultBranch = "main"
-	}
-	if body.CloneURL == "" {
-		body.CloneURL = fmt.Sprintf("https://github.com/%s/%s.git", body.Owner, body.Name)
-	}
-	// Only anonymous HTTPS is supported here. An ssh:// or file:// source
-	// would let a caller reach things the API should not reach on its behalf.
-	if !strings.HasPrefix(body.CloneURL, "https://") {
-		writeError(w, http.StatusBadRequest, "cloneUrl must be an https:// url")
-		return
-	}
-
-	repo, err := a.db.UpsertManualRepository(r.Context(), models.Repository{
-		Owner:         body.Owner,
-		Name:          body.Name,
-		DefaultBranch: body.DefaultBranch,
-		CloneURL:      body.CloneURL,
-	})
-	if err != nil {
-		a.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, repo)
-}
-
-// triggerScan queues a manual scan of one commit.
-//
-// It accepts either an exact commitSha or a ref to resolve. Resolving happens
-// here rather than in the worker because a scan row is keyed on its commit,
-// and that is what makes re-triggering the same commit idempotent instead of
-// piling up duplicate scans.
-func (a *API) triggerScan(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Ref       string `json:"ref"`
-		CommitSHA string `json:"commitSha"`
-	}
-	if !decodeJSON(w, r, &body) {
-		return
-	}
-
-	repo, err := a.db.GetRepository(r.Context(), id)
-	if err != nil {
-		a.fail(w, r, err)
-		return
-	}
-	// Its history stays readable, but a repository SBOMDelta lost access to
-	// cannot be cloned with the access it had.
-	if !repo.Accessible() {
-		writeError(w, http.StatusConflict,
-			fmt.Sprintf("SBOMDelta no longer has access to %s (%s); its history is still available", repo.FullName(), repo.Access))
-		return
-	}
-
-	commitSHA := strings.TrimSpace(body.CommitSHA)
-	if commitSHA == "" {
-		ref := strings.TrimSpace(body.Ref)
-		if ref == "" {
-			ref = repo.DefaultBranch
-		}
-		commitSHA, err = sbom.ResolveRef(r.Context(), a.scanner, repo.CloneURL, ref)
-		if err != nil {
-			// A failed lookup is the caller's problem to fix (wrong ref,
-			// private repo, rate limit), not a server fault.
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-	}
-	if !sbom.IsCommitSHA(commitSHA) {
-		writeError(w, http.StatusBadRequest, "commitSha must be a full 40-character sha")
-		return
-	}
-
-	// The previous completed scan is the baseline, mirroring what a push to
-	// the default branch would compare against.
-	var baseCommitSHA string
-	if previous, err := a.db.LatestCompletedScan(r.Context(), repo.ID, 0, time.Now()); err == nil {
-		baseCommitSHA = previous.CommitSHA
-	} else if !errors.Is(err, storage.ErrNotFound) {
-		a.fail(w, r, err)
-		return
-	}
-	if baseCommitSHA == commitSHA {
-		baseCommitSHA = ""
-	}
-
-	scan, err := a.db.CreateScan(r.Context(), models.Scan{
-		RepositoryID:  repo.ID,
-		CommitSHA:     commitSHA,
-		BaseCommitSHA: baseCommitSHA,
-		Trigger:       models.TriggerManual,
-	})
-	if err != nil {
-		a.fail(w, r, err)
-		return
-	}
-
-	if _, err := a.queue.Enqueue(r.Context(), queue.KindScan,
-		queue.ScanPayload{ScanID: scan.ID}, fmt.Sprintf("scan:%d", scan.ID)); err != nil {
-		a.fail(w, r, err)
-		return
-	}
-
-	// 202: the work is accepted, not finished. Poll GET /api/scans/{id}.
-	writeJSON(w, http.StatusAccepted, scan)
-}
-
-// decodeJSON reads a JSON body, rejecting unknown fields so a typo in a
-// hand-written request is reported instead of silently ignored.
-func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		writeError(w, http.StatusBadRequest, "could not read request body: "+err.Error())
-		return false
-	}
-	return true
-}
-
 func (a *API) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, storage.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "not found")
@@ -462,20 +333,6 @@ func (a *API) withLogging(next http.Handler) http.Handler {
 		a.logger.Info("request",
 			"method", r.Method, "path", r.URL.Path,
 			"status", recorder.status, "duration", time.Since(started))
-	})
-}
-
-// withCORS lets the Vue dev server call the API from a different origin.
-func (a *API) withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
 }
 

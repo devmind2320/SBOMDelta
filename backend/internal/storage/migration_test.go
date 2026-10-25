@@ -2,12 +2,14 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/url"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -287,5 +289,122 @@ func TestCleanDatabaseHasEveryScanTrigger(t *testing.T) {
 	}, ",")
 	if values != want {
 		t.Errorf("scan_trigger = %s, want %s", values, want)
+	}
+}
+
+// TestMigration0006UsersAndSessions checks the sign-in tables on a fresh
+// database, their cascade, and that the down migration removes only them.
+func TestMigration0006UsersAndSessions(t *testing.T) {
+	base := os.Getenv("TEST_DATABASE_URL")
+	if base == "" {
+		t.Skip("TEST_DATABASE_URL is not set; skipping database integration tests")
+	}
+	ctx := context.Background()
+	const schema = "test_migration_0006"
+
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer admin.Close(ctx)
+	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS `+schema+` CASCADE; CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("reset schema: %v", err)
+	}
+	parsed, _ := url.Parse(base)
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	db, err := storage.Open(ctx, parsed.String())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(ctx, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	pool := db.Pool()
+
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 4001, Login: "devmind2320"})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	if err := db.CreateSession(ctx, []byte("hash-1"), user.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	if err := db.CreateSession(ctx, []byte("hash-1"), user.ID, time.Now().Add(time.Hour)); err == nil {
+		t.Error("two sessions were stored under one token hash")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, user.ID); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	var sessions int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&sessions); err != nil || sessions != 0 {
+		t.Errorf("sessions after deleting their user = %d (err %v), want 0", sessions, err)
+	}
+
+	down, err := migrations.FS.ReadFile("0006_users_sessions.down.sql")
+	if err != nil {
+		t.Fatalf("read down migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(down)); err != nil {
+		t.Fatalf("apply down migration: %v", err)
+	}
+	var remaining int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM information_schema.tables
+		WHERE table_schema = $1 AND table_name IN ('users', 'sessions')`, schema).Scan(&remaining); err != nil || remaining != 0 {
+		t.Errorf("sign-in tables after rolling back = %d (err %v), want 0", remaining, err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT 1 FROM repositories LIMIT 1`); err != nil {
+		t.Errorf("rolling back 0006 touched other tables: %v", err)
+	}
+}
+
+// Sessions are found only by hash and only while unexpired; signing in sweeps
+// expired ones; a returning user's login and avatar are refreshed.
+func TestUserAndSessionStorage(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 4001, Login: "OldName", AvatarURL: "https://a/1"})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	renamed, err := db.UpsertUser(ctx, models.User{GitHubUserID: 4001, Login: "devmind2320"})
+	if err != nil {
+		t.Fatalf("UpsertUser() again error = %v", err)
+	}
+	if renamed.ID != user.ID || renamed.Login != "devmind2320" || renamed.AvatarURL != "" {
+		t.Errorf("returning user = %+v, want the same row with the new login", renamed)
+	}
+
+	if err := db.CreateSession(ctx, []byte("old"), user.ID, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("CreateSession(expired) error = %v", err)
+	}
+	if _, err := db.SessionUser(ctx, []byte("old")); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("expired session lookup error = %v, want ErrNotFound", err)
+	}
+	if err := db.CreateSession(ctx, []byte("live"), user.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	var stored int
+	if err := db.Pool().QueryRow(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&stored); err != nil || stored != 1 {
+		t.Errorf("sessions after a new sign-in = %d (err %v), want the expired one swept", stored, err)
+	}
+	got, err := db.SessionUser(ctx, []byte("live"))
+	if err != nil || got.ID != user.ID {
+		t.Fatalf("SessionUser() = %+v, %v", got, err)
+	}
+	if _, err := db.SessionUser(ctx, []byte("unknown")); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("unknown session error = %v, want ErrNotFound", err)
+	}
+	if err := db.DeleteSession(ctx, []byte("live")); err != nil {
+		t.Fatalf("DeleteSession() error = %v", err)
+	}
+	if err := db.DeleteSession(ctx, []byte("live")); err != nil {
+		t.Errorf("deleting a deleted session error = %v, want nil", err)
+	}
+	if _, err := db.SessionUser(ctx, []byte("live")); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("deleted session error = %v, want ErrNotFound", err)
 	}
 }

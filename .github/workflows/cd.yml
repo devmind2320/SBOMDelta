@@ -250,34 +250,69 @@ jobs:
       - name: Verify the public site
         if: steps.target.outputs.mode == 'deploy'
         env:
+          SHA: ${{ steps.target.outputs.sha }}
           RESULT: ${{ steps.ssm.outputs.result }}
           INDEX_SHA: ${{ steps.ssm.outputs.index_sha }}
+          API: ${{ steps.ssm.outputs.api }}
         run: |
           set -euo pipefail
           # deploy.sh has already checked the site through Nginx on the host,
           # and rolled back if it failed. This confirms it from outside too.
           # /healthz is not checked here: Nginx proxies only /api/ and
           # /webhooks/github to the server.
+          #
+          # An anonymous /api/repos must answer the way the deployed server
+          # image does. deploy.sh reports that (api=) from the running image's
+          # sign-in label; the label is also in the deployed commit's
+          # Dockerfile, which built that image. The two must agree. deploy.sh
+          # scripts from before the label report nothing, and their commits
+          # predate sign-in: the Dockerfile then says so.
+          signin_label='LABEL org.sbomdelta.dashboard-signin="required"'
+          refusal='{"error":"authentication required"}'
           case "$RESULT" in
-            deployed) [[ "$INDEX_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no index checksum for a deployed run"; exit 1; } ;;
-            skipped-older) echo "This commit is older than the deployed one; nothing was published. Checking the API only." ;;
+            deployed)
+              [[ "$INDEX_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no index checksum for a deployed run"; exit 1; }
+              built=repos
+              if git show "$SHA:backend/Dockerfile" 2>/dev/null | grep -qxF "$signin_label"; then built=signin; fi
+              if [ -n "$API" ] && [ "$API" != "$built" ]; then
+                echo "::error::the instance reports the running server image answers '$API', but ${SHA:0:12}'s Dockerfile builds one that answers '$built'"
+                exit 1
+              fi
+              expect="${API:-$built}"
+              ;;
+            skipped-older)
+              # Nothing was deployed and the running release is not known
+              # here, so either answer of a real server shows the API is
+              # reachable; any other answer still fails.
+              echo "This commit is older than the deployed one; nothing was published. Checking the API only."
+              expect=either
+              ;;
             *) echo "::error::unexpected result '$RESULT'"; exit 1 ;;
           esac
+          echo "Anonymous /api/repos must answer: $expect"
           body="$(mktemp)"
           for attempt in $(seq 1 10); do
             repos_status="$(curl -s -o "$body" -w '%{http_code}' --max-time 10 "$PUBLIC_URL/api/repos" || true)"
+            seen=other
+            # Only the server's exact refusal counts as sign-in; no other 401.
+            if [ "$repos_status" = 401 ] && [ "$(tr -d '\r\n' <"$body")" = "$refusal" ]; then seen=signin; fi
+            if [ "$repos_status" = 200 ] && grep -q '"repositories"' "$body"; then seen=repos; fi
+            if [ "$expect" = signin ] && [ "$seen" = repos ]; then
+              echo "::error::$PUBLIC_URL/api/repos lists repositories without sign-in"
+              exit 1
+            fi
             api_ok=0
-            if [ "$repos_status" = 200 ] && grep -q '"repositories"' "$body"; then api_ok=1; fi
+            if [ "$seen" = "$expect" ] || { [ "$expect" = either ] && [ "$seen" != other ]; }; then api_ok=1; fi
             index_ok=1
             if [ "$RESULT" = deployed ]; then
               live="$(curl -fsS --max-time 10 "$PUBLIC_URL/" | sha256sum | cut -d' ' -f1 || true)"
               [ "$live" = "$INDEX_SHA" ] || index_ok=0
             fi
             if [ "$api_ok" = 1 ] && [ "$index_ok" = 1 ]; then
-              echo "Public site healthy: /api/repos answers, index.html matches the published build"
+              echo "Public site healthy: /api/repos answers as expected ($seen), index.html matches the published build"
               exit 0
             fi
-            echo "attempt $attempt: api/repos=$repos_status api_ok=$api_ok index_match=$index_ok"
+            echo "attempt $attempt: api/repos=$repos_status seen=$seen expected=$expect index_match=$index_ok"
             sleep 6
           done
           echo "::error::$PUBLIC_URL did not pass post-deployment checks (the host-side checks passed; investigate DNS, the load path, or caching)"

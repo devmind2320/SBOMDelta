@@ -4,6 +4,14 @@ package models
 
 import "time"
 
+// User is someone who has signed in to the dashboard.
+type User struct {
+	ID           int64  `json:"id"`
+	GitHubUserID int64  `json:"githubUserId"`
+	Login        string `json:"login"`
+	AvatarURL    string `json:"avatarUrl,omitempty"`
+}
+
 type Installation struct {
 	ID                   int64      `json:"id"`
 	GitHubInstallationID int64      `json:"githubInstallationId"`

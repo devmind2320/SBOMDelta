@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"sbomdelta/internal/api"
+	"sbomdelta/internal/auth"
 	"sbomdelta/internal/config"
 	"sbomdelta/internal/models"
 	"sbomdelta/internal/queue"
@@ -19,12 +21,18 @@ import (
 	"sbomdelta/internal/storage/storagetest"
 )
 
+const testPublicURL = "https://sbomdelta.test"
+
 type fixture struct {
 	db      *storage.DB
 	handler http.Handler
 	active  models.Repository
 	revoked models.Repository
 	scan    models.Scan
+	// session is a signed-in allowed user's cookie, sent by do().
+	session *http.Cookie
+	// webhookCalls counts requests that reached the webhook handler.
+	webhookCalls *int
 }
 
 // newFixture stores one active and one revoked App repository; the revoked
@@ -67,14 +75,45 @@ func newFixture(t *testing.T) fixture {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := api.New(db, nil, queue.New(db.Pool(), time.Minute), config.Scanner{}, logger).
-		Routes(http.NotFoundHandler())
-	return fixture{db: db, handler: handler, active: active, revoked: revoked, scan: scan}
+	public, _ := url.Parse(testPublicURL)
+	authService := auth.New(config.Auth{
+		ClientID: "Iv1.apitest", ClientSecret: "api-test-client-secret", PublicURL: public,
+		WebBaseURL: "https://github.invalid", AllowedLogins: []string{"devmind2320"}, SessionTTL: time.Hour,
+	}, "https://api.github.invalid/", db, logger)
+	webhookCalls := 0
+	webhook := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		webhookCalls++
+		w.WriteHeader(http.StatusAccepted)
+	})
+	handler := api.New(db, nil, queue.New(db.Pool(), time.Minute), authService, logger).Routes(webhook)
+
+	return fixture{db: db, handler: handler, active: active, revoked: revoked, scan: scan,
+		session: newSession(t, db, 4001, "devmind2320"), webhookCalls: &webhookCalls}
+}
+
+// newSession stores a session the way a sign-in would and returns its cookie.
+func newSession(t *testing.T, db *storage.DB, githubID int64, login string) *http.Cookie {
+	t.Helper()
+	ctx := context.Background()
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: githubID, Login: login})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	token := login + "-session-token-for-tests"
+	if err := db.CreateSession(ctx, auth.HashToken(token), user.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("CreateSession() error = %v", err)
+	}
+	return &http.Cookie{Name: auth.SessionCookie, Value: token}
 }
 
 func (f fixture) do(t *testing.T, method, path, body string) (int, map[string]json.RawMessage) {
 	t.Helper()
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.AddCookie(f.session)
+	if method != http.MethodGet {
+		request.Header.Set(auth.CSRFHeader, "1")
+		request.Header.Set("Origin", testPublicURL)
+	}
 	recorder := httptest.NewRecorder()
 	f.handler.ServeHTTP(recorder, request)
 
@@ -156,27 +195,33 @@ func TestRevokedRepositoryHistoryStaysReadable(t *testing.T) {
 	}
 }
 
-func TestTriggerScanRejectsRevokedRepository(t *testing.T) {
+// Queueing a scan by hand and registering a repository by URL stay off until
+// Phase 3 replaces them safely -- even for a signed-in user sending a valid
+// same-origin request, and even with a full commit SHA.
+func TestScanTriggerAndManualRegistrationAreUnavailable(t *testing.T) {
 	f := newFixture(t)
+	ctx := context.Background()
 
-	// A full SHA skips ref resolution, so the access check is all that stands
-	// between this request and a queued scan.
-	status, body := f.do(t, http.MethodPost, "/api/repos/"+jsonID(f.revoked.ID)+"/scans",
-		`{"commitSha":"5555555555555555555555555555555555555555"}`)
-	if status != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", status)
-	}
-	if !strings.Contains(string(body["error"]), "no longer has access") {
-		t.Errorf("error = %s, want it to explain the revoked access", body["error"])
+	for _, request := range []struct{ path, body string }{
+		{"/api/repos/" + jsonID(f.active.ID) + "/scans", `{"commitSha":"5555555555555555555555555555555555555555"}`},
+		{"/api/repos/" + jsonID(f.active.ID) + "/scans", `{}`},
+		{"/api/repos/" + jsonID(f.revoked.ID) + "/scans", `{"ref":"main"}`},
+		{"/api/repos", `{"owner":"sigstore","name":"cosign"}`},
+	} {
+		status, body := f.do(t, http.MethodPost, request.path, request.body)
+		if status != http.StatusNotFound || string(body["error"]) != `"not available"` {
+			t.Errorf("POST %s = %d %s, want 404 not available", request.path, status, body["error"])
+		}
 	}
 
-	var queued int
-	if err := f.db.Pool().QueryRow(context.Background(),
-		`SELECT COUNT(*) FROM jobs WHERE kind = 'scan'`).Scan(&queued); err != nil {
-		t.Fatalf("count jobs: %v", err)
+	var jobs, scans, repos int
+	if err := f.db.Pool().QueryRow(ctx,
+		`SELECT (SELECT COUNT(*) FROM jobs), (SELECT COUNT(*) FROM scans), (SELECT COUNT(*) FROM repositories)`).
+		Scan(&jobs, &scans, &repos); err != nil {
+		t.Fatalf("count rows: %v", err)
 	}
-	if queued != 0 {
-		t.Errorf("scan jobs = %d, want 0", queued)
+	if jobs != 0 || scans != 1 || repos != 2 {
+		t.Errorf("jobs=%d scans=%d repositories=%d, want 0, the fixture's 1 and 2", jobs, scans, repos)
 	}
 }
 

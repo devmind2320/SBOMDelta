@@ -175,9 +175,9 @@ H="$(printf 'b%.0s' {1..64})"
 parse() { "$ROOT/deploy/ssm-result.sh" "$@" 2>/dev/null; }
 
 out="$(printf '[t] log\nSBOMDELTA_RESULT status=deployed sha=%s index_sha256=%s\n' "$S" "$H" | parse deploy "$S" 0)" && rc=0 || rc=$?
-check "marker: deployed run yields its index checksum" [ "$rc:$out" = "0:result=deployed"$'\n'"index_sha=$H" ]
+check "marker: deployed run yields its index checksum" [ "$rc:$out" = "0:result=deployed"$'\n'"index_sha=$H"$'\n'"api=" ]
 out="$(printf 'SBOMDELTA_RESULT status=skipped-older sha=%s deployed=%s\n' "$S" "$S" | parse deploy "$S" 1)" && rc=0 || rc=$?
-check "marker: skipped-older is accepted for an automatic run" [ "$rc:$out" = "0:result=skipped-older"$'\n'"index_sha=" ]
+check "marker: skipped-older is accepted for an automatic run" [ "$rc:$out" = "0:result=skipped-older"$'\n'"index_sha="$'\n'"api=" ]
 check "marker: skipped-older is refused when skipping was not allowed" \
 	sh -c '! printf "SBOMDELTA_RESULT status=skipped-older sha=%s deployed=x\n" "$1" | "$2" deploy "$1" 0 2>/dev/null' _ "$S" "$ROOT/deploy/ssm-result.sh"
 check "marker: preflight-ok fits a preflight" sh -c 'printf "SBOMDELTA_RESULT status=preflight-ok sha=%s\n" "$1" | "$2" preflight "$1" 0 >/dev/null 2>&1' _ "$S" "$ROOT/deploy/ssm-result.sh"
@@ -192,6 +192,14 @@ check "marker: deployed with a malformed checksum fails" \
 	sh -c '! printf "SBOMDELTA_RESULT status=deployed sha=%s index_sha256=xyz\n" "$1" | "$2" deploy "$1" 0 2>/dev/null' _ "$S" "$ROOT/deploy/ssm-result.sh"
 check "marker: preflight result does not satisfy a deploy" \
 	sh -c '! printf "SBOMDELTA_RESULT status=preflight-ok sha=%s\n" "$1" | "$2" deploy "$1" 0 2>/dev/null' _ "$S" "$ROOT/deploy/ssm-result.sh"
+out="$(printf 'SBOMDELTA_RESULT status=deployed sha=%s index_sha256=%s api=signin\n' "$S" "$H" | parse deploy "$S" 0)" && rc=0 || rc=$?
+check "marker: a deployed run reports the running image's api expectation" [ "$rc:$out" = "0:result=deployed"$'\n'"index_sha=$H"$'\n'"api=signin" ]
+out="$(printf 'SBOMDELTA_RESULT status=deployed sha=%s index_sha256=%s api=repos\n' "$S" "$H" | parse deploy "$S" 0)" && rc=0 || rc=$?
+check "marker: ... including an image that predates sign-in" [ "$rc:${out##*$'\n'}" = "0:api=repos" ]
+out="$(printf 'SBOMDELTA_RESULT status=deployed sha=%s index_sha256=%s\n' "$S" "$H" | parse deploy "$S" 0)" && rc=0 || rc=$?
+check "marker: an older deploy.sh's marker (no api) is accepted with an empty api" [ "$rc:${out##*$'\n'}" = "0:api=" ]
+check "marker: an unknown api expectation fails" \
+	sh -c '! printf "SBOMDELTA_RESULT status=deployed sha=%s index_sha256=%s api=either\n" "$1" "$2" | "$3" deploy "$1" 0 2>/dev/null' _ "$S" "$H" "$ROOT/deploy/ssm-result.sh"
 check "marker: two markers fail" \
 	sh -c '! printf "SBOMDELTA_RESULT status=preflight-ok sha=%s\nSBOMDELTA_RESULT status=preflight-ok sha=%s\n" "$1" "$1" | "$2" preflight "$1" 0 2>/dev/null' _ "$S" "$ROOT/deploy/ssm-result.sh"
 check "marker: only a marker at the start of a line counts" \
@@ -703,7 +711,8 @@ rollback_case() {
 		# Read by the function loaded with eval below.
 		# shellcheck disable=SC2034
 		FRONTEND_TOUCHED="$2" FRONTEND_DIST="$rb/dist" FRONTEND_BACKUP="$rb/backup.tar.gz" \
-			SERVER_SWITCHED=0 WORKER_SWITCHED=0 WORKER_PRESENT=1 ROLLING_BACK=0 DB_BACKUP=""
+			SERVER_SWITCHED=0 WORKER_SWITCHED=0 WORKER_PRESENT=1 ROLLING_BACK=0 DB_BACKUP="" \
+			PREVIOUS_API="${RB_PREVIOUS_API:-}" API_EXPECT=signin
 		RESTORE_WORKS="$3" HOME_SERVES="$4"
 		WANT="$(sha256sum <"$rb/saved/index.html" | cut -d' ' -f1)"
 		# shellcheck disable=SC2317,SC2329
@@ -714,7 +723,7 @@ rollback_case() {
 		make_dist_readable() { :; }
 		# shellcheck disable=SC2317,SC2329
 		wait_for_nginx() {
-			echo "smoke: checksum=${1:-none}"
+			echo "smoke: checksum=${1:-none} api=$API_EXPECT"
 			[ -n "${1:-}" ] || return 0
 			[ "$HOME_SERVES" = 1 ] && [ "$1" = "$WANT" ]
 		}
@@ -742,6 +751,14 @@ check "rollback, restored but / does not serve it: reported as a failure" \
 out="$(rollback_case no-frontend 0 1 1)"
 check "rollback, frontend never touched: only the API is checked, and no homepage claim is made" \
 	sh -c 'printf "%s\n" "$1" | grep -q "smoke: checksum=none" && printf "%s\n" "$1" | grep -qx "ROLLBACK: the site answers through Nginx"' _ "$out"
+# The restored server is the previous image: it must answer /api/repos as
+# that image declares (read in preflight), not as the new server had to.
+out="$(RB_PREVIOUS_API=repos rollback_case api-repos 0 1 1)"
+check "rollback: an image without the sign-in label must list repositories again" contains "$out" "api=repos"
+out="$(RB_PREVIOUS_API=signin rollback_case api-signin 0 1 1)"
+check "rollback: an image with the sign-in label must require it again" contains "$out" "api=signin"
+out="$(rollback_case api-unknown 0 1 1)"
+check "rollback: with no expectation read, nothing is accepted (fail closed)" contains "$out" "api=unknown"
 
 # The incident: under umask 077 the owner's tar and cp left the web root,
 # assets and index.html readable by the owner only, and Nginx answered 403.
@@ -770,6 +787,9 @@ check "permissions: the previous as_dist_owner leaves the frontend unreadable (t
 # / from files. A failure must say which check failed: an API fault, a
 # homepage status (the 403 of the incident) and a stale homepage each point
 # somewhere different, and the old message blamed the frontend for all three.
+signin_refusal="$(sed -n "s/^SIGNIN_REFUSAL='\(.*\)'$/\1/p" "$ROOT/deploy/deploy.sh")"
+check "smoke: deploy.sh defines the server's exact sign-in refusal" \
+	[ "$signin_refusal" = '{"error":"authentication required"}' ]
 smoke_functions="$(awk '
 	/^(nginx_get|smoke_nginx|wait_for_nginx)\(\) \{$/ { on = 1 }
 	on { print }
@@ -814,6 +834,8 @@ smoke() {
 		# Read by the functions loaded with eval below.
 		# shellcheck disable=SC2034
 		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SMOKE_PROBLEM=""
+		# shellcheck disable=SC2034
+		API_EXPECT="${API_EXPECT-repos}" SIGNIN_REFUSAL="$signin_refusal"
 		export FAKE_API_BODY="${FAKE_API_BODY:-$WORK/smoke/api-ok}" FAKE_HOME_BODY="${FAKE_HOME_BODY:-$WORK/smoke/index-new}"
 		# shellcheck disable=SC2317,SC2329
 		log() { printf '%s\n' "$*"; }
@@ -835,6 +857,19 @@ check "smoke: ... and names /api/repos and its status, not the homepage" \
 out="$(FAKE_API_BODY="$WORK/smoke/api-other" smoke "$new_sha")"
 check "smoke: an API answer without a repositories list is named as such" \
 	contains "$out" "last: /api/repos returned 200 without a repositories list"
+# Dashboard sign-in: the server refuses /api/repos with its own JSON 401,
+# which proves Nginx reaches it as well as the old anonymous list did.
+printf '{"error":"authentication required"}' >"$WORK/smoke/api-signin"
+printf '<html>401 Authorization Required</html>' >"$WORK/smoke/api-foreign-401"
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" smoke "$new_sha")"
+check "smoke: a signed-in server's JSON 401 on /api/repos passes" [ "$out" = "rc=0" ]
+out="$(FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-foreign-401" smoke "$new_sha")"
+check "smoke: a 401 that is not the server's sign-in response fails" \
+	contains "$out" "last: /api/repos returned 401 without the server's sign-in response"
+out="$(FAKE_API_CODE=403 FAKE_API_BODY="$WORK/smoke/api-signin" smoke "$new_sha")"
+check "smoke: a 403 on /api/repos fails" contains "$out" "last: /api/repos returned HTTP 403"
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" FAKE_HOME_CODE=403 smoke "$new_sha")"
+check "smoke: with sign-in, the homepage is still checked" contains "$out" "last: the homepage (/) returned HTTP 403"
 out="$(FAKE_HOME_CODE=403 smoke "$new_sha")"
 check "smoke: a homepage 403 (the incident) fails" exit_code_is "$out" 1
 check "smoke: ... and names the homepage status" contains "$out" "last: the homepage (/) returned HTTP 403"
@@ -846,6 +881,472 @@ check "smoke: a stale homepage fails, naming both checksums" \
 check "smoke: ... after all 10 attempts" contains "$out" "failed 10 times"
 check "smoke: response bodies are never printed" \
 	sh -c '! printf "%s\n" "$1" | grep -q "<html>"' _ "$out"
+
+# API expectations. The server's refusal ends with a newline (Go's JSON
+# encoder); only that exact body is the sign-in refusal.
+printf '{"error":"authentication required"}\n' >"$WORK/smoke/api-signin-nl"
+printf '{"error":"authentication required","detail":"proxy"}' >"$WORK/smoke/api-signin-extra"
+printf '<p>{"error":"authentication required"}</p>' >"$WORK/smoke/api-signin-wrapped"
+out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin-nl" smoke "$new_sha")"
+check "smoke (signin): the server's exact refusal passes" [ "$out" = "rc=0" ]
+out="$(API_EXPECT=signin smoke "$new_sha")"
+check "smoke (signin): an anonymous repository list fails" \
+	contains "$out" "last: /api/repos listed repositories without sign-in (HTTP 200); this server must refuse anonymous requests"
+for body in api-foreign-401 api-signin-extra api-signin-wrapped api-other; do
+	out="$(API_EXPECT=signin FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/$body" smoke "$new_sha")"
+	check "smoke (signin): a 401 with another body ($body) fails" \
+		contains "$out" "last: /api/repos returned 401 without the server's sign-in response"
+done
+out="$(API_EXPECT=signin FAKE_API_CODE=200 FAKE_API_BODY="$WORK/smoke/api-signin" smoke "$new_sha")"
+check "smoke (signin): the refusal's body with HTTP 200 fails" \
+	contains "$out" "last: /api/repos returned 200 without a repositories list"
+out="$(API_EXPECT=signin FAKE_API_CODE=502 smoke "$new_sha")"
+check "smoke (signin): an API failure still names its status" contains "$out" "last: /api/repos returned HTTP 502"
+out="$(API_EXPECT=repos FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" smoke "$new_sha")"
+check "smoke (repos): a refusal from a server that should predate sign-in fails" \
+	contains "$out" "last: /api/repos required sign-in, but the server checked here predates it"
+out="$(API_EXPECT=repos smoke "$new_sha")"
+check "smoke (repos): the repository list passes" [ "$out" = "rc=0" ]
+for body in api-foreign-401 api-signin-extra; do
+	out="$(API_EXPECT=repos FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/$body" smoke "$new_sha")"
+	check "smoke (repos): a 401 with another body ($body) fails" exit_code_is "$out" 1
+done
+for expectation in bogus either unknown ""; do
+	out="$(API_EXPECT="$expectation" smoke "$new_sha")"
+	check "smoke: expectation '$expectation' accepts nothing, not even a repository list" \
+		contains "$out" "unknown API expectation '$expectation'"
+	out="$(API_EXPECT="$expectation" FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" smoke "$new_sha")"
+	check "smoke: expectation '$expectation' does not accept the refusal either" exit_code_is "$out" 1
+done
+
+# What smoke_nginx saw is what rollback will require of the restored server.
+seen_of() {
+	(
+		PATH="$WORK/fakecurl:$PATH"
+		# shellcheck disable=SC2034
+		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 API_EXPECT=repos SIGNIN_REFUSAL="$signin_refusal"
+		export FAKE_API_BODY="$1" FAKE_API_CODE="$2" FAKE_HOME_BODY="$WORK/smoke/index-new"
+		eval "$smoke_functions"
+		smoke_nginx "" || true
+		echo "seen=$SMOKE_API_SEEN"
+	)
+}
+check "smoke: records a repository list as 'repos'" [ "$(seen_of "$WORK/smoke/api-ok" 200)" = "seen=repos" ]
+check "smoke: records the refusal as 'signin'" [ "$(seen_of "$WORK/smoke/api-signin" 401)" = "seen=signin" ]
+check "smoke: records a foreign 401 as nothing" [ "$(seen_of "$WORK/smoke/api-foreign-401" 401)" = "seen=" ]
+
+# ------------------------------------------------ image sign-in label --
+
+# What a server must answer is read from its image's sign-in label, which
+# travels with the image: the running one in preflight, the same one again in
+# rollback, and the new build after the switch. Deployment records play no
+# part, so a missing, stale, garbage or unreadable current-sha changes nothing.
+signin_label_key="$(sed -n 's/^SIGNIN_LABEL=\(.*\)$/\1/p' "$ROOT/deploy/deploy.sh")"
+check "label: deploy.sh names the sign-in label" [ "$signin_label_key" = org.sbomdelta.dashboard-signin ]
+dockerfile_label='LABEL org.sbomdelta.dashboard-signin="required"'
+server_stage="$(awk '/^FROM .* AS server$/ { on = 1; next } /^FROM / { on = 0 } on { print }' "$ROOT/backend/Dockerfile")"
+worker_stage="$(awk '/^FROM .* AS worker$/ { on = 1; next } /^FROM / { on = 0 } on { print }' "$ROOT/backend/Dockerfile")"
+check "label: the server image declares sign-in" grep -qxF -- "$dockerfile_label" <<<"$server_stage"
+check "label: the worker image does not (it serves no API)" sh -c '! printf "%s\n" "$1" | grep -qF "$2"' _ "$worker_stage" "$signin_label_key"
+check "label: the CD workflow looks for exactly the Dockerfile's label" \
+	grep -qF -- "signin_label='$dockerfile_label'" "$ROOT/.github/workflows/cd.yml"
+
+label_function="$(awk '/^image_api_expectation\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+check "label: deploy.sh defines image_api_expectation" grep -q '^image_api_expectation() {$' <<<"$label_function"
+check "label: deploy.sh no longer has a record-based expectation" sh -c '! grep -q "preflight_api_expectation" "$1"' _ "$ROOT/deploy/deploy.sh"
+check "label: current-sha is read only to skip older commits, and written only by the record step" \
+	[ "$(grep -v '^[[:space:]]*#' "$ROOT/deploy/deploy.sh" | grep -c 'current-sha')" -eq 3 ]
+
+# Stand-in docker: image ids map to labels through FAKE_IMAGES
+# ("id=value ...", value "none" for no label, "nolabels" for an image with no
+# labels at all, which docker prints as <no value>); unknown ids fail.
+mkdir -p "$WORK/fakedocker"
+cat >"$WORK/fakedocker/docker" <<'EOF2'
+#!/usr/bin/env bash
+[ "$1 $2 $3" = "image inspect --format" ] || { echo "fake docker: unexpected $*" >&2; exit 2; }
+case "$4" in *'org.sbomdelta.dashboard-signin'*) ;; *) echo "fake docker: unexpected format $4" >&2; exit 2 ;; esac
+for pair in $FAKE_IMAGES; do
+	if [ "${pair%%=*}" = "$5" ]; then
+		case "${pair#*=}" in none) echo "" ;; nolabels) echo "<no value>" ;; *) echo "${pair#*=}" ;; esac
+		exit 0
+	fi
+done
+echo "Error: No such image: $5" >&2
+exit 1
+EOF2
+chmod +x "$WORK/fakedocker/docker"
+# expectation_of <image id> [current-sha state]: image_api_expectation with
+# the stand-in docker, and current-sha in the given state beside it.
+expectation_of() {
+	(
+		PATH="$WORK/fakedocker:$PATH" SIGNIN_LABEL="$signin_label_key"
+		BACKUP_DIR="$WORK/label-backups"
+		rm -rf "$BACKUP_DIR" && mkdir -p "$BACKUP_DIR"
+		case "${2:-missing}" in
+		missing) ;;
+		stale) printf '%s\n' "$(printf 'a%.0s' {1..40})" >"$BACKUP_DIR/current-sha" ;;
+		garbage) printf 'not a commit\n' >"$BACKUP_DIR/current-sha" ;;
+		unreadable) printf '%s\n' "$(printf 'b%.0s' {1..40})" >"$BACKUP_DIR/current-sha"; chmod 000 "$BACKUP_DIR/current-sha" ;;
+		esac
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		eval "$label_function"
+		if out="$(image_api_expectation "$1" 2>&1)"; then echo "$out"; else echo "error: $out"; fi
+	)
+}
+export FAKE_IMAGES="sha256:old=none sha256:bare=nolabels sha256:new=required sha256:odd=optional"
+for state in missing stale garbage unreadable; do
+	check "label ($state current-sha): an image without the label must list repositories" [ "$(expectation_of sha256:old "$state")" = repos ]
+	check "label ($state current-sha): an image with no labels at all must list repositories" [ "$(expectation_of sha256:bare "$state")" = repos ]
+	check "label ($state current-sha): an image with sign-in must refuse anonymous requests" [ "$(expectation_of sha256:new "$state")" = signin ]
+done
+out="$(expectation_of sha256:odd)"
+check "label: an unrecognized label value is an error, never a guess" contains "$out" "error: ERROR: image sha256:odd has an unrecognized org.sbomdelta.dashboard-signin label"
+out="$(expectation_of sha256:gone)"
+check "label: an image that cannot be inspected is an error" contains "$out" "error: ERROR: could not read the labels of image sha256:gone"
+
+# The deploy.sh steps that use it: preflight reads the running image (which
+# rollback restores), the new build must declare sign-in, and the new server
+# is held to that build's label.
+check "label: preflight reads the running server image's label, failing closed" \
+	grep -qxF 'PREVIOUS_API="$(image_api_expectation "$SERVER_OLD_ID")" || die "cannot tell whether the running server image requires sign-in"' "$ROOT/deploy/deploy.sh"
+check "label: preflight's smoke test uses it" \
+	sh -c 'grep -A1 -xF "PREVIOUS_API=\"\$(image_api_expectation \"\$SERVER_OLD_ID\")\" || die \"cannot tell whether the running server image requires sign-in\"" "$1" | grep -qxF "API_EXPECT=\"\$PREVIOUS_API\""' _ "$ROOT/deploy/deploy.sh"
+check "label: rollback expects what the previous image declares, and nothing without it" \
+	grep -qF 'API_EXPECT="${PREVIOUS_API:-unknown}"' <<<"$rollback_function"
+check "label: the new build must declare sign-in before anything is switched" \
+	grep -qxF '[ "$NEW_API" = signin ] || die "the new server image does not declare $SIGNIN_LABEL=required"' "$ROOT/deploy/deploy.sh"
+check "label: the new build is checked before the switchover" \
+	[ "$(grep -n 'die "the new server image does not declare' "$ROOT/deploy/deploy.sh" | cut -d: -f1)" -lt "$(grep -n '^SERVER_SWITCHED=1$' "$ROOT/deploy/deploy.sh" | cut -d: -f1)" ]
+check "label: after the switch the new server is held to its image's expectation" \
+	sh -c 'grep -B1 -F "wait_for_nginx || die \"the new server does not answer through Nginx\"" "$1" | grep -qxF "API_EXPECT=\"\$NEW_API\""' _ "$ROOT/deploy/deploy.sh"
+check "label: the result marker reports the running image's expectation" \
+	grep -qxF 'result deployed "index_sha256=$INDEX_SHA api=$NEW_API"' "$ROOT/deploy/deploy.sh"
+
+# Old and new images through preflight, the switch and rollback, with
+# current-sha in every state. Each phase reads the image's label as deploy.sh
+# does and runs the real smoke test against what that server answers.
+# lifecycle <old image> <old answer> <new image> <new answer> <restored answer> <current-sha state>
+lifecycle() {
+	(
+		PATH="$WORK/fakedocker:$WORK/fakecurl:$PATH" SIGNIN_LABEL="$signin_label_key"
+		# shellcheck disable=SC2034
+		PUBLIC_HOST=sbomdelta.example NGINX_HTTPS_PORT=443 NGINX_HTTPS_IP=127.0.0.1 SIGNIN_REFUSAL="$signin_refusal"
+		export FAKE_HOME_BODY="$WORK/smoke/index-new"
+		# shellcheck disable=SC2317,SC2329
+		log() { :; }
+		# shellcheck disable=SC2317,SC2329
+		sleep() { :; }
+		eval "$smoke_functions"
+		eval "$label_function"
+		answer() { # signin | repos | foreign
+			case "$1" in
+			signin) export FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-signin" ;;
+			repos) export FAKE_API_CODE=200 FAKE_API_BODY="$WORK/smoke/api-ok" ;;
+			foreign) export FAKE_API_CODE=401 FAKE_API_BODY="$WORK/smoke/api-foreign-401" ;;
+			esac
+		}
+		BACKUP_DIR="$WORK/lifecycle-backups"; rm -rf "$BACKUP_DIR"; mkdir -p "$BACKUP_DIR"
+		case "$6" in
+		stale) printf '%s\n' "$(printf 'c%.0s' {1..40})" >"$BACKUP_DIR/current-sha" ;;
+		garbage) printf 'garbage\n' >"$BACKUP_DIR/current-sha" ;;
+		unreadable) printf 'x\n' >"$BACKUP_DIR/current-sha"; chmod 000 "$BACKUP_DIR/current-sha" ;;
+		esac
+		PREVIOUS_API="$(image_api_expectation "$1")" || { echo "preflight=error"; exit 0; }
+		API_EXPECT="$PREVIOUS_API"; answer "$2"
+		if smoke_nginx ""; then pre=pass; else pre=fail; fi
+		NEW_API="$(image_api_expectation "$3")"
+		API_EXPECT="$NEW_API"; answer "$4"
+		if smoke_nginx ""; then post=pass; else post=fail; fi
+		API_EXPECT="${PREVIOUS_API:-unknown}"; answer "$5"
+		if smoke_nginx ""; then rb=pass; else rb=fail; fi
+		echo "preflight=$pre post=$post rollback=$rb"
+	)
+}
+for state in missing stale garbage unreadable; do
+	out="$(lifecycle sha256:old repos sha256:new signin repos "$state")"
+	check "lifecycle ($state): first rollout -- old image lists, new refuses, rollback lists again" [ "$out" = "preflight=pass post=pass rollback=pass" ]
+	out="$(lifecycle sha256:new signin sha256:new signin signin "$state")"
+	check "lifecycle ($state): signed-in release to signed-in release passes throughout" [ "$out" = "preflight=pass post=pass rollback=pass" ]
+	out="$(lifecycle sha256:new repos sha256:new signin signin "$state")"
+	check "lifecycle ($state): a running signed-in image that lists repositories fails preflight" [ "${out%% *}" = "preflight=fail" ]
+	out="$(lifecycle sha256:old repos sha256:new repos repos "$state")"
+	check "lifecycle ($state): a new signed-in image that lists repositories fails after the switch" [ "$(cut -d' ' -f2 <<<"$out")" = "post=fail" ]
+	out="$(lifecycle sha256:new signin sha256:new signin repos "$state")"
+	check "lifecycle ($state): a rollback to a signed-in image that lists repositories fails" [ "${out##* }" = "rollback=fail" ]
+	out="$(lifecycle sha256:old repos sha256:new signin signin "$state")"
+	check "lifecycle ($state): a rollback to an old image that still refuses (not restored) fails" [ "${out##* }" = "rollback=fail" ]
+	out="$(lifecycle sha256:old foreign sha256:new foreign foreign "$state")"
+	check "lifecycle ($state): a foreign 401 passes no phase" [ "$out" = "preflight=fail post=fail rollback=fail" ]
+done
+out="$(lifecycle sha256:gone repos sha256:new signin repos missing)"
+check "lifecycle: a running image that cannot be inspected stops preflight" [ "$out" = "preflight=error" ]
+
+# deploy.sh, the CD workflow and the server's own test must agree on the
+# refusal, or a correct server would fail its smoke tests (or a wrong one pass).
+check "smoke: the CD workflow requires the same refusal" grep -qF -- "refusal='$signin_refusal'" "$ROOT/.github/workflows/cd.yml"
+check "smoke: the CD workflow fails an anonymous repository list" grep -qF -- 'lists repositories without sign-in' "$ROOT/.github/workflows/cd.yml"
+check "smoke: the server's test pins the same refusal" grep -qF -- "got != \`$signin_refusal\`" "$ROOT/backend/internal/api/security_test.go"
+
+# ------------------------------------------------- CD public check --
+
+# The workflow's "Verify the public site" step, run as written against a
+# stand-in curl, a throwaway history with a commit before and after the
+# sign-in label, and every combination of what the instance reported.
+cd_step="$(awk '
+	/^      - name: Verify the public site$/ { found = 1; next }
+	found && /^        run: \|$/ { on = 1; next }
+	on && /^      - name: / { exit }
+	on { sub(/^          /, ""); print }
+' "$ROOT/.github/workflows/cd.yml")"
+check "cd: the workflow's public check can be extracted" grep -q 'Anonymous /api/repos must answer' <<<"$cd_step"
+mkdir -p "$WORK/cdrepo/backend" "$WORK/fakecd"
+git -C "$WORK/cdrepo" init -q
+printf 'FROM alpine AS server\n' >"$WORK/cdrepo/backend/Dockerfile"
+git -C "$WORK/cdrepo" add backend && git -C "$WORK/cdrepo" commit -q -m before-signin
+cd_old="$(git -C "$WORK/cdrepo" rev-parse HEAD)"
+printf 'FROM alpine AS server\n%s\n' "$dockerfile_label" >"$WORK/cdrepo/backend/Dockerfile"
+git -C "$WORK/cdrepo" commit -q -am signin
+cd_new="$(git -C "$WORK/cdrepo" rev-parse HEAD)"
+cat >"$WORK/fakecd/curl" <<'EOF2'
+#!/usr/bin/env bash
+out="" url=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-o) out="$2"; shift 2 ;;
+	-w | --max-time) shift 2 ;;
+	-*) shift ;;
+	*) url="$1"; shift ;;
+	esac
+done
+case "$url" in
+*/api/repos) cat "$CD_API_BODY" >"$out"; printf '%s' "$CD_API_CODE" ;;
+*/) cat "$CD_HOME_BODY" ;;
+esac
+EOF2
+printf '#!/bin/sh\nexit 0\n' >"$WORK/fakecd/sleep"
+chmod +x "$WORK/fakecd/curl" "$WORK/fakecd/sleep"
+printf '%s\n' "$cd_step" >"$WORK/cd-step.sh"
+# cd_check <result> <commit> <api reported> <answer: signin|repos|foreign> [index matches 1|0]
+cd_check() {
+	local code=200 body="$WORK/smoke/api-ok"
+	case "$4" in
+	signin) code=401 body="$WORK/smoke/api-signin-nl" ;;
+	foreign) code=401 body="$WORK/smoke/api-foreign-401" ;;
+	esac
+	local index_sha="$new_sha"
+	[ "${5:-1}" = 1 ] || index_sha="$old_sha"
+	(
+		cd "$WORK/cdrepo" &&
+			PATH="$WORK/fakecd:$PATH" PUBLIC_URL=https://sbomdelta.example RESULT="$1" SHA="$2" API="$3" \
+				INDEX_SHA="$index_sha" CD_API_CODE="$code" CD_API_BODY="$body" CD_HOME_BODY="$WORK/smoke/index-new" \
+				bash "$WORK/cd-step.sh"
+	) 2>&1 && echo rc=0 || echo rc=1
+}
+out="$(cd_check deployed "$cd_old" "" repos)"
+check "cd: an older commit (no api reported) that lists repositories passes" exit_code_is "$out" 0
+check "cd: ... expecting a repository list from its Dockerfile" contains "$out" "must answer: repos"
+out="$(cd_check deployed "$cd_old" repos repos)"
+check "cd: an older commit reported as listing repositories passes" exit_code_is "$out" 0
+out="$(cd_check deployed "$cd_old" "" signin)"
+check "cd: an older commit whose site refuses anonymous requests fails (not what was deployed)" exit_code_is "$out" 1
+out="$(cd_check deployed "$cd_new" signin signin)"
+check "cd: a signed-in release that refuses anonymous requests passes" exit_code_is "$out" 0
+out="$(cd_check deployed "$cd_new" "" signin)"
+check "cd: a signed-in commit is held to the refusal even without a reported api" exit_code_is "$out" 0
+out="$(cd_check deployed "$cd_new" signin repos)"
+check "cd: a signed-in release that lists repositories fails at once" \
+	sh -c 'printf "%s\n" "$1" | grep -q "rc=1" && printf "%s\n" "$1" | grep -q "lists repositories without sign-in" && ! printf "%s\n" "$1" | grep -q "attempt 2"' _ "$out"
+out="$(cd_check deployed "$cd_new" "" repos)"
+check "cd: a signed-in commit without a reported api that lists repositories fails" exit_code_is "$out" 1
+out="$(cd_check deployed "$cd_new" repos repos)"
+check "cd: an instance report that contradicts the commit's Dockerfile fails" \
+	sh -c 'printf "%s\n" "$1" | grep -q "rc=1" && printf "%s\n" "$1" | grep -q "Dockerfile builds one that answers"' _ "$out"
+out="$(cd_check deployed "$cd_old" signin signin)"
+check "cd: ... in either direction" exit_code_is "$out" 1
+out="$(cd_check deployed "$cd_new" signin foreign)"
+check "cd: a foreign 401 fails a signed-in release" exit_code_is "$out" 1
+out="$(cd_check deployed "$cd_old" "" foreign)"
+check "cd: a foreign 401 fails an older release" exit_code_is "$out" 1
+out="$(cd_check deployed "$cd_new" signin signin 0)"
+check "cd: a stale homepage still fails" exit_code_is "$out" 1
+for answer in signin repos; do
+	out="$(cd_check skipped-older "$cd_new" "" "$answer")"
+	check "cd: skipped-older (nothing deployed) accepts a real server's answer ($answer)" exit_code_is "$out" 0
+done
+out="$(cd_check skipped-older "$cd_new" "" foreign)"
+check "cd: skipped-older still fails a foreign 401" exit_code_is "$out" 1
+out="$(cd_check bogus "$cd_new" "" signin)"
+check "cd: an unexpected result fails" exit_code_is "$out" 1
+
+# ------------------------------------------------- configuration hash --
+
+# Preflight refuses a service whose running configuration differs from what
+# the production Compose file resolves to now. The documented way to change
+# the configuration is to recreate the service on its current image first,
+# which makes the two hashes equal; the check itself stays as strict.
+config_hash_function="$(awk '/^check_config_hash\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+check "config hash: deploy.sh defines check_config_hash" grep -q '^check_config_hash() {$' <<<"$config_hash_function"
+check "config hash: preflight runs it on the server (and worker) and stops on failure" \
+	grep -qx 'check_config_hash "${hash_services\[@\]}" || exit 1' "$ROOT/deploy/deploy.sh"
+config_hash_case() { # <running hash> <hash Compose resolves>
+	(
+		RUNNING="$1" WANTED="$2"
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		# shellcheck disable=SC2317,SC2329
+		container_for() { echo "cid-$1"; }
+		# shellcheck disable=SC2317,SC2329
+		docker() {
+			case "$1" in
+			compose) echo 2.30.0 ;;
+			inspect) case "$3" in *config-hash*) echo "$RUNNING" ;; *) echo 2.30.0 ;; esac ;;
+			esac
+		}
+		# shellcheck disable=SC2317,SC2329
+		compose() { [ "$1 $2" = "config --hash" ] && [ -n "$WANTED" ] && echo "$3 $WANTED"; }
+		eval "$config_hash_function"
+		if check_config_hash server; then echo rc=0; else echo rc=1; fi
+	)
+}
+out="$(config_hash_case old-config old-config)"
+check "config hash: an unchanged configuration passes" exit_code_is "$out" 0
+out="$(config_hash_case old-config with-signin)"
+check "config hash: settings added to the Compose file but not applied stop preflight" exit_code_is "$out" 1
+check "config hash: ... and point at the documented procedure" \
+	contains "$out" 'apply the change on the current image first (deploy/README.md, "Changing the production configuration")'
+out="$(config_hash_case with-signin with-signin)"
+check "config hash: once applied on the current image, the same settings pass" exit_code_is "$out" 0
+out="$(config_hash_case old-config "")"
+check "config hash: a Compose file that cannot be hashed stops preflight" exit_code_is "$out" 1
+
+# The documented procedure must be what this check needs and nothing more:
+# the same Compose file and project as deploy.sh, recreating only the server
+# on its current image, then the same Nginx reload deploy.sh uses.
+readme="$ROOT/deploy/README.md"
+check "config docs: deploy.sh's pointer names a README section that exists" \
+	grep -qx '## Changing the production configuration' "$readme"
+apply_block="$(awk '/<!-- config-apply:end -->/ { on = 0 } on { print } /<!-- config-apply:begin -->/ { on = 1 }' "$readme")"
+check "config docs: the procedure is marked in the README" [ -n "$apply_block" ]
+check "config docs: it uses the production Compose file and project, as deploy.sh's compose() does" \
+	sh -c 'printf "%s\n" "$1" | grep -qF -- "docker compose --project-directory . -f docker-compose.yml -p \$P" &&
+		grep -qF -- "docker compose --project-directory \"\$PROD_DIR\" -f \"\$PROD_COMPOSE_FILE\" -p \"\$PROJECT\"" "$2"' _ "$apply_block" "$ROOT/deploy/deploy.sh"
+check "config docs: it recreates only the server, without building" \
+	sh -c 'printf "%s\n" "$1" | grep -qx "\$C up -d --no-deps --no-build server"' _ "$apply_block"
+check "config docs: it is the same recreate command deploy.sh uses for the server" \
+	grep -qF -- 'compose up -d --no-deps --no-build "$SERVER_SERVICE"' "$ROOT/deploy/deploy.sh"
+check "config docs: it confirms the image name still means the running image" \
+	sh -c 'printf "%s\n" "$1" | grep -qF "docker image inspect --format" && printf "%s\n" "$1" | grep -qF "STOP:"' _ "$apply_block"
+check "config docs: it reloads Nginx only after nginx -t, as deploy.sh does" \
+	sh -c 'printf "%s\n" "$1" | grep -qF "docker exec sbomdelta-nginx nginx -t && docker exec sbomdelta-nginx nginx -s reload"' _ "$apply_block"
+check "config docs: it builds, recreates nothing else, and never force-recreates" \
+	sh -c '! printf "%s\n" "$1" | grep -qE -- "--build( |$)|--force-recreate|--remove-orphans| up -d *$"' _ "$apply_block"
+printf '%s\n' "$apply_block" | sed '/^```/d' >"$WORK/config-apply.sh"
+check "config docs: the procedure passes the destructive-command guard" "$ROOT/deploy/tests/check-destructive.sh" "$WORK/config-apply.sh"
+check "config docs: the procedure is valid bash" bash -n "$WORK/config-apply.sh"
+
+# Every in-page link in the deployment README must reach a heading.
+anchors="$(grep -E '^#{1,6} ' "$readme" | sed -E 's/^#+ //' | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9 -]//g; s/ /-/g')"
+missing_anchors=""
+while IFS= read -r link; do
+	grep -qx -- "$link" <<<"$anchors" || missing_anchors="$missing_anchors $link"
+done < <(grep -oE '\]\(#[^)]+\)' "$readme" | sed -E 's/^\]\(#//; s/\)$//' | sort -u)
+check "config docs: every in-page README link resolves${missing_anchors:+ (missing:$missing_anchors)}" [ -z "$missing_anchors" ]
+
+# ------------------------------------------------- sign-in settings --
+
+# Preflight checks, inside the running server container and as its user, that
+# the new server will have what it needs to start. Here the same script runs
+# against real files, with a stand-in `docker exec` that runs it locally.
+signin_script="$(awk '/^SIGNIN_CHECK_SCRIPT=.$/ { on = 1 } on { print } on && /^.$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+signin_function="$(awk '/^check_signin_settings\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
+check "sign-in check: deploy.sh defines the script and check_signin_settings" \
+	sh -c '[ -n "$1" ] && printf "%s\n" "$2" | grep -q "^check_signin_settings() {$"' _ "$signin_script" "$signin_function"
+check "sign-in check: preflight runs it against the server container and the public origin" \
+	grep -qx 'check_signin_settings "$SERVER_CID" "https://$PUBLIC_HOST" || exit 1' "$ROOT/deploy/deploy.sh"
+SECRET_VALUE="s3cr3t-client-value-0123456789"
+mkdir -p "$WORK/signin"
+printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/secret"
+chmod 0400 "$WORK/signin/secret"
+printf '  \n' >"$WORK/signin/blank"
+mkdir -p "$WORK/signin/dir"
+printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/open-write"
+chmod 0666 "$WORK/signin/open-write"
+printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/open-read"
+chmod 0644 "$WORK/signin/open-read"
+printf '%s\n' "$SECRET_VALUE" >"$WORK/signin/locked"
+chmod 0000 "$WORK/signin/locked"
+GOOD_ENV=(GITHUB_CLIENT_ID=Iv1.clientid0001 ALLOWED_GITHUB_LOGINS=alice,bob
+	PUBLIC_URL=https://sbomdelta.website GITHUB_CLIENT_SECRET_PATH="$WORK/signin/secret")
+# signin_case <docker exec works 0|1> <env assignments...>
+signin_case() {
+	local works="$1"
+	shift
+	(
+		CASE_ENV=("$@")
+		# shellcheck disable=SC2317,SC2329
+		log() { printf '%s\n' "$*"; }
+		# shellcheck disable=SC2317,SC2329
+		docker() {
+			[ "$works" = 1 ] || return 1
+			[ "$1" = exec ] || return 99
+			shift 2
+			# (bash 3.2 treats an empty array as unset under set -u)
+			env -i PATH="$PATH" ${CASE_ENV[@]+"${CASE_ENV[@]}"} "$@"
+		}
+		eval "$signin_script"
+		eval "$signin_function"
+		if check_signin_settings cid-server https://sbomdelta.website; then echo rc=0; else echo rc=1; fi
+	) 2>&1
+}
+no_secret_printed() { ! grep -qF -- "$SECRET_VALUE" <<<"$1" && ! grep -qF -- Iv1.clientid0001 <<<"$1" && ! grep -qF -- alice <<<"$1"; }
+
+out="$(signin_case 1 "${GOOD_ENV[@]}")"
+check "sign-in check: complete settings and a readable 0400 secret pass" exit_code_is "$out" 0
+check "sign-in check: ... reporting the secret readable by the server user" contains "$out" "ok: client secret file $WORK/signin/secret is readable by the server user"
+check "sign-in check: ... and print no secret, client ID or login" no_secret_printed "$out"
+out="$(signin_case 1 "${GOOD_ENV[@]}" PUBLIC_URL=https://sbomdelta.website/)"
+check "sign-in check: PUBLIC_URL with a trailing slash passes" exit_code_is "$out" 0
+out="$(signin_case 1)"
+check "sign-in check: no settings at all fail" exit_code_is "$out" 1
+for name in GITHUB_CLIENT_ID ALLOWED_GITHUB_LOGINS PUBLIC_URL; do
+	check "sign-in check: ... naming $name" contains "$out" "ERROR: $name is not set"
+done
+check "sign-in check: ... and the missing secret" contains "$out" "ERROR: neither GITHUB_CLIENT_SECRET_PATH nor GITHUB_CLIENT_SECRET is set"
+check "sign-in check: ... and point at the documented procedure" contains "$out" '"Changing the production configuration"'
+out="$(signin_case 1 "${GOOD_ENV[@]}" PUBLIC_URL=https://staging.example)"
+check "sign-in check: a PUBLIC_URL for another origin fails, naming the expected one" contains "$out" "ERROR: PUBLIC_URL is not https://sbomdelta.website"
+check "sign-in check: ... without printing the configured value" sh -c '! printf "%s" "$1" | grep -q staging.example' _ "$out"
+out="$(signin_case 1 "${GOOD_ENV[@]}" AUTH_DISABLED=true)"
+check "sign-in check: AUTH_DISABLED fails" contains "$out" "ERROR: AUTH_DISABLED is set"
+out="$(signin_case 1 "${GOOD_ENV[@]}" AUTH_DISABLED=false)"
+check "sign-in check: AUTH_DISABLED=false passes" exit_code_is "$out" 0
+out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/nope")"
+check "sign-in check: a missing secret file fails" contains "$out" "does not exist in the server container"
+out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/dir")"
+check "sign-in check: a directory instead of a file fails" contains "$out" "is not a regular file"
+out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/blank")"
+check "sign-in check: a blank secret file fails" contains "$out" "is empty"
+out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/open-write")"
+check "sign-in check: a world-writable secret file fails" contains "$out" "is writable by everyone"
+check "sign-in check: ... and is still not printed" no_secret_printed "$out"
+out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/open-read")"
+check "sign-in check: a world-readable secret file passes with a warning" \
+	sh -c 'printf "%s\n" "$1" | grep -q "rc=0" && printf "%s\n" "$1" | grep -q "WARNING: .* readable by everyone"' _ "$out"
+if [ "$(id -u)" -ne 0 ]; then
+	out="$(signin_case 1 "${GOOD_ENV[@]}" GITHUB_CLIENT_SECRET_PATH="$WORK/signin/locked")"
+	check "sign-in check: a secret file the server user cannot read fails, naming the uid" \
+		contains "$out" "is not readable by the server user (uid $(id -u))"
+else
+	echo "skip sign-in check: unreadable secret file (root reads any file)"
+fi
+out="$(signin_case 1 GITHUB_CLIENT_ID=Iv1.clientid0001 ALLOWED_GITHUB_LOGINS=alice PUBLIC_URL=https://sbomdelta.website GITHUB_CLIENT_SECRET="$SECRET_VALUE")"
+check "sign-in check: an inline secret passes without being printed" \
+	sh -c 'printf "%s\n" "$1" | grep -q "rc=0" && printf "%s\n" "$1" | grep -q "client secret given inline"' _ "$out"
+check "sign-in check: ... and the inline secret is not printed" no_secret_printed "$out"
+out="$(signin_case 0 "${GOOD_ENV[@]}")"
+check "sign-in check: a failing docker exec fails, never passes silently" \
+	sh -c 'printf "%s\n" "$1" | grep -q "rc=1" && printf "%s\n" "$1" | grep -q "could not check the dashboard sign-in settings"' _ "$out"
 
 # ------------------------------------------------------- worker image --
 

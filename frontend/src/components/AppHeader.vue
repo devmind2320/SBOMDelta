@@ -1,6 +1,25 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { RouterLink } from 'vue-router'
+import { RouterLink, useRouter } from 'vue-router'
+import { useSession } from '../composables/useSession.js'
+import { signOutErrorMessage } from '../lib/auth.js'
+
+const { user, signOut } = useSession()
+const router = useRouter()
+const signOutError = ref('')
+
+// Only a sign-out the server confirmed leaves the page. A failed one stays
+// here and says so: the session is still valid.
+async function onSignOut() {
+  signOutError.value = ''
+  try {
+    await signOut()
+  } catch (error) {
+    signOutError.value = signOutErrorMessage(error)
+    return
+  }
+  router.push({ name: 'login', query: { signed_out: '1' } })
+}
 
 // "system" leaves only prefers-color-scheme in play; the explicit modes stamp
 // data-theme on the root element, which the token blocks in style.css honour
@@ -38,7 +57,7 @@ onMounted(() => {
 
 <template>
   <header class="border-b border-hairline bg-surface">
-    <div class="mx-auto flex w-full max-w-[1200px] items-center gap-4 px-4 py-3 sm:px-6">
+    <div class="mx-auto flex w-full max-w-[1200px] flex-wrap items-center gap-4 px-4 py-3 sm:px-6">
       <RouterLink
         :to="{ name: 'repositories' }"
         class="flex items-center gap-2 text-ink no-underline"
@@ -63,9 +82,22 @@ onMounted(() => {
         Dependency drift across your repositories
       </span>
 
+      <span v-if="user" class="ml-auto text-xs text-ink-muted">{{ user.login }}</span>
+      <button
+        v-if="user && !user.authDisabled"
+        type="button"
+        class="cursor-pointer rounded-md border border-hairline bg-surface-raised px-2.5 py-1.5 text-xs text-ink-secondary"
+        @click="onSignOut"
+      >
+        Sign out
+      </button>
+      <span v-if="signOutError" role="alert" class="basis-full text-right text-xs text-ink-secondary">
+        {{ signOutError }}
+      </span>
       <button
         type="button"
-        class="ml-auto cursor-pointer rounded-md border border-hairline bg-surface-raised px-2.5 py-1.5 text-xs text-ink-secondary capitalize"
+        class="cursor-pointer rounded-md border border-hairline bg-surface-raised px-2.5 py-1.5 text-xs text-ink-secondary capitalize"
+        :class="{ 'ml-auto': !user }"
         :aria-label="`Theme: ${theme}. Click to change.`"
         @click="cycle"
       >

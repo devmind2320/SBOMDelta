@@ -31,6 +31,23 @@ const vulnerabilities = useAsyncData(
   { watch: [scanId] },
 )
 
+// The download is a plain navigation, which an expired session would turn
+// into a page of raw JSON. Check the session first: a 401 or 403 goes to the
+// sign-in page like any other request, and comes back here afterwards.
+async function downloadSbom(event) {
+  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+    return
+  }
+  event.preventDefault()
+  const href = event.currentTarget.href
+  try {
+    await api.checkSession()
+  } catch (error) {
+    if (error?.status === 401 || error?.status === 403) return
+  }
+  window.location.assign(href)
+}
+
 // A pending or running scan is a moving target, so poll until it settles
 // rather than making the reader refresh. The composable holds the previous
 // render during each refetch, so nothing flickers.
@@ -153,6 +170,7 @@ const isBaseline = computed(
             v-if="scan.data.value.sbomLocation"
             :href="api.sbomDownloadUrl(scan.data.value.id)"
             class="rounded-md border border-hairline bg-surface-raised px-2.5 py-1 text-xs text-ink-secondary no-underline"
+            @click="downloadSbom"
           >
             Download SBOM
           </a>

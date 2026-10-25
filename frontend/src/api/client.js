@@ -1,7 +1,25 @@
 // Thin wrapper over fetch. Every call funnels through request() so that error
 // shape, JSON parsing, and abort handling are defined exactly once.
 
+// The API must be on the dashboard's own origin: the session cookie is
+// same-site only and the API sends no CORS headers. A base is useful only for
+// a path prefix, never for another host.
 const BASE = import.meta.env.VITE_API_BASE ?? ''
+
+// Must match auth.CSRFHeader on the server. Every state-changing request
+// carries it; a cross-site form or script cannot.
+export const CSRF_HEADER = 'X-SBOMDelta-Request'
+
+let onUnauthenticated = () => {}
+
+/**
+ * Registers what to do when a request finds no usable session. The handler
+ * gets 'signed_out' (401: missing or expired) or 'not_allowed' (403 on a read:
+ * the account was removed from the allowlist).
+ */
+export function setUnauthenticatedHandler(handler) {
+  onUnauthenticated = handler
+}
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -11,12 +29,18 @@ export class ApiError extends Error {
   }
 }
 
-async function request(path, { signal } = {}) {
+// notify: false leaves a 401 or 403 to the caller instead of the handler; the
+// session check itself uses it, since its answer is what decides the route.
+async function request(path, { signal, method = 'GET', notify = true } = {}) {
+  const headers = { Accept: 'application/json' }
+  if (method !== 'GET') headers[CSRF_HEADER] = '1'
   let response
   try {
     response = await fetch(`${BASE}${path}`, {
       signal,
-      headers: { Accept: 'application/json' },
+      method,
+      headers,
+      credentials: 'same-origin',
     })
   } catch (cause) {
     // An aborted request is a normal consequence of navigating away; let the
@@ -35,13 +59,25 @@ async function request(path, { signal } = {}) {
     } catch {
       /* keep the status-based message */
     }
+    // A 403 on a state-changing request is the CSRF check, not the session.
+    if (notify && response.status === 401) onUnauthenticated('signed_out')
+    if (notify && response.status === 403 && method === 'GET') onUnauthenticated('not_allowed')
     throw new ApiError(detail, response.status)
   }
 
+  if (response.status === 204) return null
   return response.json()
 }
 
 export const api = {
+  /** The signed-in user, or an ApiError: 401 signed out, 403 not allowed. */
+  me: (options) => request('/api/me', { ...options, notify: false }),
+
+  /** Like me(), but a missing session is handled like any other request's. */
+  checkSession: (options) => request('/api/me', options),
+
+  logout: () => request('/api/auth/logout', { method: 'POST', notify: false }),
+
   // access is 'active' (the API default), 'inactive' or 'all'. Inactive
   // repositories are ones SBOMDelta lost access to; their history is kept.
   listRepositories: ({ access = 'active', ...options } = {}) =>

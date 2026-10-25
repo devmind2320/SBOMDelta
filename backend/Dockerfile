@@ -17,6 +17,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/serve
 # git is here only for `git ls-remote`, which resolves a branch or tag to a
 # commit before a manual scan is queued. Cloning still happens on the worker.
 FROM alpine:3.21 AS server
+# Deployment reads this to know how the server answers an anonymous API
+# request: with the sign-in refusal (401), not data. deploy/deploy.sh holds a
+# running, rolled-back or new server to what its own image declares, so remove
+# it only together with dashboard sign-in itself.
+LABEL org.sbomdelta.dashboard-signin="required"
 RUN apk add --no-cache ca-certificates git && adduser -D -u 10001 sbomdelta
 COPY --from=build /out/server /usr/local/bin/server
 USER sbomdelta
