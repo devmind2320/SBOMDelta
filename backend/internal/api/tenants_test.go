@@ -2,11 +2,13 @@ package api_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +136,8 @@ func TestTenantsSeeAndActOnlyOnTheirOwnRepositories(t *testing.T) {
 			"/api/scans/" + scan + "/vulnerability-changes",
 			"/api/scans/" + scan + "/risk",
 			"/api/scans/" + scan + "/sbom",
+			"/api/scans/" + scan + "/report?format=csv",
+			"/api/scans/" + scan + "/report?format=pdf",
 			"/api/me/scans?repositoryId=" + repo,
 		} {
 			if status, body := f.as(t, me.session, http.MethodGet, path); status != http.StatusNotFound || strings.Contains(body, other.repo.Name) {
@@ -187,5 +191,60 @@ func TestNewUserWithoutAnInstallationSeesNothing(t *testing.T) {
 	}
 	if status, _ := f.as(t, newcomer, http.MethodPost, "/api/repos/"+jsonID(alice.repo.ID)+"/scans"); status != http.StatusNotFound {
 		t.Errorf("newcomer scanning alice's repository = %d, want 404", status)
+	}
+}
+
+// Each user downloads the SBOM report of their own scan, as CSV or PDF, as an
+// attachment no shared cache keeps. It names their repository and component,
+// and nothing of the other user's.
+func TestTenantsDownloadOnlyTheirOwnReports(t *testing.T) {
+	f, alice, bob := newTenants(t)
+
+	for _, pair := range [][2]tenant{{alice, bob}, {bob, alice}} {
+		me, other := pair[0], pair[1]
+		for _, format := range []struct{ name, contentType, magic string }{
+			{"csv", "text/csv; charset=utf-8", "name,version,ecosystem"},
+			{"pdf", "application/pdf", "%PDF-1.4"},
+		} {
+			request := httptest.NewRequest(http.MethodGet, "/api/scans/"+jsonID(me.scan.ID)+"/report?format="+format.name, nil)
+			request.AddCookie(me.session)
+			recorder := httptest.NewRecorder()
+			f.handler.ServeHTTP(recorder, request)
+			body := recorder.Body.String()
+
+			if recorder.Code != http.StatusOK || !strings.HasPrefix(body, format.magic) {
+				t.Fatalf("%s %s report = %d %.40q, want 200 and a %s file", me.login, format.name, recorder.Code, body, format.name)
+			}
+			header := recorder.Header()
+			wantName := fmt.Sprintf(`attachment; filename="sbomdelta-%s-%s.%s"`, me.repo.Name, me.scan.CommitSHA[:7], format.name)
+			if header.Get("Content-Type") != format.contentType || header.Get("Content-Disposition") != wantName ||
+				header.Get("Cache-Control") != "private, no-store" || header.Get("Content-Length") != strconv.Itoa(len(body)) {
+				t.Errorf("%s %s report headers = %v", me.login, format.name, header)
+			}
+			if !strings.Contains(body, "lodash") || (format.name == "pdf" && !strings.Contains(body, me.login+"/"+me.repo.Name)) {
+				t.Errorf("%s %s report does not show their own scan", me.login, format.name)
+			}
+			if strings.Contains(body, other.repo.Name) || strings.Contains(body, other.scan.CommitSHA) {
+				t.Errorf("%s %s report leaks %s's repository", me.login, format.name, other.login)
+			}
+		}
+	}
+
+	for _, format := range []string{"", "json", "PDF", "../pdf"} {
+		status, body := f.as(t, alice.session, http.MethodGet, "/api/scans/"+jsonID(alice.scan.ID)+"/report?format="+url.QueryEscape(format))
+		if status != http.StatusBadRequest || !strings.Contains(body, "format must be csv or pdf") {
+			t.Errorf("report format %q = %d %s, want 400", format, status, body)
+		}
+	}
+
+	// A scan still running has nothing to report yet.
+	pending, err := f.db.CreateScan(context.Background(), models.Scan{
+		RepositoryID: alice.repo.ID, CommitSHA: strings.Repeat("9", 40), Trigger: models.TriggerManual,
+	})
+	if err != nil {
+		t.Fatalf("CreateScan() error = %v", err)
+	}
+	if status, body := f.as(t, alice.session, http.MethodGet, "/api/scans/"+jsonID(pending.ID)+"/report?format=pdf"); status != http.StatusConflict {
+		t.Errorf("report of a pending scan = %d %s, want 409", status, body)
 	}
 }

@@ -156,5 +156,5 @@ export const api = {
       summary: body.summary ?? null,
     })),
 
-  sbomDownloadUrl: (id) => `${BASE}/api/scans/${id}/sbom`,
+  reportDownloadUrl: (id, format) => `${BASE}/api/scans/${id}/report?format=${encodeURIComponent(format)}`,
 }

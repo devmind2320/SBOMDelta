@@ -365,6 +365,7 @@ gets through to its own data. State-changing requests must also send
 | `GET` | `/api/scans/{id}/vulnerability-changes` | Advisories introduced and resolved against the base scan |
 | `GET` | `/api/scans/{id}/risk` | Risk score with factors and method, or why it is not scored |
 | `GET` | `/api/scans/{id}/sbom` | Redirect to a presigned SBOM download |
+| `GET` | `/api/scans/{id}/report?format=csv\|pdf` | The scan's SBOM report as a file: CSV, one row per component, or a PDF summary |
 
 Every `/api/repos/…`, `/api/scans/…` and `/api/pulls/…` route answers `404` for a
 repository outside the signed-in user's list from GitHub, exactly as for one that does not
@@ -398,6 +399,7 @@ backend/
 │   ├── models/          Persisted domain types
 │   ├── osv/             OSV.dev client, CVSS v3 scoring, fix selection
 │   ├── queue/           Postgres job queue (SKIP LOCKED)
+│   ├── report/          SBOM report downloads, as CSV and PDF
 │   ├── risk/            Deterministic risk model and finding comparison
 │   ├── sbom/            Clone, syft, CycloneDX normalization
 │   ├── scanner/         The end-to-end scan pipeline

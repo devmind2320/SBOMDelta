@@ -10,6 +10,7 @@ import LoadingState from '../components/LoadingState.vue'
 import PageHeader from '../components/PageHeader.vue'
 import ComponentTable from '../components/ComponentTable.vue'
 import DataCard from '../components/DataCard.vue'
+import DownloadReportMenu from '../components/DownloadReportMenu.vue'
 import DriftList from '../components/DriftList.vue'
 import ErrorState from '../components/ErrorState.vue'
 import LicenseMatrix from '../components/LicenseMatrix.vue'
@@ -51,23 +52,6 @@ watch(
     }
   },
 )
-
-// The download is a plain navigation, which an expired session would turn
-// into a page of raw JSON. Check the session first: a 401 or 403 goes to the
-// sign-in page like any other request, and comes back here afterwards.
-async function downloadSbom(event) {
-  if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
-    return
-  }
-  event.preventDefault()
-  const href = event.currentTarget.href
-  try {
-    await api.checkSession()
-  } catch (error) {
-    if (error?.status === 401 || error?.status === 403) return
-  }
-  window.location.assign(href)
-}
 
 // A pending or running scan is a moving target, so poll until it settles
 // rather than making the reader refresh -- and keep polling briefly after it
@@ -166,15 +150,7 @@ const isBaseline = computed(
           </span>
         </template>
         <template #actions>
-          <a
-            v-if="scan.data.value.sbomLocation"
-            :href="api.sbomDownloadUrl(scan.data.value.id)"
-            class="btn btn-secondary"
-            @click="downloadSbom"
-          >
-            <AppIcon name="download" :size="14" />
-            Download SBOM
-          </a>
+          <DownloadReportMenu v-if="scan.data.value.status === 'completed'" :scan-id="scan.data.value.id" />
         </template>
       </PageHeader>
 
