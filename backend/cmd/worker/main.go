@@ -96,13 +96,13 @@ func run(logger *slog.Logger) error {
 	var reconciler *ghapp.Reconciler
 	var initial *ghapp.InitialScanner
 	if app != nil {
-		reconciler = ghapp.NewReconciler(app, db, jobs, logger)
+		reconciler = ghapp.NewReconciler(app, cfg.GitHub.AllowedInstallationAccounts, db, jobs, logger)
 		initial = ghapp.NewInitialScanner(app, db, jobs, logger)
 		// A webhook missed while nothing was listening is never redelivered
 		// once GitHub stops retrying, so re-read every installation's
 		// repository list each time a worker starts. Reconciliation also
 		// queues initial scans for repositories that have never been scanned.
-		if err := enqueueReconciliation(ctx, db, jobs, logger); err != nil {
+		if err := reconciler.EnqueueStartup(ctx); err != nil {
 			return err
 		}
 	}
@@ -131,21 +131,6 @@ func enqueueEnrichment(ctx context.Context, db *storage.DB, jobs *queue.Queue, l
 		}
 	}
 	logger.Info("queued vulnerability analysis for unanalyzed scans", "scans", queued)
-	return nil
-}
-
-func enqueueReconciliation(ctx context.Context, db *storage.DB, jobs *queue.Queue, logger *slog.Logger) error {
-	installations, err := db.ListUsableInstallations(ctx)
-	if err != nil {
-		return err
-	}
-	for _, id := range installations {
-		if _, err := jobs.Enqueue(ctx, queue.KindReconcileInstallation,
-			queue.ReconcileInstallationPayload{GitHubInstallationID: id}, ""); err != nil {
-			return err
-		}
-	}
-	logger.Info("queued startup repository reconciliation", "installations", len(installations))
 	return nil
 }
 

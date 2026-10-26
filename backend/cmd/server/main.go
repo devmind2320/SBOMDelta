@@ -65,7 +65,7 @@ func run(logger *slog.Logger) error {
 			http.Error(w, "GitHub integration is disabled for local development", http.StatusServiceUnavailable)
 		})
 	} else {
-		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, db, jobs, logger)
+		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.AllowedInstallationAccounts, db, jobs, logger)
 		// A scan request resolves the default branch head as the installation,
 		// as initial scans do on the worker, then queues the usual scan job.
 		scans = ghapp.NewManualScanner(ghapp.NewApp(cfg.GitHub), db, jobs, logger)

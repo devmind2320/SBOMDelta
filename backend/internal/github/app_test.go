@@ -238,3 +238,39 @@ func TestDefaultBranchHeadCancelled(t *testing.T) {
 		t.Errorf("DefaultBranchHead() error = %v, want a retryable error", err)
 	}
 }
+
+// The installation's account comes from GET /app/installations/{id}, signed
+// with the App's JWT, as GitHub's numeric ID. A refusal or an answer with no
+// account is an error, never an account ID of zero that could be stored.
+func TestInstallationAccountID(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			t.Errorf("%s was not signed with the app JWT", r.URL.Path)
+		}
+		switch r.URL.Path {
+		case "/app/installations/77":
+			_, _ = fmt.Fprint(w, `{"id":77,"account":{"login":"acme","id":9901,"type":"Organization"}}`)
+		case "/app/installations/78":
+			_, _ = fmt.Fprint(w, `{"id":78}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	app := NewApp(config.GitHub{AppID: 1, PrivateKey: keyPEM, APIBaseURL: server.URL + "/"})
+
+	if got, err := app.InstallationAccountID(context.Background(), 77); err != nil || got != 9901 {
+		t.Errorf("InstallationAccountID(77) = %d, %v; want 9901", got, err)
+	}
+	for _, id := range []int64{78, 79} {
+		if got, err := app.InstallationAccountID(context.Background(), id); err == nil {
+			t.Errorf("InstallationAccountID(%d) = %d, want an error", id, got)
+		}
+	}
+}

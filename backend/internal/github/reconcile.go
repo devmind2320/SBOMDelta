@@ -18,6 +18,7 @@ import (
 // satisfies it; tests substitute a fixed list.
 type RepositoryLister interface {
 	ListInstallationRepositories(ctx context.Context, installationID int64) ([]*gh.Repository, error)
+	InstallationAccountID(ctx context.Context, installationID int64) (int64, error)
 }
 
 // Reconciler brings stored repository access in line with what GitHub says an
@@ -27,15 +28,48 @@ type RepositoryLister interface {
 // empty repository list, a removal can be delivered while the server is down,
 // and nothing is ever redelivered after GitHub gives up retrying. Asking
 // GitHub directly is the only source of truth that cannot drift.
+//
+// Only installations on an account in allowedAccounts are reconciled; see
+// WebhookHandler.
 type Reconciler struct {
-	lister RepositoryLister
-	db     *storage.DB
-	queue  *queue.Queue
-	logger *slog.Logger
+	lister          RepositoryLister
+	allowedAccounts []int64
+	db              *storage.DB
+	queue           *queue.Queue
+	logger          *slog.Logger
 }
 
-func NewReconciler(lister RepositoryLister, db *storage.DB, q *queue.Queue, logger *slog.Logger) *Reconciler {
-	return &Reconciler{lister: lister, db: db, queue: q, logger: logger}
+func NewReconciler(lister RepositoryLister, allowedAccounts []int64, db *storage.DB, q *queue.Queue, logger *slog.Logger) *Reconciler {
+	return &Reconciler{lister: lister, allowedAccounts: allowedAccounts, db: db, queue: q, logger: logger}
+}
+
+// EnqueueStartup queues a reconciliation of every usable installation, as
+// each worker start does: a webhook missed while nothing was listening is
+// never redelivered once GitHub stops retrying.
+//
+// An installation whose account is known and not on the allowlist is skipped,
+// so it never gets a job. One whose account is not yet known is queued: its
+// reconciliation is what asks GitHub whose it is, and Reconcile still refuses
+// it if the answer is not an approved account.
+func (r *Reconciler) EnqueueStartup(ctx context.Context) error {
+	installations, err := r.db.ListUsableInstallations(ctx)
+	if err != nil {
+		return err
+	}
+	queued := 0
+	for _, installation := range installations {
+		if installation.AccountID != 0 && !accountAllowed(r.allowedAccounts, installation) {
+			logUnapproved(r.logger, installation, "startup reconciliation")
+			continue
+		}
+		if _, err := r.queue.Enqueue(ctx, queue.KindReconcileInstallation,
+			queue.ReconcileInstallationPayload{GitHubInstallationID: installation.GitHubInstallationID}, ""); err != nil {
+			return err
+		}
+		queued++
+	}
+	r.logger.Info("queued startup repository reconciliation", "installations", queued, "skipped", len(installations)-queued)
+	return nil
 }
 
 // initialScanStagger spaces out initial scans across every installation.
@@ -67,6 +101,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, githubInstallationID int64) 
 		// or suspended from the installation row itself.
 		logger.Info("skipping reconciliation of unusable installation",
 			"deleted", installation.DeletedAt != nil, "suspended", installation.SuspendedAt != nil)
+		return nil
+	}
+	// A row recorded before account IDs were stored, or created by a push
+	// that arrived before its installation event, has no account yet. GitHub
+	// says which it is; until then the installation counts as unapproved.
+	if installation.AccountID == 0 {
+		accountID, err := r.lister.InstallationAccountID(ctx, githubInstallationID)
+		if err != nil {
+			return err
+		}
+		if installation, err = r.db.EnsureInstallation(ctx, githubInstallationID, "", "", accountID); err != nil {
+			return err
+		}
+	}
+	if !accountAllowed(r.allowedAccounts, installation) {
+		logUnapproved(logger, installation, "reconciliation")
 		return nil
 	}
 

@@ -88,6 +88,12 @@ jobs:
           grep -q -- '--- PASS: TestLastScansAndImpactAreScopedToTrackedRepositories' test-output.txt
           grep -q -- '--- PASS: TestAnonymousWriteProbeGetsTheServersCSRFRefusal' test-output.txt
           grep -q -- '--- PASS: TestDashboardWriteRoutesPassTheBrowserChecks' test-output.txt
+          grep -q -- '--- PASS: TestUnapprovedInstallationIsRecordedButQueuesNothing' test-output.txt
+          grep -q -- '--- PASS: TestEmptyAllowlistApprovesNoInstallation' test-output.txt
+          grep -q -- '--- PASS: TestReconcileSkipsUnapprovedInstallation' test-output.txt
+          grep -q -- '--- PASS: TestInstallationWithoutAccountIDIsUnapprovedUntilReconciled' test-output.txt
+          grep -q -- '--- PASS: TestStartupReconciliationSkipsKnownUnapprovedInstallations' test-output.txt
+          grep -q -- '--- PASS: TestInstallationAccountAllowlist' test-output.txt
 
       - name: Run lint checks
         run: make lint

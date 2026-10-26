@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,15 +23,22 @@ import (
 // It deliberately does no scanning: a webhook handler that clones a repository
 // holds GitHub's delivery open for minutes and will simply time out. Everything
 // expensive happens on the worker.
+//
+// A public App can be installed by anyone, so only installations on an
+// account in allowedAccounts (ALLOWED_INSTALLATION_ACCOUNTS) may queue work.
+// Every other installation is still recorded, so its uninstall and suspension
+// are tracked and the logs show who installed it, but nothing it sends is
+// scanned or reconciled.
 type WebhookHandler struct {
-	secret string
-	db     *storage.DB
-	queue  *queue.Queue
-	logger *slog.Logger
+	secret          string
+	allowedAccounts []int64
+	db              *storage.DB
+	queue           *queue.Queue
+	logger          *slog.Logger
 }
 
-func NewWebhookHandler(secret string, db *storage.DB, q *queue.Queue, logger *slog.Logger) *WebhookHandler {
-	return &WebhookHandler{secret: secret, db: db, queue: q, logger: logger}
+func NewWebhookHandler(secret string, allowedAccounts []int64, db *storage.DB, q *queue.Queue, logger *slog.Logger) *WebhookHandler {
+	return &WebhookHandler{secret: secret, allowedAccounts: allowedAccounts, db: db, queue: q, logger: logger}
 }
 
 func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -130,11 +138,16 @@ func (h *WebhookHandler) handleInstallation(ctx context.Context, logger *slog.Lo
 		record, err := h.db.UpsertInstallation(ctx, models.Installation{
 			GitHubInstallationID: installation.GetID(),
 			AccountLogin:         installation.GetAccount().GetLogin(),
+			AccountID:            installation.GetAccount().GetID(),
 			AccountType:          installation.GetAccount().GetType(),
 			SuspendedAt:          timePtr(installation.SuspendedAt),
 		})
 		if err != nil {
 			return err
+		}
+		if !accountAllowed(h.allowedAccounts, record) {
+			logUnapproved(logger, record, "installation "+event.GetAction())
+			return nil
 		}
 		for _, repo := range event.Repositories {
 			if _, err := h.upsertRepositoryFromEvent(ctx, record.ID, repo, installation.GetAccount().GetLogin()); err != nil {
@@ -165,14 +178,23 @@ func (h *WebhookHandler) handleInstallationRepositories(ctx context.Context, log
 	// Not an installation lifecycle event, so it must not clear a suspension
 	// or undo an uninstall -- a redelivery can arrive after either.
 	record, err := h.db.EnsureInstallation(ctx, installation.GetID(),
-		installation.GetAccount().GetLogin(), installation.GetAccount().GetType())
+		installation.GetAccount().GetLogin(), installation.GetAccount().GetType(), installation.GetAccount().GetID())
 	if err != nil {
 		return err
 	}
+	// Removals below still apply to an unapproved installation: revoking
+	// access only takes work away, and an account dropped from the allowlist
+	// may still have repositories recorded from when it was on it.
+	approved := accountAllowed(h.allowedAccounts, record)
+	if !approved {
+		logUnapproved(logger, record, "installation_repositories "+event.GetAction())
+	}
 
-	for _, repo := range event.RepositoriesAdded {
-		if _, err := h.upsertRepositoryFromEvent(ctx, record.ID, repo, installation.GetAccount().GetLogin()); err != nil {
-			return err
+	if approved {
+		for _, repo := range event.RepositoriesAdded {
+			if _, err := h.upsertRepositoryFromEvent(ctx, record.ID, repo, installation.GetAccount().GetLogin()); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -194,6 +216,9 @@ func (h *WebhookHandler) handleInstallationRepositories(ctx context.Context, log
 		"action", event.GetAction(), "selection", event.GetRepositorySelection(),
 		"added", len(event.RepositoriesAdded), "removed", len(event.RepositoriesRemoved), "revoked", revoked)
 
+	if !approved {
+		return nil
+	}
 	// The event describes a delta. Reconciling afterwards repairs anything an
 	// earlier, missed delivery left behind.
 	return h.enqueueReconcile(ctx, logger, installation.GetID())
@@ -289,8 +314,8 @@ func (h *WebhookHandler) handlePush(ctx context.Context, logger *slog.Logger, ev
 		return nil
 	}
 
-	installationRecordID, err := h.installationRecordID(ctx, event.GetInstallation())
-	if err != nil {
+	installationRecordID, approved, err := h.approvedInstallation(ctx, logger, event.GetInstallation(), "push")
+	if err != nil || !approved {
 		return err
 	}
 
@@ -363,8 +388,8 @@ func (h *WebhookHandler) handlePullRequest(ctx context.Context, logger *slog.Log
 		return nil
 	}
 
-	installationRecordID, err := h.installationRecordID(ctx, event.GetInstallation())
-	if err != nil {
+	installationRecordID, approved, err := h.approvedInstallation(ctx, logger, event.GetInstallation(), "pull_request")
+	if err != nil || !approved {
 		return err
 	}
 
@@ -479,22 +504,45 @@ func enqueuePendingScan(ctx context.Context, q *queue.Queue, logger *slog.Logger
 	return nil
 }
 
-// installationRecordID maps GitHub's installation ID to our row ID, tolerating
-// events that arrive before the installation event itself.
+// approvedInstallation maps GitHub's installation ID to our row ID, tolerating
+// events that arrive before the installation event itself, and reports
+// whether that installation may queue work. An event with no installation,
+// or from one whose account is not yet known, is not approved.
 //
 // Push and pull request payloads carry only the installation's ID, so this
 // must not use UpsertInstallation: that would blank the stored account and
-// clear any suspension or uninstall.
-func (h *WebhookHandler) installationRecordID(ctx context.Context, installation *gh.Installation) (*int64, error) {
+// clear any suspension or uninstall. The account ID comes from the stored row,
+// which the installation event or reconciliation filled in.
+func (h *WebhookHandler) approvedInstallation(ctx context.Context, logger *slog.Logger, installation *gh.Installation, event string) (*int64, bool, error) {
 	if installation == nil || installation.GetID() == 0 {
-		return nil, nil
+		logger.Warn("ignoring event with no GitHub App installation", "trigger", event)
+		return nil, false, nil
 	}
 	record, err := h.db.EnsureInstallation(ctx, installation.GetID(),
-		installation.GetAccount().GetLogin(), installation.GetAccount().GetType())
+		installation.GetAccount().GetLogin(), installation.GetAccount().GetType(), installation.GetAccount().GetID())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return &record.ID, nil
+	if !accountAllowed(h.allowedAccounts, record) {
+		logUnapproved(logger, record, event)
+		return nil, false, nil
+	}
+	return &record.ID, true, nil
+}
+
+// accountAllowed reports whether an installation's account is on the
+// allowlist. An account not yet known (ID zero) never is.
+func accountAllowed(allowed []int64, installation models.Installation) bool {
+	return installation.AccountID != 0 && slices.Contains(allowed, installation.AccountID)
+}
+
+// logUnapproved is the audit record of work refused for an installation
+// outside ALLOWED_INSTALLATION_ACCOUNTS. The account ID it logs is the value
+// to add there to approve the installation.
+func logUnapproved(logger *slog.Logger, installation models.Installation, trigger string) {
+	logger.Warn("ignoring installation outside ALLOWED_INSTALLATION_ACCOUNTS; nothing queued",
+		"trigger", trigger, "installation", installation.GitHubInstallationID,
+		"account", installation.AccountLogin, "account_id", installation.AccountID)
 }
 
 // isZeroSHA reports whether a SHA is git's all-zeroes sentinel, which marks a

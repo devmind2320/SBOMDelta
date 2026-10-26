@@ -86,6 +86,11 @@ development file, which is exactly why git is kept out of that directory.
   (uid 10001). It prints setting names, the secret's path and that uid --
   never a value or the secret. A world-writable secret file fails; a
   world-readable one is a warning;
+- the running server, and the worker if it has a container, already have a
+  non-empty `ALLOWED_INSTALLATION_ACCOUNTS`, which the new ones need to
+  start. It is read from the container's configuration with
+  `docker inspect` (so a stopped worker is checked too), and only the
+  setting's name is printed, never a value;
 - the Postgres data volume exists; `.env` and the GitHub App key exist
   (checked for presence only, never read); Postgres is healthy;
 - there is free disk for the backup and the image builds;
@@ -386,6 +391,43 @@ In order:
 7. Sign in at `https://sbomdelta.website` with an allowed account, and sign
    out again.
 
+### First deployment of the installation allowlist
+
+The release that adds `ALLOWED_INSTALLATION_ACCOUNTS` needs it in **both** the
+server (webhooks) and the worker (reconciliation), and neither starts without
+it. As with sign-in, the setting goes in first, on the running images, and
+the deployment then changes only the image. Do this **before** making the
+GitHub App public. In order:
+
+1. Find the numeric account ID of every account whose installations should be
+   scanned (your user, and any organization the App is installed on), for
+   example `curl -s https://api.github.com/users/<login> | grep '"id"'`. It is
+   not a secret.
+2. Add `ALLOWED_INSTALLATION_ACCOUNTS: "<id>[,<id>...]"` to the `environment:`
+   of **both** the `server` and the `worker` service in the production
+   `docker-compose.yml` (or reference a variable in `.env`). Change nothing
+   else.
+3. Apply it on the current images:
+   [Changing the production configuration](#changing-the-production-configuration),
+   once for `server` and once for `worker`. The running release predates the
+   setting and ignores it, so nothing changes yet.
+4. **Actions → CD → Run workflow**, mode **`preflight`**. It must report
+   `ok: ALLOWED_INSTALLATION_ACCOUNTS present in the running 'server'` and the
+   same for `'worker'`. Fix anything it reports and repeat.
+5. Run it again with mode **`deploy`**. The server applies migration 0009,
+   which adds `installations.account_id`; existing installations have none
+   yet. The new worker reconciles every installation at start and asks GitHub
+   whose each one is (`GET /app/installations/{id}`), so within a minute the
+   approved installation works as before. A push in that minute is not
+   scanned; **Scan** it from the dashboard if it matters.
+6. Check the worker log for `reconciled installation repositories` with your
+   account. An installation outside the list logs
+   `ignoring installation outside ALLOWED_INSTALLATION_ACCOUNTS; nothing queued`
+   with its `account_id` instead. Adding that ID to the list (steps 2 and 3,
+   then restart both services) approves it; the worker's next start
+   reconciles it.
+7. Only then make the GitHub App public, if that is the goal.
+
 ## Configuration
 
 ### GitHub repository variables (Settings → Secrets and variables → Actions → Variables)
@@ -479,6 +521,13 @@ repository and must not be:
 | `ALLOWED_GITHUB_LOGINS` | Comma-separated GitHub logins allowed to sign in |
 | `SESSION_TTL` (optional) | Default `12h` |
 
+**Installation allowlist (required from the release that adds it), in both the
+`server` and the `worker` service:**
+
+| Setting | Value |
+|---|---|
+| `ALLOWED_INSTALLATION_ACCOUNTS` | Comma-separated GitHub **numeric account IDs** whose App installations may be reconciled and scanned. Logins are refused. See [First deployment of the installation allowlist](#first-deployment-of-the-installation-allowlist) |
+
 The GitHub App's **Callback URL** must be
 `https://sbomdelta.website/api/auth/github/callback`. Nginx needs no change:
 it already proxies `/api/`. Never set `AUTH_DISABLED` in production; the
@@ -525,6 +574,7 @@ only on the instance:
 | Containers were created from exactly `docker-compose.yml`, with no override file present | Deployments use exactly that file | Merge or remove the override |
 | `com.docker.compose.config-hash` matches what root's Compose resolves | Recreating must change only the image | After a deliberate edit, apply it on the current image ([Changing the production configuration](#changing-the-production-configuration)); otherwise usually a different Compose version for root, or a variable that resolves differently; review |
 | The running server has the sign-in settings and can read its client secret file | The new server refuses to start without them | [First deployment of dashboard sign-in](#first-deployment-of-dashboard-sign-in) |
+| The running server and worker have `ALLOWED_INSTALLATION_ACCOUNTS` | The new server and worker refuse to start without it | [First deployment of the installation allowlist](#first-deployment-of-the-installation-allowlist) |
 | No service has `depends_on: {server: {restart: true}}` except the worker | Recreating the server must not restart Nginx | Remove `restart: true` |
 | `/run/secrets` on the server is a bind mount with a `*.pem` key | Presence check for the GitHub App key | Set `GITHUB_APP_KEY_FILE` |
 
@@ -675,6 +725,11 @@ configuration on disk is the one it runs, which preflight also checks). If
 `/healthz` is not `ok`, the new configuration is wrong for the current
 release too: revert the edit and run the same commands again. Then run a CD
 **preflight**; it must now pass the configuration check.
+
+For the `worker`, run steps 1 and 2 with `worker` in place of `server`, and
+skip the health check and the Nginx reload: the worker serves nothing. Then
+check `$C ps worker` shows it running and `$C logs --tail 20 worker` shows
+`worker started`.
 
 ## Tests
 

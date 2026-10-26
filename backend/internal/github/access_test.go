@@ -18,12 +18,18 @@ import (
 
 const testInstallationID = 4242
 
+// testAccountID is the GitHub account ID of devmind2320, the account the test
+// installation is on, and the one account the test allowlist approves.
+const testAccountID = 9901
+
+var testAllowedAccounts = []int64{testAccountID}
+
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func newTestHandler(t *testing.T) (*WebhookHandler, *storage.DB) {
 	t.Helper()
 	db := storagetest.Open(t, "test_github")
-	return NewWebhookHandler("unused", db, testQueue(db), discardLogger()), db
+	return NewWebhookHandler("unused", testAllowedAccounts, db, testQueue(db), discardLogger()), db
 }
 
 func testQueue(db *storage.DB) *queue.Queue { return queue.New(db.Pool(), time.Minute) }
@@ -31,7 +37,7 @@ func testQueue(db *storage.DB) *queue.Queue { return queue.New(db.Pool(), time.M
 func testInstallation() *gh.Installation {
 	return &gh.Installation{
 		ID:      gh.Int64(testInstallationID),
-		Account: &gh.User{Login: gh.String("devmind2320"), Type: gh.String("User")},
+		Account: &gh.User{Login: gh.String("devmind2320"), ID: gh.Int64(testAccountID), Type: gh.String("User")},
 	}
 }
 
@@ -196,11 +202,21 @@ type fakeLister struct {
 	repos []*gh.Repository
 	err   error
 	calls int
+	// account is whose installation GitHub says it is; zero means the
+	// approved test account.
+	account int64
 }
 
 func (f *fakeLister) ListInstallationRepositories(context.Context, int64) ([]*gh.Repository, error) {
 	f.calls++
 	return f.repos, f.err
+}
+
+func (f *fakeLister) InstallationAccountID(context.Context, int64) (int64, error) {
+	if f.account != 0 {
+		return f.account, nil
+	}
+	return testAccountID, nil
 }
 
 // apiRepo is the full shape GET /installation/repositories returns.
@@ -222,7 +238,7 @@ func TestReconcileAfterNarrowingAccess(t *testing.T) {
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"), eventRepo(1002, "devmind2320/web"))
 
 	lister := &fakeLister{repos: []*gh.Repository{apiRepo(1002, "web"), apiRepo(1003, "docs")}}
-	if err := NewReconciler(lister, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err != nil {
+	if err := NewReconciler(lister, testAllowedAccounts, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}
 
@@ -244,7 +260,7 @@ func TestReconcileListingErrorChangesNothing(t *testing.T) {
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"))
 
 	lister := &fakeLister{err: errors.New("github is unreachable")}
-	if err := NewReconciler(lister, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err == nil {
+	if err := NewReconciler(lister, testAllowedAccounts, db, testQueue(db), discardLogger()).Reconcile(context.Background(), testInstallationID); err == nil {
 		t.Fatal("Reconcile() succeeded, want the listing error so the job retries")
 	}
 	if got := repoByName(t, db, "api").Access; got != models.AccessActive {
@@ -256,7 +272,7 @@ func TestReconcileSkipsUnusableInstallations(t *testing.T) {
 	_, db := newTestHandler(t)
 	ctx := context.Background()
 	lister := &fakeLister{}
-	reconciler := NewReconciler(lister, db, testQueue(db), discardLogger())
+	reconciler := NewReconciler(lister, testAllowedAccounts, db, testQueue(db), discardLogger())
 
 	// Unknown: the installation event that creates it has not landed yet.
 	if err := reconciler.Reconcile(ctx, 999); err != nil {
@@ -264,7 +280,7 @@ func TestReconcileSkipsUnusableInstallations(t *testing.T) {
 	}
 
 	if _, err := db.UpsertInstallation(ctx, models.Installation{
-		GitHubInstallationID: testInstallationID, AccountLogin: "devmind2320", AccountType: "User",
+		GitHubInstallationID: testInstallationID, AccountLogin: "devmind2320", AccountID: testAccountID, AccountType: "User",
 	}); err != nil {
 		t.Fatalf("UpsertInstallation() error = %v", err)
 	}
@@ -411,6 +427,10 @@ type listerThatUninstalls struct {
 	db *storage.DB
 }
 
+func (listerThatUninstalls) InstallationAccountID(context.Context, int64) (int64, error) {
+	return testAccountID, nil
+}
+
 func (l listerThatUninstalls) ListInstallationRepositories(ctx context.Context, id int64) ([]*gh.Repository, error) {
 	if err := l.db.MarkInstallationDeleted(ctx, id); err != nil {
 		return nil, err
@@ -422,7 +442,7 @@ func TestReconcileAbandonedWhenUninstalledDuringListing(t *testing.T) {
 	h, db := newTestHandler(t)
 	addRepos(t, h, eventRepo(1001, "devmind2320/api"))
 
-	if err := NewReconciler(listerThatUninstalls{db: db}, db, testQueue(db), discardLogger()).
+	if err := NewReconciler(listerThatUninstalls{db: db}, testAllowedAccounts, db, testQueue(db), discardLogger()).
 		Reconcile(context.Background(), testInstallationID); err != nil {
 		t.Fatalf("Reconcile() error = %v, want the reconciliation quietly abandoned", err)
 	}

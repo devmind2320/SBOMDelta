@@ -82,7 +82,7 @@ func newInitialScanner(db *storage.DB, heads HeadResolver) *InitialScanner {
 func reconcile(t *testing.T, db *storage.DB, repos ...*gh.Repository) {
 	t.Helper()
 	lister := &fakeLister{repos: repos}
-	if err := NewReconciler(lister, db, testQueue(db), discardLogger()).
+	if err := NewReconciler(lister, testAllowedAccounts, db, testQueue(db), discardLogger()).
 		Reconcile(context.Background(), testInstallationID); err != nil {
 		t.Fatalf("Reconcile() error = %v", err)
 	}

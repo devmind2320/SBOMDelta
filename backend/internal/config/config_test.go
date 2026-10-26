@@ -3,6 +3,7 @@ package config
 import (
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestWorkerLoadRemainsStrictWithGitHubDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() accepted a worker without GitHub credentials")
 	}
-	for _, requirement := range []string{"GITHUB_APP_ID", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET"} {
+	for _, requirement := range []string{"GITHUB_APP_ID", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "ALLOWED_INSTALLATION_ACCOUNTS"} {
 		if !strings.Contains(err.Error(), requirement) {
 			t.Errorf("Load() error = %v, missing requirement %q", err, requirement)
 		}
@@ -85,24 +86,79 @@ func TestWorkerLoadRemainsStrictWithGitHubDisabled(t *testing.T) {
 	}
 }
 
+// The installation allowlist fails closed in both processes that queue work:
+// absent, blank or unparseable is an error, never "allow every installation",
+// and only numeric account IDs are accepted, because logins can be renamed.
+func TestInstallationAccountAllowlist(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		want      []int64
+		wantError string
+	}{
+		{name: "absent", value: "", wantError: "ALLOWED_INSTALLATION_ACCOUNTS is required"},
+		{name: "blank", value: " , ", wantError: "ALLOWED_INSTALLATION_ACCOUNTS is required"},
+		{name: "a login is not an account ID", value: "devmind2320", wantError: `"devmind2320", which is not a GitHub numeric account ID`},
+		{name: "wildcard", value: "*", wantError: "not a GitHub numeric account ID"},
+		{name: "zero", value: "0", wantError: "not a GitHub numeric account ID"},
+		{name: "negative", value: "-7", wantError: "not a GitHub numeric account ID"},
+		{name: "one bad entry fails the list", value: "1001,acme", wantError: "not a GitHub numeric account ID"},
+		{name: "trimmed list", value: " 1001 , 2002 ,", want: []int64{1001, 2002}},
+	}
+	for _, tt := range tests {
+		for name, load := range map[string]func() (*Config, error){"server": LoadAPI, "worker": LoadWorker} {
+			t.Run(tt.name+"/"+name, func(t *testing.T) {
+				setConfigEnvironment(t)
+				setCredentialFixtures(t)
+				setAuthFixtures(t)
+				t.Setenv("APP_ENV", "production")
+				t.Setenv("ALLOWED_INSTALLATION_ACCOUNTS", tt.value)
+				cfg, err := load()
+				if tt.wantError != "" {
+					if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+						t.Fatalf("load() error = %v, want %q", err, tt.wantError)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("load() error = %v", err)
+				}
+				if !slices.Equal(cfg.GitHub.AllowedInstallationAccounts, tt.want) {
+					t.Errorf("AllowedInstallationAccounts = %v, want %v", cfg.GitHub.AllowedInstallationAccounts, tt.want)
+				}
+			})
+		}
+	}
+
+	// Local development without a GitHub App receives no webhooks and
+	// reconciles nothing, so it needs no allowlist.
+	setConfigEnvironment(t)
+	setAuthFixtures(t)
+	t.Setenv("GITHUB_DISABLED", "true")
+	if _, err := LoadAPI(); err != nil {
+		t.Fatalf("LoadAPI() with GitHub disabled error = %v, want no allowlist requirement", err)
+	}
+}
+
 func setConfigEnvironment(t *testing.T) {
 	t.Helper()
 	for key, value := range map[string]string{
-		"APP_ENV":                   "development",
-		"GITHUB_DISABLED":           "",
-		"GITHUB_APP_ID":             "",
-		"GITHUB_PRIVATE_KEY":        "",
-		"GITHUB_PRIVATE_KEY_PATH":   "",
-		"GITHUB_WEBHOOK_SECRET":     "",
-		"WORKER_CONCURRENCY":        "4",
-		"AUTH_DISABLED":             "",
-		"GITHUB_CLIENT_ID":          "",
-		"GITHUB_CLIENT_SECRET":      "",
-		"GITHUB_CLIENT_SECRET_PATH": "",
-		"PUBLIC_URL":                "",
-		"ALLOWED_GITHUB_LOGINS":     "",
-		"SESSION_TTL":               "",
-		"GITHUB_WEB_BASE_URL":       "",
+		"APP_ENV":                       "development",
+		"GITHUB_DISABLED":               "",
+		"GITHUB_APP_ID":                 "",
+		"GITHUB_PRIVATE_KEY":            "",
+		"GITHUB_PRIVATE_KEY_PATH":       "",
+		"GITHUB_WEBHOOK_SECRET":         "",
+		"ALLOWED_INSTALLATION_ACCOUNTS": "",
+		"WORKER_CONCURRENCY":            "4",
+		"AUTH_DISABLED":                 "",
+		"GITHUB_CLIENT_ID":              "",
+		"GITHUB_CLIENT_SECRET":          "",
+		"GITHUB_CLIENT_SECRET_PATH":     "",
+		"PUBLIC_URL":                    "",
+		"ALLOWED_GITHUB_LOGINS":         "",
+		"SESSION_TTL":                   "",
+		"GITHUB_WEB_BASE_URL":           "",
 	} {
 		t.Setenv(key, value)
 	}
@@ -113,6 +169,7 @@ func setCredentialFixtures(t *testing.T) {
 	t.Setenv("GITHUB_APP_ID", "123")
 	t.Setenv("GITHUB_PRIVATE_KEY", "configuration-test-key")
 	t.Setenv("GITHUB_WEBHOOK_SECRET", "configuration-test-secret")
+	t.Setenv("ALLOWED_INSTALLATION_ACCOUNTS", "1001")
 }
 
 func setAuthFixtures(t *testing.T) {

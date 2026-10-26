@@ -64,11 +64,11 @@ func TestWebhookIsAuthenticatedIdempotentAndFollowsThePullRequest(t *testing.T) 
 	db := storagetest.Open(t, "test_github")
 	ctx := context.Background()
 	if _, err := db.UpsertInstallation(ctx, models.Installation{
-		GitHubInstallationID: testInstallationID, AccountLogin: "devmind2320", AccountType: "User",
+		GitHubInstallationID: testInstallationID, AccountLogin: "devmind2320", AccountID: testAccountID, AccountType: "User",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	h := NewWebhookHandler(testWebhookSecret, db, testQueue(db), discardLogger())
+	h := NewWebhookHandler(testWebhookSecret, testAllowedAccounts, db, testQueue(db), discardLogger())
 	head := "2222222222222222222222222222222222222222"
 	opened := pullRequestEvent("opened", 12, head, false)
 

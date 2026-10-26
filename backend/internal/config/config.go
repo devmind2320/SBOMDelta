@@ -41,6 +41,11 @@ type GitHub struct {
 	APIBaseURL    string
 	// AppSlug is used to build human-facing links back to the app.
 	AppSlug string
+	// AllowedInstallationAccounts are the GitHub numeric account IDs whose
+	// installations may queue work: reconciliation, initial scans, push and
+	// pull request scans. Anyone can install a public App; an installation
+	// on any other account is recorded and otherwise ignored.
+	AllowedInstallationAccounts []int64
 }
 
 // Auth configures dashboard sign-in through the GitHub App's user
@@ -214,6 +219,8 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 		if cfg.GitHub.WebhookSecret == "" {
 			problems = append(problems, errors.New("GITHUB_WEBHOOK_SECRET is required; without it webhook signatures cannot be verified"))
 		}
+
+		cfg.GitHub.AllowedInstallationAccounts, problems = loadInstallationAccounts(problems)
 	}
 	if cfg.Worker.Concurrency < 1 {
 		problems = append(problems, errors.New("WORKER_CONCURRENCY must be at least 1"))
@@ -230,6 +237,30 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 		return nil, errors.Join(problems...)
 	}
 	return cfg, nil
+}
+
+// loadInstallationAccounts reads ALLOWED_INSTALLATION_ACCOUNTS: GitHub's
+// numeric account IDs, never logins, because a login can be renamed and then
+// claimed by someone else. Like ALLOWED_GITHUB_LOGINS it has no default, and
+// an empty list is an error rather than "allow every installation".
+func loadInstallationAccounts(problems []error) ([]int64, []error) {
+	var accounts []int64
+	for _, raw := range strings.Split(os.Getenv("ALLOWED_INSTALLATION_ACCOUNTS"), ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || id <= 0 {
+			problems = append(problems, fmt.Errorf("ALLOWED_INSTALLATION_ACCOUNTS contains %q, which is not a GitHub numeric account ID", raw))
+			continue
+		}
+		accounts = append(accounts, id)
+	}
+	if len(accounts) == 0 {
+		problems = append(problems, errors.New("ALLOWED_INSTALLATION_ACCOUNTS is required: a comma-separated list of the GitHub numeric account IDs whose installations may be scanned"))
+	}
+	return accounts, problems
 }
 
 // githubLogin matches GitHub's username rules: letters, digits and single

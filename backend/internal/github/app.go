@@ -93,6 +93,37 @@ func (a *App) InstallationToken(ctx context.Context, installationID int64) (stri
 	return token, nil
 }
 
+// InstallationAccountID asks GitHub which account an installation belongs to,
+// as GitHub's numeric account ID. GET /app/installations/{id} authenticates as
+// the App itself, with its JWT, rather than as the installation.
+func (a *App) InstallationAccountID(ctx context.Context, installationID int64) (int64, error) {
+	transport, err := ghinstallation.NewAppsTransport(a.httpClient.Transport, a.cfg.AppID, a.cfg.PrivateKey)
+	if err != nil {
+		return 0, fmt.Errorf("build app transport: %w", err)
+	}
+	if base := a.cfg.APIBaseURL; base != "" && base != "https://api.github.com/" {
+		transport.BaseURL = trimTrailingSlash(base)
+	}
+	client := gh.NewClient(&http.Client{Transport: transport, Timeout: 30 * time.Second})
+	if a.cfg.APIBaseURL != "" && a.cfg.APIBaseURL != "https://api.github.com/" {
+		parsed, err := url.Parse(a.cfg.APIBaseURL)
+		if err != nil {
+			return 0, fmt.Errorf("parse github api base url: %w", err)
+		}
+		client.BaseURL = parsed
+	}
+
+	installation, _, err := client.Apps.GetInstallation(ctx, installationID)
+	if err != nil {
+		return 0, fmt.Errorf("get installation %d: %w", installationID, err)
+	}
+	id := installation.GetAccount().GetID()
+	if id == 0 {
+		return 0, fmt.Errorf("installation %d has no account ID", installationID)
+	}
+	return id, nil
+}
+
 // ListInstallationRepositories returns every repository the installation can
 // currently access, following pagination.
 //

@@ -224,6 +224,20 @@ browsers send an origin (lowercase, no default port, no path). For local work wi
 GitHub App, `docker-compose.yml` sets `AUTH_DISABLED=true`, which the server accepts only
 with `APP_ENV=development`.
 
+**Which installations are scanned.** Anyone can install a public GitHub App, so the
+server and the worker both require `ALLOWED_INSTALLATION_ACCOUNTS`: the GitHub numeric
+account IDs (users or organizations) whose installations may be scanned. They refuse to
+start without it while GitHub integration is on. IDs, not logins, because a login can be
+renamed and then claimed by someone else; find one with
+`curl -s https://api.github.com/users/<login> | grep '"id"'`. An installation on any
+other account is recorded, its uninstall and suspension are tracked, and every event it
+sends is logged as `ignoring installation outside ALLOWED_INSTALLATION_ACCOUNTS` with
+its `account_id`, but nothing is reconciled or scanned for it: no repository listing, no
+initial scans, no push or pull request scans. An installation whose account is not yet
+known (recorded before this setting existed, or referenced by a push that arrived before
+its installation event) counts as unapproved until reconciliation asks GitHub whose it
+is; every worker start does that. Changing the list takes a restart of both services.
+
 Signing in again from the same browser replaces its previous session. A failed sign-out
 says so and leaves you signed in, rather than only forgetting the cookie. If an account is
 removed from the allowlist while signed in, the dashboard shows the sign-in page with the
@@ -493,6 +507,10 @@ errors are redacted before they reach a log line or a check body, and git is run
   The allowlist matches logins, and GitHub logins can be renamed and later claimed by
   someone else, so remove a departed login from the list rather than relying on the
   account. The login a session is checked against is the one recorded at sign-in.
+- **Taking an account off `ALLOWED_INSTALLATION_ACCOUNTS` stops new work, not work
+  already queued.** Scans and initial scans queued before the restart still run, and a
+  signed-in user can still ask for a scan of a repository stored while the account was
+  approved. Uninstalling the App is what cuts off access.
 - **A repository appears in "All Repos" before it can be scanned** when the App was just
   installed: GitHub lists it for the user at once, but SBOMDelta stores it when the
   installation's reconciliation runs. It shows as syncing until then.

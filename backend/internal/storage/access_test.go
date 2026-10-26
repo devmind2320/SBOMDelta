@@ -459,7 +459,7 @@ func TestEnsureInstallationPreservesLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	// Unknown installation: created from the bare reference.
-	created, err := db.EnsureInstallation(ctx, 777, "", "")
+	created, err := db.EnsureInstallation(ctx, 777, "", "", 0)
 	if err != nil {
 		t.Fatalf("EnsureInstallation() error = %v", err)
 	}
@@ -475,7 +475,7 @@ func TestEnsureInstallationPreservesLifecycle(t *testing.T) {
 	}
 
 	// A push payload: ID only.
-	got, err := db.EnsureInstallation(ctx, 777, "", "")
+	got, err := db.EnsureInstallation(ctx, 777, "", "", 0)
 	if err != nil {
 		t.Fatalf("EnsureInstallation() error = %v", err)
 	}
@@ -487,7 +487,7 @@ func TestEnsureInstallationPreservesLifecycle(t *testing.T) {
 		t.Fatalf("MarkInstallationDeleted() error = %v", err)
 	}
 	// An installation_repositories payload: full account, renamed.
-	got, err = db.EnsureInstallation(ctx, 777, "acme-renamed", "Organization")
+	got, err = db.EnsureInstallation(ctx, 777, "acme-renamed", "Organization", 0)
 	if err != nil {
 		t.Fatalf("EnsureInstallation() error = %v", err)
 	}
@@ -496,6 +496,52 @@ func TestEnsureInstallationPreservesLifecycle(t *testing.T) {
 	}
 	if got.DeletedAt == nil {
 		t.Error("deleted_at was cleared by a non-lifecycle event")
+	}
+}
+
+// The account ID the installation allowlist is checked against is set by
+// whichever event or lookup reports it, and is never cleared by one that does
+// not carry it: push payloads have only the installation's ID.
+func TestInstallationAccountIDIsKept(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	created, err := db.EnsureInstallation(ctx, 777, "", "", 0)
+	if err != nil {
+		t.Fatalf("EnsureInstallation() error = %v", err)
+	}
+	if created.AccountID != 0 {
+		t.Errorf("accountID = %d, want 0 while unknown", created.AccountID)
+	}
+
+	if _, err := db.UpsertInstallation(ctx, models.Installation{
+		GitHubInstallationID: 777, AccountLogin: "acme", AccountID: 9901, AccountType: "Organization",
+	}); err != nil {
+		t.Fatalf("UpsertInstallation() error = %v", err)
+	}
+	for _, step := range []func() (models.Installation, error){
+		func() (models.Installation, error) { return db.EnsureInstallation(ctx, 777, "", "", 0) },
+		func() (models.Installation, error) {
+			return db.UpsertInstallation(ctx, models.Installation{GitHubInstallationID: 777, AccountLogin: "acme", AccountType: "Organization"})
+		},
+		func() (models.Installation, error) { return db.GetInstallationByGitHubID(ctx, 777) },
+	} {
+		got, err := step()
+		if err != nil {
+			t.Fatalf("error = %v", err)
+		}
+		if got.AccountID != 9901 {
+			t.Errorf("accountID = %d, want 9901 kept", got.AccountID)
+		}
+	}
+
+	// Reconciliation's lookup fills in a row that has none.
+	got, err := db.EnsureInstallation(ctx, 778, "legacy", "User", 0)
+	if err != nil || got.AccountID != 0 {
+		t.Fatalf("EnsureInstallation(778) = %+v, %v; want no account ID yet", got, err)
+	}
+	if got, err = db.EnsureInstallation(ctx, 778, "", "", 4242); err != nil || got.AccountID != 4242 || got.AccountLogin != "legacy" {
+		t.Errorf("EnsureInstallation(778, 4242) = %+v, %v; want the account ID filled in and the login kept", got, err)
 	}
 }
 

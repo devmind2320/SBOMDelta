@@ -24,19 +24,20 @@ var ErrInstallationUnusable = errors.New("installation is deleted or suspended")
 // the app is reinstalled on the same account.
 func (db *DB) UpsertInstallation(ctx context.Context, in models.Installation) (models.Installation, error) {
 	const query = `
-		INSERT INTO installations (github_installation_id, account_login, account_type, suspended_at)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO installations (github_installation_id, account_login, account_type, suspended_at, account_id)
+		VALUES ($1, $2, $3, $4, NULLIF($5, 0))
 		ON CONFLICT (github_installation_id) DO UPDATE
 		SET account_login = EXCLUDED.account_login,
 		    account_type  = EXCLUDED.account_type,
 		    suspended_at  = EXCLUDED.suspended_at,
+		    account_id    = COALESCE(EXCLUDED.account_id, installations.account_id),
 		    deleted_at    = NULL,
 		    updated_at    = now()
-		RETURNING id, github_installation_id, account_login, account_type, suspended_at, deleted_at`
+		RETURNING ` + installationColumns
 
 	var out models.Installation
-	err := db.pool.QueryRow(ctx, query, in.GitHubInstallationID, in.AccountLogin, in.AccountType, in.SuspendedAt).
-		Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.SuspendedAt, &out.DeletedAt)
+	err := scanInstallation(db.pool.QueryRow(ctx, query,
+		in.GitHubInstallationID, in.AccountLogin, in.AccountType, in.SuspendedAt, in.AccountID), &out)
 	if err != nil {
 		return models.Installation{}, fmt.Errorf("upsert installation: %w", err)
 	}
@@ -50,24 +51,31 @@ func (db *DB) UpsertInstallation(ctx context.Context, in models.Installation) (m
 // push carries only the installation's ID. So this fills in account details
 // only where the event actually has them, and never touches suspended_at or
 // deleted_at: only installation events themselves may change those, through
-// UpsertInstallation.
-func (db *DB) EnsureInstallation(ctx context.Context, githubInstallationID int64, accountLogin, accountType string) (models.Installation, error) {
+// UpsertInstallation. An accountID of zero leaves the stored one alone.
+func (db *DB) EnsureInstallation(ctx context.Context, githubInstallationID int64, accountLogin, accountType string, accountID int64) (models.Installation, error) {
 	const query = `
-		INSERT INTO installations (github_installation_id, account_login, account_type)
-		VALUES ($1, $2, COALESCE(NULLIF($3, ''), 'User'))
+		INSERT INTO installations (github_installation_id, account_login, account_type, account_id)
+		VALUES ($1, $2, COALESCE(NULLIF($3, ''), 'User'), NULLIF($4, 0))
 		ON CONFLICT (github_installation_id) DO UPDATE
 		SET account_login = COALESCE(NULLIF(EXCLUDED.account_login, ''), installations.account_login),
 		    account_type  = CASE WHEN $3 = '' THEN installations.account_type ELSE EXCLUDED.account_type END,
+		    account_id    = COALESCE(EXCLUDED.account_id, installations.account_id),
 		    updated_at    = now()
-		RETURNING id, github_installation_id, account_login, account_type, suspended_at, deleted_at`
+		RETURNING ` + installationColumns
 
 	var out models.Installation
-	err := db.pool.QueryRow(ctx, query, githubInstallationID, accountLogin, accountType).
-		Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.SuspendedAt, &out.DeletedAt)
+	err := scanInstallation(db.pool.QueryRow(ctx, query, githubInstallationID, accountLogin, accountType, accountID), &out)
 	if err != nil {
 		return models.Installation{}, fmt.Errorf("ensure installation: %w", err)
 	}
 	return out, nil
+}
+
+const installationColumns = `id, github_installation_id, account_login, account_type, COALESCE(account_id, 0), suspended_at, deleted_at`
+
+func scanInstallation(row pgx.Row, out *models.Installation) error {
+	return row.Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.AccountID,
+		&out.SuspendedAt, &out.DeletedAt)
 }
 
 // MarkInstallationDeleted soft-deletes an installation so that historical scan
@@ -429,10 +437,9 @@ func (db *DB) ReconcileInstallationRepositories(ctx context.Context, installatio
 // GetInstallationByGitHubID loads an installation by GitHub's numeric ID.
 func (db *DB) GetInstallationByGitHubID(ctx context.Context, githubInstallationID int64) (models.Installation, error) {
 	var out models.Installation
-	err := db.pool.QueryRow(ctx, `
-		SELECT id, github_installation_id, account_login, account_type, suspended_at, deleted_at
-		FROM installations WHERE github_installation_id = $1`, githubInstallationID).
-		Scan(&out.ID, &out.GitHubInstallationID, &out.AccountLogin, &out.AccountType, &out.SuspendedAt, &out.DeletedAt)
+	err := scanInstallation(db.pool.QueryRow(ctx, `
+		SELECT `+installationColumns+`
+		FROM installations WHERE github_installation_id = $1`, githubInstallationID), &out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.Installation{}, ErrNotFound
 	}
@@ -442,11 +449,11 @@ func (db *DB) GetInstallationByGitHubID(ctx context.Context, githubInstallationI
 	return out, nil
 }
 
-// ListUsableInstallations returns the GitHub IDs of installations whose
-// tokens can currently be minted: not deleted and not suspended.
-func (db *DB) ListUsableInstallations(ctx context.Context) ([]int64, error) {
+// ListUsableInstallations returns the installations whose tokens can
+// currently be minted: not deleted and not suspended.
+func (db *DB) ListUsableInstallations(ctx context.Context) ([]models.Installation, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT github_installation_id FROM installations
+		SELECT `+installationColumns+` FROM installations
 		WHERE deleted_at IS NULL AND suspended_at IS NULL
 		ORDER BY id`)
 	if err != nil {
@@ -454,15 +461,15 @@ func (db *DB) ListUsableInstallations(ctx context.Context) ([]int64, error) {
 	}
 	defer rows.Close()
 
-	ids := make([]int64, 0)
+	installations := make([]models.Installation, 0)
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan installation id: %w", err)
+		var installation models.Installation
+		if err := scanInstallation(rows, &installation); err != nil {
+			return nil, fmt.Errorf("scan installation: %w", err)
 		}
-		ids = append(ids, id)
+		installations = append(installations, installation)
 	}
-	return ids, rows.Err()
+	return installations, rows.Err()
 }
 
 // Now returns the database clock, which is what row timestamps are written

@@ -575,6 +575,25 @@ check_signin_settings() {
 	log "ok: dashboard sign-in settings present in the running server"
 }
 
+# check_installation_allowlist <container> <service> checks, before anything
+# changes, that a container already has a non-empty ALLOWED_INSTALLATION_ACCOUNTS,
+# which the new server and worker refuse to start without. It reads the
+# container's configured environment with docker inspect, which also works for
+# a stopped worker, and only setting names leave the pipe -- never a value.
+check_installation_allowlist() {
+	local names
+	if ! names="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null |
+		sed -n 's/^\(ALLOWED_INSTALLATION_ACCOUNTS\)=.*[0-9].*$/\1/p')"; then
+		log "ERROR: could not read the configuration of the '$2' container"
+		return 1
+	fi
+	if [ "$names" != ALLOWED_INSTALLATION_ACCOUNTS ]; then
+		log "ERROR: ALLOWED_INSTALLATION_ACCOUNTS is not set in the running '$2'; the new $2 would refuse to start. Add it to the $2 service and apply it on the current image first (deploy/README.md, \"Changing the production configuration\"). Nothing was changed."
+		return 1
+	fi
+	log "ok: ALLOWED_INSTALLATION_ACCOUNTS present in the running '$2'"
+}
+
 # ---------------------------------------------------------------- rollback --
 
 rollback() {
@@ -880,6 +899,10 @@ fi
 log "ok: .env and GitHub App key present"
 
 check_signin_settings "$SERVER_CID" "https://$PUBLIC_HOST" || exit 1
+check_installation_allowlist "$SERVER_CID" "$SERVER_SERVICE" || exit 1
+if [ "$WORKER_PRESENT" -eq 1 ]; then
+	check_installation_allowlist "$WORKER_CID" "$WORKER_SERVICE" || exit 1
+fi
 
 pg_health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$PG_CID")"
 case "$pg_health" in

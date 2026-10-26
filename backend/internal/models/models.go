@@ -13,12 +13,15 @@ type User struct {
 }
 
 type Installation struct {
-	ID                   int64      `json:"id"`
-	GitHubInstallationID int64      `json:"githubInstallationId"`
-	AccountLogin         string     `json:"accountLogin"`
-	AccountType          string     `json:"accountType"`
-	SuspendedAt          *time.Time `json:"suspendedAt,omitempty"`
-	DeletedAt            *time.Time `json:"deletedAt,omitempty"`
+	ID                   int64  `json:"id"`
+	GitHubInstallationID int64  `json:"githubInstallationId"`
+	AccountLogin         string `json:"accountLogin"`
+	// AccountID is GitHub's numeric ID for the account, which survives a
+	// rename. Zero until an installation event or reconciliation reports it.
+	AccountID   int64      `json:"accountId,omitempty"`
+	AccountType string     `json:"accountType"`
+	SuspendedAt *time.Time `json:"suspendedAt,omitempty"`
+	DeletedAt   *time.Time `json:"deletedAt,omitempty"`
 }
 
 type Repository struct {
