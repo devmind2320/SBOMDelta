@@ -63,6 +63,7 @@ func deliver(t *testing.T, h http.Handler, event string, deliveryID string, payl
 func TestWebhookIsAuthenticatedIdempotentAndFollowsThePullRequest(t *testing.T) {
 	db := storagetest.Open(t, "test_github")
 	ctx := context.Background()
+	connect(t, db, 7001, "devmind2320", testInstallationID)
 	if _, err := db.UpsertInstallation(ctx, models.Installation{
 		GitHubInstallationID: testInstallationID, AccountLogin: "devmind2320", AccountID: testAccountID, AccountType: "User",
 	}); err != nil {

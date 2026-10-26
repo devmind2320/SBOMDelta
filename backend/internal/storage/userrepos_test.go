@@ -2,8 +2,12 @@ package storage_test
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"sbomdelta/internal/diff"
 	"sbomdelta/internal/models"
@@ -247,5 +251,209 @@ func TestDevelopmentListingCoversEveryStoredRepository(t *testing.T) {
 
 	if only, total, err := db.ListAllRepositoryOverviews(ctx, "WEB", 10, 0); err != nil || total != 1 || len(only) != 1 || only[0].Name != "web" {
 		t.Errorf("search = %+v total %d (%v), want acme/web only", only, total, err)
+	}
+}
+
+// An installation is connected while some user's latest GitHub listing
+// reaches it, and stops being connected when no listing does.
+func TestInstallationHasUsers(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 8101, Login: "alice"})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	connected := func(id int64) bool {
+		t.Helper()
+		ok, err := db.InstallationHasUsers(ctx, id)
+		if err != nil {
+			t.Fatalf("InstallationHasUsers(%d) error = %v", id, err)
+		}
+		return ok
+	}
+
+	if connected(31) {
+		t.Error("installation 31 is connected before anyone listed it")
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, []models.AccessibleRepository{
+		{GitHubRepoID: 3101, GitHubInstallationID: 31, Owner: "alice", Name: "app"},
+	}, time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+	if !connected(31) || connected(32) {
+		t.Errorf("connected(31) = %v, connected(32) = %v; want only 31", connected(31), connected(32))
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, nil, time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+	if connected(31) {
+		t.Error("installation 31 is still connected after the only listing stopped reaching it")
+	}
+}
+
+// listingFor is a repository list as one sign-in would read it.
+func listingFor(ids ...int64) []models.AccessibleRepository {
+	repos := make([]models.AccessibleRepository, 0, len(ids))
+	for _, id := range ids {
+		repos = append(repos, models.AccessibleRepository{
+			GitHubRepoID: id, GitHubInstallationID: 31, Owner: "alice", Name: fmt.Sprintf("repo-%d", id),
+		})
+	}
+	return repos
+}
+
+func storedRepoIDs(t *testing.T, db *storage.DB, userID int64) []int64 {
+	t.Helper()
+	rows, err := db.Pool().Query(context.Background(),
+		`SELECT github_repo_id FROM user_repositories WHERE user_id = $1 ORDER BY 1`, userID)
+	if err != nil {
+		t.Fatalf("list stored repositories: %v", err)
+	}
+	defer rows.Close()
+	ids := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan stored repository: %v", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// holdUserRepositories opens a transaction that row-locks the user's current
+// repository list, so that refreshes started now all have to wait, and
+// returns it with its backend's pid. Committing it lets them go at once.
+func holdUserRepositories(t *testing.T, db *storage.DB, userID int64) (pgx.Tx, int32) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Pool().Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(ctx) })
+	var pid int32
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatalf("backend pid: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM user_repositories WHERE user_id = $1 FOR UPDATE`, userID); err != nil {
+		t.Fatalf("lock user repositories: %v", err)
+	}
+	return tx, pid
+}
+
+// waitForBlocked waits until n sessions are blocked behind the backend pid,
+// directly or behind a session that is, so the operations under test are
+// known to be in flight at the same time before it is released.
+func waitForBlocked(t *testing.T, db *storage.DB, pid int32, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked int
+		if err := db.Pool().QueryRow(context.Background(), `
+			WITH direct AS (SELECT pid FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)))
+			SELECT (SELECT COUNT(*) FROM direct) + (SELECT COUNT(*) FROM pg_stat_activity a
+				WHERE a.pid NOT IN (SELECT pid FROM direct) AND pg_blocking_pids(a.pid) && ARRAY(SELECT pid FROM direct))`,
+			pid).Scan(&blocked); err != nil {
+			t.Fatalf("count blocked sessions: %v", err)
+		}
+		if blocked >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions blocked after 10s, want %d", blocked, n)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Two sign-ins of the same user at once both succeed, and the stored list is
+// exactly one of the two listings, never a mixture or a failure on the
+// repository they share.
+func TestConcurrentRefreshesOfOneUserSerialize(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 8101, Login: "alice"})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, listingFor(1, 2), time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+
+	blocker, pid := holdUserRepositories(t, db, user.ID)
+	first, second := listingFor(1, 3, 5), listingFor(1, 4)
+	errs := make(chan error, 2)
+	for _, listing := range [][]models.AccessibleRepository{first, second} {
+		go func() { errs <- db.ReplaceUserRepositories(ctx, user.ID, listing, time.Now()) }()
+	}
+	waitForBlocked(t, db, pid, 2)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent ReplaceUserRepositories() error = %v", err)
+		}
+	}
+
+	got := storedRepoIDs(t, db, user.ID)
+	if !slices.Equal(got, []int64{1, 3, 5}) && !slices.Equal(got, []int64{1, 4}) {
+		t.Errorf("stored %v, want exactly one listing: [1 3 5] or [1 4]", got)
+	}
+}
+
+// A refresh and a failed listing at once leave a consistent record: either
+// the list with no error, or an empty list with the failure recorded.
+func TestConcurrentRefreshAndClearOfOneUserSerialize(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: 8101, Login: "alice"})
+	if err != nil {
+		t.Fatalf("UpsertUser() error = %v", err)
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, listingFor(1, 2), time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories() error = %v", err)
+	}
+
+	blocker, pid := holdUserRepositories(t, db, user.ID)
+	errs := make(chan error, 2)
+	go func() { errs <- db.ReplaceUserRepositories(ctx, user.ID, listingFor(1, 3), time.Now()) }()
+	go func() { errs <- db.ClearUserRepositories(ctx, user.ID, "rate_limited", time.Now()) }()
+	waitForBlocked(t, db, pid, 2)
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Errorf("concurrent refresh or clear error = %v", err)
+		}
+	}
+
+	got := storedRepoIDs(t, db, user.ID)
+	listing, err := db.UserRepositoryListing(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("UserRepositoryListing() error = %v", err)
+	}
+	refreshedLast := slices.Equal(got, []int64{1, 3}) && listing.Error == ""
+	clearedLast := len(got) == 0 && listing.Error == "rate_limited"
+	if !refreshedLast && !clearedLast {
+		t.Errorf("stored %v with listing error %q, want [1 3] with none or nothing with rate_limited", got, listing.Error)
+	}
+}
+
+// Refreshing or clearing the list of a user that does not exist is an error,
+// and stores nothing.
+func TestRefreshOfAMissingUserFails(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	if err := db.ReplaceUserRepositories(ctx, 999, listingFor(1), time.Now()); err == nil {
+		t.Error("ReplaceUserRepositories() for a missing user succeeded")
+	}
+	if err := db.ClearUserRepositories(ctx, 999, "github", time.Now()); err == nil {
+		t.Error("ClearUserRepositories() for a missing user succeeded")
+	}
+	if got := storedRepoIDs(t, db, 999); len(got) != 0 {
+		t.Errorf("stored %v for a missing user, want nothing", got)
 	}
 }

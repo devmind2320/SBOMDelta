@@ -22,6 +22,9 @@ func (db *DB) ReplaceUserRepositories(ctx context.Context, userID int64, repos [
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := lockUserRepositories(ctx, tx, userID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM user_repositories WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("clear user repositories: %w", err)
 	}
@@ -47,6 +50,28 @@ func (db *DB) ReplaceUserRepositories(ctx context.Context, userID int64, repos [
 	return nil
 }
 
+// lockUserRepositories makes the rest of tx the only writer of the user's
+// repository list until it ends, so concurrent sign-ins of one user replace
+// the list one after another rather than interleaving. It takes the same row
+// lock on the user that the transaction's final UPDATE of users takes anyway,
+// only first: a second refresh then waits before its DELETE, so under READ
+// COMMITTED that DELETE sees -- and removes -- every row the first one
+// committed. NO KEY UPDATE, unlike UPDATE, does not block the key-share locks
+// that inserting a session or a tracked repository for the user takes. Other
+// users' refreshes lock other rows and are unaffected. A user that does not
+// exist is ErrNotFound.
+func lockUserRepositories(ctx context.Context, tx pgx.Tx, userID int64) error {
+	var id int64
+	err := tx.QueryRow(ctx, `SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE`, userID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock user %d: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("lock user %d: %w", userID, err)
+	}
+	return nil
+}
+
 // ClearUserRepositories empties a user's list and records why it could not be
 // read. A stale list is never kept in place of one GitHub would not give: it
 // could still grant a repository the user has since lost.
@@ -56,6 +81,9 @@ func (db *DB) ClearUserRepositories(ctx context.Context, userID int64, reason st
 		return fmt.Errorf("begin clear user repositories: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockUserRepositories(ctx, tx, userID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM user_repositories WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("clear user repositories: %w", err)
 	}
@@ -108,6 +136,19 @@ var (
 	r.id, r.installation_id, r.github_repo_id, r.owner, r.name, r.default_branch, r.private,
 	COALESCE(r.clone_url, ''), r.created_at, r.access_revoked_at, ` + aliasedRepositoryAccess
 )
+
+// InstallationHasUsers reports whether any user's GitHub listing, read at
+// their last sign-in, includes the installation: whether someone using
+// SBOMDelta has connected it.
+func (db *DB) InstallationHasUsers(ctx context.Context, githubInstallationID int64) (bool, error) {
+	var connected bool
+	if err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_repositories WHERE github_installation_id = $1)`,
+		githubInstallationID).Scan(&connected); err != nil {
+		return false, fmt.Errorf("check installation users: %w", err)
+	}
+	return connected, nil
+}
 
 // CanAccessRepository reports whether a user may see a repository and its
 // scans. A repository that does not exist is simply not accessible.

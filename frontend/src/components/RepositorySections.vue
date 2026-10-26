@@ -51,6 +51,13 @@ const timeZone = viewerTimeZone()
 // With sign-in disabled for local development there is no user to track for:
 // All Repositories lists every stored repository and tracking is hidden.
 const { user } = useSession()
+// Where to install SBOMDelta's GitHub App on another account or organization,
+// or choose more of its repositories. The server builds it from the App's
+// slug; anything that is not an https link is not shown.
+const installUrl = computed(() => {
+  const url = user.value?.installUrl ?? ''
+  return url.startsWith('https://') ? url : ''
+})
 const localDevelopment = computed(() => Boolean(user.value?.authDisabled))
 
 // --- Tracked Repositories ---------------------------------------------------
@@ -375,6 +382,10 @@ defineExpose({ reload: reloadAll })
         <span v-if="total" class="chip nums ml-1.5 align-[2px]">{{ total }}</span>
       </template>
       <template v-if="!localDevelopment" #actions>
+        <a v-if="installUrl" :href="installUrl" class="btn btn-secondary btn-sm" target="_blank" rel="noopener noreferrer">
+          <AppIcon name="github" :size="13" />
+          Add repositories
+        </a>
         <button type="button" class="btn btn-secondary btn-sm" @click="refreshFromGitHub">
           <AppIcon name="refresh" :size="13" />
           Refresh from GitHub
@@ -427,8 +438,13 @@ defineExpose({ reload: reloadAll })
       <EmptyState
         v-else-if="!rows.length && !listing.error"
         title="No repositories found"
-        note="Your GitHub account cannot reach any repository through SBOMDelta’s GitHub App. Install the App on a repository (or ask its owner to), then select Refresh from GitHub."
-      />
+        note="Your GitHub account cannot reach any repository through SBOMDelta’s GitHub App yet. Install the App on your account or organization and choose repositories (or ask their owner to), then select Refresh from GitHub."
+      >
+        <a v-if="installUrl" :href="installUrl" class="btn btn-primary btn-sm mt-2" target="_blank" rel="noopener noreferrer">
+          <AppIcon name="github" :size="14" />
+          Install the GitHub App
+        </a>
+      </EmptyState>
 
       <ul
         v-else-if="rows.length"

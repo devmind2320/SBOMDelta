@@ -70,7 +70,7 @@ func TestWorkerLoadRemainsStrictWithGitHubDisabled(t *testing.T) {
 	if err == nil {
 		t.Fatal("Load() accepted a worker without GitHub credentials")
 	}
-	for _, requirement := range []string{"GITHUB_APP_ID", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET", "ALLOWED_INSTALLATION_ACCOUNTS"} {
+	for _, requirement := range []string{"GITHUB_APP_ID", "GITHUB_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET"} {
 		if !strings.Contains(err.Error(), requirement) {
 			t.Errorf("Load() error = %v, missing requirement %q", err, requirement)
 		}
@@ -86,9 +86,10 @@ func TestWorkerLoadRemainsStrictWithGitHubDisabled(t *testing.T) {
 	}
 }
 
-// The installation allowlist fails closed in both processes that queue work:
-// absent, blank or unparseable is an error, never "allow every installation",
-// and only numeric account IDs are accepted, because logins can be renamed.
+// The installation account allowlist is optional in both processes that queue
+// work: absent means no narrowing (the connected-installation rule still
+// applies). When set, only numeric account IDs are accepted, because logins
+// can be renamed, and a value naming no account is a mistake.
 func TestInstallationAccountAllowlist(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -96,8 +97,8 @@ func TestInstallationAccountAllowlist(t *testing.T) {
 		want      []int64
 		wantError string
 	}{
-		{name: "absent", value: "", wantError: "ALLOWED_INSTALLATION_ACCOUNTS is required"},
-		{name: "blank", value: " , ", wantError: "ALLOWED_INSTALLATION_ACCOUNTS is required"},
+		{name: "absent", value: ""},
+		{name: "only commas", value: " , ", wantError: "ALLOWED_INSTALLATION_ACCOUNTS names no account"},
 		{name: "a login is not an account ID", value: "devmind2320", wantError: `"devmind2320", which is not a GitHub numeric account ID`},
 		{name: "wildcard", value: "*", wantError: "not a GitHub numeric account ID"},
 		{name: "zero", value: "0", wantError: "not a GitHub numeric account ID"},
@@ -131,7 +132,7 @@ func TestInstallationAccountAllowlist(t *testing.T) {
 	}
 
 	// Local development without a GitHub App receives no webhooks and
-	// reconciles nothing, so it needs no allowlist.
+	// reconciles nothing, so the setting is not even read.
 	setConfigEnvironment(t)
 	setAuthFixtures(t)
 	t.Setenv("GITHUB_DISABLED", "true")
@@ -159,6 +160,7 @@ func setConfigEnvironment(t *testing.T) {
 		"ALLOWED_GITHUB_LOGINS":         "",
 		"SESSION_TTL":                   "",
 		"GITHUB_WEB_BASE_URL":           "",
+		"GITHUB_APP_SLUG":               "",
 	} {
 		t.Setenv(key, value)
 	}
@@ -189,9 +191,59 @@ func TestLoadAPIRequiresSignInSettings(t *testing.T) {
 	if err == nil {
 		t.Fatal("LoadAPI() accepted a server with no sign-in settings")
 	}
-	for _, requirement := range []string{"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "PUBLIC_URL", "ALLOWED_GITHUB_LOGINS"} {
+	for _, requirement := range []string{"GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "PUBLIC_URL"} {
 		if !strings.Contains(err.Error(), requirement) {
 			t.Errorf("LoadAPI() error = %v, missing requirement %q", err, requirement)
+		}
+	}
+	if strings.Contains(err.Error(), "ALLOWED_GITHUB_LOGINS") {
+		t.Errorf("LoadAPI() error = %v, want ALLOWED_GITHUB_LOGINS optional", err)
+	}
+}
+
+// Without ALLOWED_GITHUB_LOGINS any GitHub account may sign in; each still
+// sees only what GitHub grants it. With it, sign-in is restricted as before.
+func TestSignInIsOpenUnlessRestricted(t *testing.T) {
+	setConfigEnvironment(t)
+	setCredentialFixtures(t)
+	setAuthFixtures(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("ALLOWED_GITHUB_LOGINS", "")
+	cfg, err := LoadAPI()
+	if err != nil {
+		t.Fatalf("LoadAPI() error = %v", err)
+	}
+	if len(cfg.Auth.AllowedLogins) != 0 || cfg.Auth.Disabled {
+		t.Errorf("Auth = %+v, want sign-in enabled and open to every account", cfg.Auth)
+	}
+
+	t.Setenv("ALLOWED_GITHUB_LOGINS", "devmind2320")
+	if cfg, err = LoadAPI(); err != nil || !slices.Equal(cfg.Auth.AllowedLogins, []string{"devmind2320"}) {
+		t.Errorf("LoadAPI() error = %v, want sign-in restricted to devmind2320", err)
+	}
+}
+
+// The App's install link is built only from a slug that is a GitHub App URL
+// name, so the setting cannot put anything else into the page.
+func TestInstallURL(t *testing.T) {
+	for slug, want := range map[string]string{
+		"sbomdelta":       "https://github.com/apps/sbomdelta/installations/new",
+		"sbom-delta-2":    "https://github.com/apps/sbom-delta-2/installations/new",
+		"":                "",
+		"Bad Slug":        "",
+		"evil.example/x?": "",
+		"-leading":        "",
+	} {
+		setConfigEnvironment(t)
+		setCredentialFixtures(t)
+		setAuthFixtures(t)
+		t.Setenv("GITHUB_APP_SLUG", slug)
+		cfg, err := LoadAPI()
+		if err != nil {
+			t.Fatalf("LoadAPI(%q) error = %v", slug, err)
+		}
+		if cfg.Auth.InstallURL != want {
+			t.Errorf("InstallURL for %q = %q, want %q", slug, cfg.Auth.InstallURL, want)
 		}
 	}
 }
@@ -216,7 +268,7 @@ func TestLoadAPISignInValidation(t *testing.T) {
 		{name: "public url with the default http port", env: "development", set: map[string]string{"PUBLIC_URL": "http://localhost:80"}, wantError: `use "http://localhost"`},
 		{name: "public url with an empty port", env: "production", set: map[string]string{"PUBLIC_URL": "https://sbomdelta.example:"}, wantError: `use "https://sbomdelta.example"`},
 		{name: "public url with uppercase and the default port", env: "production", set: map[string]string{"PUBLIC_URL": "https://SBOMDelta.Example:443/"}, wantError: `use "https://sbomdelta.example"`},
-		{name: "blank allowlist", env: "production", set: map[string]string{"ALLOWED_GITHUB_LOGINS": " , "}, wantError: "ALLOWED_GITHUB_LOGINS is required"},
+		{name: "allowlist of only commas", env: "production", set: map[string]string{"ALLOWED_GITHUB_LOGINS": " , "}, wantError: "ALLOWED_GITHUB_LOGINS names no login"},
 		{name: "not a login", env: "production", set: map[string]string{"ALLOWED_GITHUB_LOGINS": "devmind2320,bad login"}, wantError: "not a GitHub login"},
 		{name: "wildcard is not a login", env: "production", set: map[string]string{"ALLOWED_GITHUB_LOGINS": "*"}, wantError: "not a GitHub login"},
 		{name: "session too short", env: "production", set: map[string]string{"SESSION_TTL": "1m"}, wantError: "SESSION_TTL"},

@@ -217,31 +217,52 @@ secret — without one, signatures cannot be verified.
 
 **Sign-in.** The dashboard and every `/api` data endpoint require signing in with GitHub.
 The API server needs `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` (or
-`GITHUB_CLIENT_SECRET_PATH`), `PUBLIC_URL` and `ALLOWED_GITHUB_LOGINS`, and refuses to
-start without them; see `.env.example`. Only the logins in `ALLOWED_GITHUB_LOGINS` can
-sign in, and the list is rechecked on every request. `PUBLIC_URL` must be written the way
-browsers send an origin (lowercase, no default port, no path). For local work without a
-GitHub App, `docker-compose.yml` sets `AUTH_DISABLED=true`, which the server accepts only
-with `APP_ENV=development`.
+`GITHUB_CLIENT_SECRET_PATH`) and `PUBLIC_URL`, and refuses to start without them; see
+`.env.example`. Any GitHub account can sign in; what it can see and scan is decided by
+GitHub, below. `PUBLIC_URL` must be written the way browsers send an origin (lowercase,
+no default port, no path). For local work without a GitHub App, `docker-compose.yml` sets
+`AUTH_DISABLED=true`, which the server accepts only with `APP_ENV=development`.
 
-**Which installations are scanned.** Anyone can install a public GitHub App, so the
-server and the worker both require `ALLOWED_INSTALLATION_ACCOUNTS`: the GitHub numeric
-account IDs (users or organizations) whose installations may be scanned. They refuse to
-start without it while GitHub integration is on. IDs, not logins, because a login can be
-renamed and then claimed by someone else; find one with
-`curl -s https://api.github.com/users/<login> | grep '"id"'`. An installation on any
-other account is recorded, its uninstall and suspension are tracked, and every event it
-sends is logged as `ignoring installation outside ALLOWED_INSTALLATION_ACCOUNTS` with
-its `account_id`, but nothing is reconciled or scanned for it: no repository listing, no
-initial scans, no push or pull request scans. An installation whose account is not yet
-known (recorded before this setting existed, or referenced by a push that arrived before
-its installation event) counts as unapproved until reconciliation asks GitHub whose it
-is; every worker start does that. Changing the list takes a restart of both services.
+**Multiple users.** Anyone with the URL can use SBOMDelta with their own GitHub account:
+
+1. Sign in with GitHub.
+2. Install the GitHub App on their personal account or an organization they administer
+   (**Add repositories** on the dashboard links to it when `GITHUB_APP_SLUG` is set) and
+   choose repositories, or be given access to a repository where it is already installed.
+3. Back on the dashboard, **Refresh from GitHub**. The repositories appear, are stored and
+   get a first scan; pushes and pull requests are scanned from then on.
+
+Each user sees only repositories GitHub lists for their own token through the App
+(below), so one user never reads another's private repositories, scans or SBOMs.
+Setting the App's **Setup URL** to `PUBLIC_URL` plus `/api/auth/github/login`, with
+**Redirect on update**, sends people straight back from installing it into a refreshed
+sign-in.
+
+**Which installations are scanned.** Anyone can install a public GitHub App, so an
+installation queues work -- repository listing, initial scans, push and pull request
+scans -- only once it is *connected*: the GitHub listing read at some user's sign-in
+includes it. An installation nobody has signed in to use is recorded, its uninstall and
+suspension are tracked, and each event it sends is logged as `ignoring installation;
+nothing queued` with the reason, but nothing is done for it. A sign-in that lists a
+recorded installation queues its reconciliation at once.
+
+Two optional settings narrow this for private deployments. Leave both empty for a
+multi-user deployment:
+
+- `ALLOWED_GITHUB_LOGINS`: only these logins may sign in, rechecked on every request.
+- `ALLOWED_INSTALLATION_ACCOUNTS`: only installations on these GitHub numeric account IDs
+  (users or organizations) are scanned, even when connected. IDs, not logins, because a
+  login can be renamed and then claimed by someone else; find one with
+  `curl -s https://api.github.com/users/<login> | grep '"id"'`. With it set, an
+  installation whose account is not yet known counts as unapproved until reconciliation
+  asks GitHub whose it is.
+
+Changing either takes a restart of the services that read it.
 
 Signing in again from the same browser replaces its previous session. A failed sign-out
 says so and leaves you signed in, rather than only forgetting the cookie. If an account is
-removed from the allowlist while signed in, the dashboard shows the sign-in page with the
-reason and a button to end that session. After signing in, or after an expired session
+removed from `ALLOWED_GITHUB_LOGINS` while signed in, the dashboard shows the sign-in page
+with the reason and a button to end that session. After signing in, or after an expired session
 sends you to sign in, you return to the page you were on.
 
 **Your repositories.** While GitHub's token is in hand at sign-in, the server asks GitHub
@@ -310,8 +331,9 @@ cd backend && go test -tags osvlive ./internal/osv -run TestLiveOSV -v
 ## API
 
 Everything under `/api` except the three sign-in endpoints needs a session; without one
-the answer is `401 {"error":"authentication required"}`, and a signed-in login no longer
-on the allowlist gets `403`. State-changing requests must also send
+the answer is `401 {"error":"authentication required"}`. When `ALLOWED_GITHUB_LOGINS` is
+set, a signed-in login no longer on it gets `403`; without it, every signed-in account
+gets through to its own data. State-changing requests must also send
 `X-SBOMDelta-Request: 1` from the dashboard's own origin. No CORS headers are sent.
 
 | Method | Path | Purpose |
@@ -504,13 +526,16 @@ errors are redacted before they reach a log line or a check body, and git is run
   for them when they last signed in. Access gained or lost on GitHub since then shows after
   **Refresh from GitHub** or the next sign-in (sessions last `SESSION_TTL`). Scanning
   still requires the App's installation to reach the repository at the time of the scan.
-  The allowlist matches logins, and GitHub logins can be renamed and later claimed by
-  someone else, so remove a departed login from the list rather than relying on the
-  account. The login a session is checked against is the one recorded at sign-in.
-- **Taking an account off `ALLOWED_INSTALLATION_ACCOUNTS` stops new work, not work
-  already queued.** Scans and initial scans queued before the restart still run, and a
-  signed-in user can still ask for a scan of a repository stored while the account was
-  approved. Uninstalling the App is what cuts off access.
+  `ALLOWED_GITHUB_LOGINS`, when used, matches logins, and GitHub logins can be renamed and
+  later claimed by someone else, so remove a departed login from the list rather than
+  relying on the account.
+- **An installation stays connected while any user's last listing reaches it**, even if
+  that user never signs in again. Uninstalling the App, or removing repositories from it,
+  is what stops its scans. Narrowing an allowlist stops new work, not work already queued.
+- **There are no per-user or per-installation quotas.** Anyone can sign in, install the
+  App on an account with many repositories and queue one initial scan for each. Scans are
+  spaced out (`initialScanStagger`), capped in size (`SCANNER_MAX_REPO_SIZE_MB`) and time,
+  and run `WORKER_CONCURRENCY` at a time, but one large account can still delay others.
 - **A repository appears in "All Repos" before it can be scanned** when the App was just
   installed: GitHub lists it for the user at once, but SBOMDelta stores it when the
   installation's reconciliation runs. It shows as syncing until then.
