@@ -100,6 +100,7 @@ jobs:
           grep -q -- '--- PASS: TestAnyGitHubAccountSignsInWithoutAnAllowlist' test-output.txt
           grep -q -- '--- PASS: TestTenantsSeeAndActOnlyOnTheirOwnRepositories' test-output.txt
           grep -q -- '--- PASS: TestNewUserWithoutAnInstallationSeesNothing' test-output.txt
+          grep -q -- '--- PASS: TestTenantsDownloadOnlyTheirOwnReports' test-output.txt
 
       - name: Run lint checks
         run: make lint

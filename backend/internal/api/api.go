@@ -10,9 +10,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -22,6 +24,7 @@ import (
 	ghapp "sbomdelta/internal/github"
 	"sbomdelta/internal/models"
 	"sbomdelta/internal/queue"
+	"sbomdelta/internal/report"
 	"sbomdelta/internal/storage"
 )
 
@@ -74,6 +77,7 @@ func (a *API) Routes(webhook http.Handler) http.Handler {
 	data.HandleFunc("GET /api/scans/{id}/vulnerability-changes", a.vulnerabilityChanges)
 	data.HandleFunc("GET /api/scans/{id}/risk", a.scanRisk)
 	data.HandleFunc("GET /api/scans/{id}/sbom", a.downloadSBOM)
+	data.HandleFunc("GET /api/scans/{id}/report", a.downloadReport)
 	// A scan request takes no input but the repository: the commit is the
 	// default branch head, resolved as the App installation, and one scan
 	// exists per commit (see github.ManualScanner).
@@ -526,6 +530,82 @@ func (a *API) downloadSBOM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, url, http.StatusFound)
+}
+
+// reportFormats are the report downloads, by the format query parameter.
+var reportFormats = map[string]struct {
+	contentType string
+	write       func(io.Writer, report.Report) error
+}{
+	"csv": {"text/csv; charset=utf-8", report.WriteCSV},
+	"pdf": {"application/pdf", report.WritePDF},
+}
+
+// downloadReport serves a scan's SBOM report as a file: ?format=csv is one
+// row per component, ?format=pdf a document for people. Both come from the
+// database, through this process, so the browser never has to reach blob
+// storage. The report is built in full before anything is sent, so a failure
+// is an error response rather than a truncated file.
+func (a *API) downloadReport(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	if !a.authorizeScan(w, r, id) {
+		return
+	}
+	format, ok := reportFormats[r.URL.Query().Get("format")]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "format must be csv or pdf")
+		return
+	}
+	ctx := r.Context()
+	scan, err := a.db.GetScan(ctx, id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if scan.Status != models.ScanCompleted {
+		writeError(w, http.StatusConflict, "the scan has not completed")
+		return
+	}
+	repository, err := a.db.GetRepository(ctx, scan.RepositoryID)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	components, err := a.db.ListComponents(ctx, id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	vulnerabilities, err := a.db.ListVulnerabilities(ctx, id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	drift, err := a.db.ListDriftEvents(ctx, id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+
+	rep := report.Report{Repository: repository, Scan: scan, Components: components,
+		Vulnerabilities: vulnerabilities, Drift: drift, Generated: time.Now()}
+	var body bytes.Buffer
+	if err := format.write(&body, rep); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	extension := r.URL.Query().Get("format")
+	w.Header().Set("Content-Type", format.contentType)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+rep.Filename(extension)+`"`)
+	w.Header().Set("Content-Length", strconv.Itoa(body.Len()))
+	// The report is the user's private data: no shared cache may keep it.
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = body.WriteTo(w)
 }
 
 func (a *API) listPullRequests(w http.ResponseWriter, r *http.Request) {

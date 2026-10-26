@@ -29,6 +29,8 @@ func dataPaths(f fixture) []string {
 		"/api/scans/" + scan + "/drift",
 		"/api/scans/" + scan + "/vulnerabilities",
 		"/api/scans/" + scan + "/sbom",
+		"/api/scans/" + scan + "/report?format=csv",
+		"/api/scans/" + scan + "/report?format=pdf",
 		"/api/scans/" + scan + "/risk",
 		"/api/scans/" + scan + "/vulnerability-changes",
 		"/api/me/repositories",
