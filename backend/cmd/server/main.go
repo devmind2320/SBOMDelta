@@ -55,6 +55,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	jobs := queue.New(db.Pool(), cfg.Worker.LockTimeout)
+	authService := auth.New(cfg.Auth, cfg.GitHub.APIBaseURL, db, logger)
 	var webhook http.Handler
 	// scans stays a nil interface, not a typed nil, when GitHub is disabled,
 	// so the API can tell scanning is unavailable.
@@ -65,15 +66,26 @@ func run(logger *slog.Logger) error {
 			http.Error(w, "GitHub integration is disabled for local development", http.StatusServiceUnavailable)
 		})
 	} else {
-		webhook = ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.AllowedInstallationAccounts, db, jobs, logger)
+		handler := ghapp.NewWebhookHandler(cfg.GitHub.WebhookSecret, cfg.GitHub.AllowedInstallationAccounts, db, jobs, logger)
+		webhook = handler
+		// Signing in is what connects an installation; reconcile the ones the
+		// sign-in listed so a new installation is stored and scanned at once.
+		authService.OnInstallationsListed(handler.QueueReconciliationAfterSignIn)
+		if len(cfg.GitHub.AllowedInstallationAccounts) > 0 {
+			logger.Info("installations restricted to ALLOWED_INSTALLATION_ACCOUNTS", "accounts", len(cfg.GitHub.AllowedInstallationAccounts))
+		}
 		// A scan request resolves the default branch head as the installation,
 		// as initial scans do on the worker, then queues the usual scan job.
 		scans = ghapp.NewManualScanner(ghapp.NewApp(cfg.GitHub), db, jobs, logger)
 	}
-	if cfg.Auth.Disabled {
+	switch {
+	case cfg.Auth.Disabled:
 		logger.Warn("dashboard sign-in disabled for local development; every request is treated as signed in")
+	case len(cfg.Auth.AllowedLogins) > 0:
+		logger.Info("sign-in restricted to ALLOWED_GITHUB_LOGINS", "logins", len(cfg.Auth.AllowedLogins))
+	default:
+		logger.Info("sign-in open to any GitHub account; each sees only what GitHub grants it")
 	}
-	authService := auth.New(cfg.Auth, cfg.GitHub.APIBaseURL, db, logger)
 	handler := api.New(db, blob, jobs, authService, scans, logger).Routes(webhook)
 
 	server := &http.Server{

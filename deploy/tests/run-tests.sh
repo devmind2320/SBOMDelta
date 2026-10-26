@@ -1368,11 +1368,13 @@ out="$(signin_case 1 "${GOOD_ENV[@]}")"
 check "sign-in check: complete settings and a readable 0400 secret pass" exit_code_is "$out" 0
 check "sign-in check: ... reporting the secret readable by the server user" contains "$out" "ok: client secret file $WORK/signin/secret is readable by the server user"
 check "sign-in check: ... and print no secret, client ID or login" no_secret_printed "$out"
+out="$(signin_case 1 GITHUB_CLIENT_ID=Iv1.clientid0001 PUBLIC_URL=https://sbomdelta.website GITHUB_CLIENT_SECRET_PATH="$WORK/signin/secret")"
+check "sign-in check: no ALLOWED_GITHUB_LOGINS passes (sign-in open to any account)" exit_code_is "$out" 0
 out="$(signin_case 1 "${GOOD_ENV[@]}" PUBLIC_URL=https://sbomdelta.website/)"
 check "sign-in check: PUBLIC_URL with a trailing slash passes" exit_code_is "$out" 0
 out="$(signin_case 1)"
 check "sign-in check: no settings at all fail" exit_code_is "$out" 1
-for name in GITHUB_CLIENT_ID ALLOWED_GITHUB_LOGINS PUBLIC_URL; do
+for name in GITHUB_CLIENT_ID PUBLIC_URL; do
 	check "sign-in check: ... naming $name" contains "$out" "ERROR: $name is not set"
 done
 check "sign-in check: ... and the missing secret" contains "$out" "ERROR: neither GITHUB_CLIENT_SECRET_PATH nor GITHUB_CLIENT_SECRET is set"
@@ -1411,57 +1413,9 @@ out="$(signin_case 0 "${GOOD_ENV[@]}")"
 check "sign-in check: a failing docker exec fails, never passes silently" \
 	sh -c 'printf "%s\n" "$1" | grep -q "rc=1" && printf "%s\n" "$1" | grep -q "could not check the dashboard sign-in settings"' _ "$out"
 
-# -------------------------------------------- installation allowlist --
-
-# The new server and worker refuse to start without ALLOWED_INSTALLATION_ACCOUNTS,
-# so preflight checks that both running containers already have it, reading
-# their configured environment through docker inspect (a stopped worker too)
-# and printing no value.
-allowlist_function="$(awk '/^check_installation_allowlist\(\) \{$/ { on = 1 } on { print } on && /^\}$/ { on = 0 }' "$ROOT/deploy/deploy.sh")"
-check "installation allowlist: deploy.sh defines check_installation_allowlist" \
-	sh -c 'printf "%s\n" "$1" | grep -q "^check_installation_allowlist() {$"' _ "$allowlist_function"
-check "installation allowlist: preflight checks the server" \
-	grep -qx 'check_installation_allowlist "$SERVER_CID" "$SERVER_SERVICE" || exit 1' "$ROOT/deploy/deploy.sh"
-check "installation allowlist: ... and a present worker" \
-	grep -qx $'\tcheck_installation_allowlist "$WORKER_CID" "$WORKER_SERVICE" || exit 1' "$ROOT/deploy/deploy.sh"
-# allowlist_case <docker inspect works 0|1> <env lines...>
-allowlist_case() {
-	local works="$1"
-	shift
-	(
-		set -o pipefail
-		CASE_ENV=("$@")
-		# shellcheck disable=SC2317,SC2329
-		log() { printf '%s\n' "$*"; }
-		# shellcheck disable=SC2317,SC2329
-		docker() {
-			[ "$works" = 1 ] || return 1
-			[ "$1" = inspect ] || return 99
-			# shellcheck disable=SC2031
-			[ "${#CASE_ENV[@]}" -eq 0 ] || printf '%s\n' "${CASE_ENV[@]}"
-		}
-		eval "$allowlist_function"
-		if check_installation_allowlist cid-worker worker; then echo rc=0; else echo rc=1; fi
-	) 2>&1
-}
-SECRET_LINE="GITHUB_WEBHOOK_SECRET=w3bh00k-secret-0123456789"
-out="$(allowlist_case 1 "$SECRET_LINE" ALLOWED_INSTALLATION_ACCOUNTS=9901,4242 APP_ENV=production)"
-check "installation allowlist: a set allowlist passes" exit_code_is "$out" 0
-check "installation allowlist: ... and prints no value" \
-	sh -c '! printf "%s" "$1" | grep -qE "9901|w3bh00k"' _ "$out"
-out="$(allowlist_case 1 "$SECRET_LINE" APP_ENV=production)"
-check "installation allowlist: a missing allowlist fails, naming the service" contains "$out" "ALLOWED_INSTALLATION_ACCOUNTS is not set in the running 'worker'"
-check "installation allowlist: ... and points at the documented procedure" contains "$out" '"Changing the production configuration"'
-check "installation allowlist: ... and prints no value" sh -c '! printf "%s" "$1" | grep -q w3bh00k' _ "$out"
-out="$(allowlist_case 1 ALLOWED_INSTALLATION_ACCOUNTS=)"
-check "installation allowlist: an empty allowlist fails" exit_code_is "$out" 1
-out="$(allowlist_case 1 "ALLOWED_INSTALLATION_ACCOUNTS= , ")"
-check "installation allowlist: a blank allowlist fails" exit_code_is "$out" 1
-out="$(allowlist_case 1 NOT_ALLOWED_INSTALLATION_ACCOUNTS=9901)"
-check "installation allowlist: a different setting ending in the name fails" exit_code_is "$out" 1
-out="$(allowlist_case 0 ALLOWED_INSTALLATION_ACCOUNTS=9901)"
-check "installation allowlist: a failing docker inspect fails, never passes silently" \
-	sh -c 'printf "%s\n" "$1" | grep -q "rc=1" && printf "%s\n" "$1" | grep -q "could not read the configuration"' _ "$out"
+# Neither allowlist is required any more, so preflight demands neither.
+check "preflight no longer requires ALLOWED_GITHUB_LOGINS or ALLOWED_INSTALLATION_ACCOUNTS" \
+	sh -c '! grep -qE "ALLOWED_(GITHUB_LOGINS|INSTALLATION_ACCOUNTS)" "$1"' _ "$ROOT/deploy/deploy.sh"
 
 # ------------------------------------------------------- worker image --
 

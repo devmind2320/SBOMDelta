@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -171,22 +173,37 @@ type harness struct {
 
 func newHarness(t *testing.T, allowed ...string) *harness {
 	t.Helper()
+	if len(allowed) == 0 {
+		allowed = []string{"devmind2320"}
+	}
+	return newHarnessWith(t, func(cfg *config.Auth) { cfg.AllowedLogins = allowed })
+}
+
+// newOpenHarness is a deployment without ALLOWED_GITHUB_LOGINS, with an
+// install link configured.
+func newOpenHarness(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessWith(t, func(cfg *config.Auth) {
+		cfg.InstallURL = "https://github.com/apps/sbomdelta/installations/new"
+	})
+}
+
+func newHarnessWith(t *testing.T, configure func(*config.Auth)) *harness {
+	t.Helper()
 	db := storagetest.Open(t, "test_auth")
 	github := newFakeGitHub(t)
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	if len(allowed) == 0 {
-		allowed = []string{"devmind2320"}
-	}
 	public, _ := url.Parse(publicURL)
-	service := auth.New(config.Auth{
-		ClientID:      clientID,
-		ClientSecret:  clientSecret,
-		PublicURL:     public,
-		WebBaseURL:    github.server.URL,
-		AllowedLogins: allowed,
-		SessionTTL:    time.Hour,
-	}, github.server.URL+"/api/", db, logger)
+	cfg := config.Auth{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		PublicURL:    public,
+		WebBaseURL:   github.server.URL,
+		SessionTTL:   time.Hour,
+	}
+	configure(&cfg)
+	service := auth.New(cfg, github.server.URL+"/api/", db, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/auth/github/login", service.Login)
@@ -508,28 +525,46 @@ func TestSigningInAgainReplacesThePreviousSession(t *testing.T) {
 	}
 }
 
+// With or without ALLOWED_GITHUB_LOGINS, only a live session gets through:
+// no cookie, a forged one, the stored hash and an expired session are all
+// refused. An open deployment drops the login check, never the session check.
 func TestRequireUserRejectsMissingForgedAndExpiredSessions(t *testing.T) {
-	h := newHarness(t)
-	session := h.signIn(t)
+	for name, harness := range map[string]func(*testing.T) *harness{
+		"restricted": func(t *testing.T) *harness { return newHarness(t) },
+		"open":       newOpenHarness,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := harness(t)
+			if name == "open" {
+				h.github.userBody = `{"id":5002,"login":"college-student"}`
+			}
+			session := h.signIn(t)
+			if code := h.me(t, session).Code; code != http.StatusOK {
+				t.Fatalf("live session: status %d, want 200", code)
+			}
 
-	if code := h.me(t, nil).Code; code != http.StatusUnauthorized {
-		t.Errorf("no cookie: status %d, want 401", code)
-	}
-	if code := h.me(t, &http.Cookie{Name: auth.SessionCookie, Value: "forged"}).Code; code != http.StatusUnauthorized {
-		t.Errorf("forged cookie: status %d, want 401", code)
-	}
-	// The stored hash itself is not a valid cookie.
-	sum := sha256.Sum256([]byte(session.Value))
-	hashCookie := &http.Cookie{Name: auth.SessionCookie, Value: fmt.Sprintf("%x", sum)}
-	if code := h.me(t, hashCookie).Code; code != http.StatusUnauthorized {
-		t.Errorf("hash as cookie: status %d, want 401", code)
-	}
+			if code := h.me(t, nil).Code; code != http.StatusUnauthorized {
+				t.Errorf("no cookie: status %d, want 401", code)
+			}
+			if code := h.me(t, &http.Cookie{Name: auth.SessionCookie, Value: "forged"}).Code; code != http.StatusUnauthorized {
+				t.Errorf("forged cookie: status %d, want 401", code)
+			}
+			// The stored hash itself is not a valid cookie.
+			sum := sha256.Sum256([]byte(session.Value))
+			hashCookie := &http.Cookie{Name: auth.SessionCookie, Value: fmt.Sprintf("%x", sum)}
+			if code := h.me(t, hashCookie).Code; code != http.StatusUnauthorized {
+				t.Errorf("hash as cookie: status %d, want 401", code)
+			}
 
-	if _, err := h.db.Pool().Exec(context.Background(), `UPDATE sessions SET expires_at = now() - interval '1 second'`); err != nil {
-		t.Fatal(err)
-	}
-	if code := h.me(t, session).Code; code != http.StatusUnauthorized {
-		t.Errorf("expired session: status %d, want 401", code)
+			if _, err := h.db.Pool().Exec(context.Background(), `UPDATE sessions SET expires_at = now() - interval '1 second'`); err != nil {
+				t.Fatal(err)
+			}
+			recorder := h.me(t, session)
+			if got := strings.TrimRight(recorder.Body.String(), "\n"); recorder.Code != http.StatusUnauthorized ||
+				got != `{"error":"authentication required"}` {
+				t.Errorf("expired session: %d %q, want 401 with the sign-in refusal", recorder.Code, got)
+			}
+		})
 	}
 }
 
@@ -868,5 +903,54 @@ func TestSignInSurvivesARefusedRepositoryListing(t *testing.T) {
 				t.Error("GitHub's response body reached the logs")
 			}
 		})
+	}
+}
+
+// Without ALLOWED_GITHUB_LOGINS any GitHub account signs in, and /api/me
+// offers the link for installing the App on that account.
+func TestAnyGitHubAccountSignsInWithoutAnAllowlist(t *testing.T) {
+	h := newOpenHarness(t)
+	h.github.userBody = `{"id":5002,"login":"college-student"}`
+	session := h.signIn(t)
+
+	recorder := h.me(t, session)
+	var me map[string]any
+	_ = json.Unmarshal(recorder.Body.Bytes(), &me)
+	if recorder.Code != http.StatusOK || me["login"] != "college-student" ||
+		me["installUrl"] != "https://github.com/apps/sbomdelta/installations/new" {
+		t.Errorf("GET /api/me = %d %v, want college-student with the install link", recorder.Code, me)
+	}
+	if n := h.count(t, "users"); n != 1 {
+		t.Errorf("users = %d, want the new account recorded", n)
+	}
+}
+
+// After the repository list is stored, the sign-in reports each installation
+// it reached once, so they can be reconciled. A failure to do so is logged
+// and does not cost the user their sign-in.
+func TestSignInReportsTheInstallationsItListed(t *testing.T) {
+	h := newOpenHarness(t)
+	h.github.installations = []fakeInstallation{
+		{id: 31, repos: []fakeRepo{{id: 1, owner: "acme", name: "api"}, {id: 2, owner: "acme", name: "web"}}},
+		{id: 32, repos: []fakeRepo{{id: 3, owner: "college-student", name: "thesis"}}},
+	}
+	var reported [][]int64
+	h.service.OnInstallationsListed(func(ctx context.Context, ids []int64) error {
+		var stored int
+		if err := h.db.Pool().QueryRow(ctx, `SELECT COUNT(*) FROM user_repositories`).Scan(&stored); err != nil || stored != 3 {
+			t.Errorf("when reported, %d repositories were stored (err %v), want the list stored first", stored, err)
+		}
+		reported = append(reported, ids)
+		return nil
+	})
+	h.signIn(t)
+	if len(reported) != 1 || !slices.Equal(reported[0], []int64{31, 32}) {
+		t.Errorf("reported = %v, want [[31 32]]", reported)
+	}
+
+	h.service.OnInstallationsListed(func(context.Context, []int64) error { return errors.New("queue unavailable") })
+	h.signIn(t)
+	if !strings.Contains(h.logs.String(), "could not queue reconciliation") {
+		t.Error("a failed report was not logged")
 	}
 }

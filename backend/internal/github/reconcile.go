@@ -29,28 +29,28 @@ type RepositoryLister interface {
 // and nothing is ever redelivered after GitHub gives up retrying. Asking
 // GitHub directly is the only source of truth that cannot drift.
 //
-// Only installations on an account in allowedAccounts are reconciled; see
-// WebhookHandler.
+// Only installations the gate approves are reconciled (see installationGate).
 type Reconciler struct {
-	lister          RepositoryLister
-	allowedAccounts []int64
-	db              *storage.DB
-	queue           *queue.Queue
-	logger          *slog.Logger
+	lister RepositoryLister
+	gate   installationGate
+	db     *storage.DB
+	queue  *queue.Queue
+	logger *slog.Logger
 }
 
 func NewReconciler(lister RepositoryLister, allowedAccounts []int64, db *storage.DB, q *queue.Queue, logger *slog.Logger) *Reconciler {
-	return &Reconciler{lister: lister, allowedAccounts: allowedAccounts, db: db, queue: q, logger: logger}
+	return &Reconciler{lister: lister, gate: installationGate{allowedAccounts: allowedAccounts, db: db}, db: db, queue: q, logger: logger}
 }
 
 // EnqueueStartup queues a reconciliation of every usable installation, as
 // each worker start does: a webhook missed while nothing was listening is
 // never redelivered once GitHub stops retrying.
 //
-// An installation whose account is known and not on the allowlist is skipped,
-// so it never gets a job. One whose account is not yet known is queued: its
-// reconciliation is what asks GitHub whose it is, and Reconcile still refuses
-// it if the answer is not an approved account.
+// An installation the gate refuses is skipped, so it never gets a job, with
+// one exception: under an account allowlist, a connected installation whose
+// account is not yet known is queued, because its reconciliation is what asks
+// GitHub whose it is, and Reconcile still refuses it if the answer is not an
+// approved account.
 func (r *Reconciler) EnqueueStartup(ctx context.Context) error {
 	installations, err := r.db.ListUsableInstallations(ctx)
 	if err != nil {
@@ -58,8 +58,12 @@ func (r *Reconciler) EnqueueStartup(ctx context.Context) error {
 	}
 	queued := 0
 	for _, installation := range installations {
-		if installation.AccountID != 0 && !accountAllowed(r.allowedAccounts, installation) {
-			logUnapproved(r.logger, installation, "startup reconciliation")
+		reason, err := r.gate.refusal(ctx, installation)
+		if err != nil {
+			return err
+		}
+		if reason == refusedNotConnected || (reason == refusedAccount && installation.AccountID != 0) {
+			logRefused(r.logger, installation, "startup reconciliation", reason)
 			continue
 		}
 		if _, err := r.queue.Enqueue(ctx, queue.KindReconcileInstallation,
@@ -104,9 +108,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, githubInstallationID int64) 
 		return nil
 	}
 	// A row recorded before account IDs were stored, or created by a push
-	// that arrived before its installation event, has no account yet. GitHub
-	// says which it is; until then the installation counts as unapproved.
-	if installation.AccountID == 0 {
+	// that arrived before its installation event, has no account yet. Under an
+	// account allowlist GitHub says which it is; until then the installation
+	// counts as unapproved.
+	if installation.AccountID == 0 && len(r.gate.allowedAccounts) > 0 {
 		accountID, err := r.lister.InstallationAccountID(ctx, githubInstallationID)
 		if err != nil {
 			return err
@@ -115,8 +120,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, githubInstallationID int64) 
 			return err
 		}
 	}
-	if !accountAllowed(r.allowedAccounts, installation) {
-		logUnapproved(logger, installation, "reconciliation")
+	reason, err := r.gate.refusal(ctx, installation)
+	if err != nil {
+		return err
+	}
+	if reason != "" {
+		logRefused(logger, installation, "reconciliation", reason)
 		return nil
 	}
 

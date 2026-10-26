@@ -78,7 +78,7 @@ development file, which is exactly why git is kept out of that directory.
   the current image first; see
   [Changing the production configuration](#changing-the-production-configuration);
 - the running server already has the dashboard sign-in settings the new
-  server needs to start (`GITHUB_CLIENT_ID`, `ALLOWED_GITHUB_LOGINS`,
+  server needs to start (`GITHUB_CLIENT_ID`,
   `PUBLIC_URL` equal to `https://sbomdelta.website`, no `AUTH_DISABLED`), and
   its client secret file exists, is a regular file, is not empty and is
   readable **by the server's own user, through its real mounts**: the check
@@ -86,11 +86,6 @@ development file, which is exactly why git is kept out of that directory.
   (uid 10001). It prints setting names, the secret's path and that uid --
   never a value or the secret. A world-writable secret file fails; a
   world-readable one is a warning;
-- the running server, and the worker if it has a container, already have a
-  non-empty `ALLOWED_INSTALLATION_ACCOUNTS`, which the new ones need to
-  start. It is read from the container's configuration with
-  `docker inspect` (so a stopped worker is checked too), and only the
-  setting's name is printed, never a value;
 - the Postgres data volume exists; `.env` and the GitHub App key exist
   (checked for presence only, never read); Postgres is healthy;
 - there is free disk for the backup and the image builds;
@@ -391,42 +386,43 @@ In order:
 7. Sign in at `https://sbomdelta.website` with an allowed account, and sign
    out again.
 
-### First deployment of the installation allowlist
+### Opening SBOMDelta to every GitHub account
 
-The release that adds `ALLOWED_INSTALLATION_ACCOUNTS` needs it in **both** the
-server (webhooks) and the worker (reconciliation), and neither starts without
-it. As with sign-in, the setting goes in first, on the running images, and
-the deployment then changes only the image. Do this **before** making the
-GitHub App public. In order:
+From the multi-user release on, `ALLOWED_GITHUB_LOGINS` and
+`ALLOWED_INSTALLATION_ACCOUNTS` are optional restrictions. While they are set,
+the release behaves as before for those accounts (an installation also has to
+be connected by a signed-in user, which the owner's already is). Opening the
+dashboard is therefore two separate, reversible steps: deploy the code with
+the settings untouched, then remove the settings.
 
-1. Find the numeric account ID of every account whose installations should be
-   scanned (your user, and any organization the App is installed on), for
-   example `curl -s https://api.github.com/users/<login> | grep '"id"'`. It is
-   not a secret.
-2. Add `ALLOWED_INSTALLATION_ACCOUNTS: "<id>[,<id>...]"` to the `environment:`
-   of **both** the `server` and the `worker` service in the production
-   `docker-compose.yml` (or reference a variable in `.env`). Change nothing
-   else.
-3. Apply it on the current images:
+1. **Deploy** the release through CD (`preflight`, then `deploy`) with the
+   production `docker-compose.yml` and `.env` unchanged. Sign in as the owner
+   and check the dashboard and a **Scan** still work. Until step 3, a rollback
+   to the previous release needs nothing else.
+2. **GitHub App settings** (on GitHub, not the instance): the App is public;
+   set **Setup URL** to `https://sbomdelta.website/api/auth/github/login` and
+   tick **Redirect on update**, so someone who installs it lands back in a
+   refreshed sign-in. Optionally add `GITHUB_APP_SLUG` (the App's URL name)
+   to the `server` service for the dashboard's **Add repositories** link.
+3. **Remove the restrictions**: delete `ALLOWED_GITHUB_LOGINS` from the
+   `server` service and `ALLOWED_INSTALLATION_ACCOUNTS` from both `server` and
+   `worker` in the production `docker-compose.yml`, and their lines in `.env`.
+   Keep a copy of both files first. Apply the change on the current images:
    [Changing the production configuration](#changing-the-production-configuration),
-   once for `server` and once for `worker`. The running release predates the
-   setting and ignores it, so nothing changes yet.
-4. **Actions → CD → Run workflow**, mode **`preflight`**. It must report
-   `ok: ALLOWED_INSTALLATION_ACCOUNTS present in the running 'server'` and the
-   same for `'worker'`. Fix anything it reports and repeat.
-5. Run it again with mode **`deploy`**. The server applies migration 0009,
-   which adds `installations.account_id`; existing installations have none
-   yet. The new worker reconciles every installation at start and asks GitHub
-   whose each one is (`GET /app/installations/{id}`), so within a minute the
-   approved installation works as before. A push in that minute is not
-   scanned; **Scan** it from the dashboard if it matters.
-6. Check the worker log for `reconciled installation repositories` with your
-   account. An installation outside the list logs
-   `ignoring installation outside ALLOWED_INSTALLATION_ACCOUNTS; nothing queued`
-   with its `account_id` instead. Adding that ID to the list (steps 2 and 3,
-   then restart both services) approves it; the worker's next start
-   reconciles it.
-7. Only then make the GitHub App public, if that is the goal.
+   once for `server` and once for `worker`. The server log then says
+   `sign-in open to any GitHub account`.
+4. **Check** with a second GitHub account: sign in, install the App on that
+   account with one repository, come back (or **Refresh from GitHub**). The
+   repository appears and gets a first scan; the owner's account does not see
+   it, and it does not see the owner's.
+5. **Then run a CD `preflight`** and confirm it passes with the new
+   configuration, so the next deployment is not held up by it.
+
+**Rolling back after step 3.** The release before this one refuses to start
+without both settings. Restore the two files saved in step 3 and apply them
+(step 3's procedure) *before* rolling back to it, or the rolled-back server
+and worker will not start. Rolling back only the configuration (restoring the
+files and applying them) re-restricts the dashboard without changing images.
 
 ## Configuration
 
@@ -518,15 +514,15 @@ repository and must not be:
 | `GITHUB_CLIENT_ID` | The GitHub App's Client ID |
 | `GITHUB_CLIENT_SECRET_PATH` | `/run/secrets/github-client-secret` (see [Client secret file](#client-secret-file)); `GITHUB_CLIENT_SECRET` inline also works but puts the secret in the environment |
 | `PUBLIC_URL` | `https://sbomdelta.website` |
-| `ALLOWED_GITHUB_LOGINS` | Comma-separated GitHub logins allowed to sign in |
 | `SESSION_TTL` (optional) | Default `12h` |
+| `GITHUB_APP_SLUG` (optional) | The App's URL name; the dashboard's **Add repositories** link is built from it |
+| `ALLOWED_GITHUB_LOGINS` (optional) | Restricts sign-in to these logins. Leave unset for a multi-user deployment |
 
-**Installation allowlist (required from the release that adds it), in both the
-`server` and the `worker` service:**
-
-| Setting | Value |
-|---|---|
-| `ALLOWED_INSTALLATION_ACCOUNTS` | Comma-separated GitHub **numeric account IDs** whose App installations may be reconciled and scanned. Logins are refused. See [First deployment of the installation allowlist](#first-deployment-of-the-installation-allowlist) |
+**Optional installation restriction, in both the `server` and the `worker`
+service:** `ALLOWED_INSTALLATION_ACCOUNTS`, comma-separated GitHub **numeric
+account IDs**, scans only installations on those accounts. Leave unset for a
+multi-user deployment. See
+[Opening SBOMDelta to every GitHub account](#opening-sbomdelta-to-every-github-account).
 
 The GitHub App's **Callback URL** must be
 `https://sbomdelta.website/api/auth/github/callback`. Nginx needs no change:
@@ -574,7 +570,6 @@ only on the instance:
 | Containers were created from exactly `docker-compose.yml`, with no override file present | Deployments use exactly that file | Merge or remove the override |
 | `com.docker.compose.config-hash` matches what root's Compose resolves | Recreating must change only the image | After a deliberate edit, apply it on the current image ([Changing the production configuration](#changing-the-production-configuration)); otherwise usually a different Compose version for root, or a variable that resolves differently; review |
 | The running server has the sign-in settings and can read its client secret file | The new server refuses to start without them | [First deployment of dashboard sign-in](#first-deployment-of-dashboard-sign-in) |
-| The running server and worker have `ALLOWED_INSTALLATION_ACCOUNTS` | The new server and worker refuse to start without it | [First deployment of the installation allowlist](#first-deployment-of-the-installation-allowlist) |
 | No service has `depends_on: {server: {restart: true}}` except the worker | Recreating the server must not restart Nginx | Remove `restart: true` |
 | `/run/secrets` on the server is a bind mount with a `*.pem` key | Presence check for the GitHub App key | Set `GITHUB_APP_KEY_FILE` |
 

@@ -41,10 +41,10 @@ type GitHub struct {
 	APIBaseURL    string
 	// AppSlug is used to build human-facing links back to the app.
 	AppSlug string
-	// AllowedInstallationAccounts are the GitHub numeric account IDs whose
-	// installations may queue work: reconciliation, initial scans, push and
-	// pull request scans. Anyone can install a public App; an installation
-	// on any other account is recorded and otherwise ignored.
+	// AllowedInstallationAccounts optionally narrows which installations may
+	// queue work (reconciliation, initial scans, push and pull request scans)
+	// to these GitHub numeric account IDs. Empty means no narrowing: any
+	// installation a signed-in user has connected qualifies.
 	AllowedInstallationAccounts []int64
 }
 
@@ -66,8 +66,13 @@ type Auth struct {
 	// WebBaseURL is where GitHub's OAuth pages live: github.com, or a GitHub
 	// Enterprise Server host.
 	WebBaseURL string
-	// AllowedLogins is who may sign in, lowercased. Everyone else is refused.
+	// AllowedLogins optionally restricts sign-in to these logins, lowercased.
+	// Empty lets any GitHub account sign in; what each account can see is
+	// still only what GitHub grants it.
 	AllowedLogins []string
+	// InstallURL is where a user installs the GitHub App on their account or
+	// organization, from GITHUB_APP_SLUG; empty when no usable slug is set.
+	InstallURL string
 	// SessionTTL is how long a sign-in lasts before it must be repeated.
 	SessionTTL time.Duration
 }
@@ -231,6 +236,9 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 	}
 	if loadAuth {
 		cfg.Auth, problems = loadAuthConfig(cfg.Env, problems)
+		if appSlug.MatchString(cfg.GitHub.AppSlug) {
+			cfg.Auth.InstallURL = cfg.Auth.WebBaseURL + "/apps/" + cfg.GitHub.AppSlug + "/installations/new"
+		}
 	}
 
 	if len(problems) > 0 {
@@ -239,13 +247,14 @@ func load(allowGitHubDisable, loadAuth bool) (*Config, error) {
 	return cfg, nil
 }
 
-// loadInstallationAccounts reads ALLOWED_INSTALLATION_ACCOUNTS: GitHub's
-// numeric account IDs, never logins, because a login can be renamed and then
-// claimed by someone else. Like ALLOWED_GITHUB_LOGINS it has no default, and
-// an empty list is an error rather than "allow every installation".
+// loadInstallationAccounts reads the optional ALLOWED_INSTALLATION_ACCOUNTS:
+// GitHub's numeric account IDs, never logins, because a login can be renamed
+// and then claimed by someone else. Unset or empty means no narrowing; a value
+// that names no account at all (only commas) is a mistake and an error.
 func loadInstallationAccounts(problems []error) ([]int64, []error) {
+	value := os.Getenv("ALLOWED_INSTALLATION_ACCOUNTS")
 	var accounts []int64
-	for _, raw := range strings.Split(os.Getenv("ALLOWED_INSTALLATION_ACCOUNTS"), ",") {
+	for _, raw := range strings.Split(value, ",") {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
@@ -257,18 +266,21 @@ func loadInstallationAccounts(problems []error) ([]int64, []error) {
 		}
 		accounts = append(accounts, id)
 	}
-	if len(accounts) == 0 {
-		problems = append(problems, errors.New("ALLOWED_INSTALLATION_ACCOUNTS is required: a comma-separated list of the GitHub numeric account IDs whose installations may be scanned"))
+	if len(accounts) == 0 && strings.TrimSpace(value) != "" {
+		problems = append(problems, errors.New("ALLOWED_INSTALLATION_ACCOUNTS names no account; leave it empty to accept any installation a signed-in user connects"))
 	}
 	return accounts, problems
 }
+
+// appSlug matches a GitHub App's URL name; anything else builds no link.
+var appSlug = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`)
 
 // githubLogin matches GitHub's username rules: letters, digits and single
 // hyphens, not at either end, at most 39 characters.
 var githubLogin = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,38}$`)
 
-// loadAuthConfig reads the sign-in settings. Nothing here has a usable
-// default: an empty allowlist or a missing secret is an error, never "allow
+// loadAuthConfig reads the sign-in settings. The credentials have no usable
+// default: a missing secret is an error, never "allow
 // everyone".
 func loadAuthConfig(appEnv string, problems []error) (Auth, []error) {
 	auth := Auth{
@@ -319,7 +331,8 @@ func loadAuthConfig(appEnv string, problems []error) (Auth, []error) {
 		auth.PublicURL = &url.URL{Scheme: parsed.Scheme, Host: parsed.Host}
 	}
 
-	for _, login := range strings.Split(os.Getenv("ALLOWED_GITHUB_LOGINS"), ",") {
+	logins := os.Getenv("ALLOWED_GITHUB_LOGINS")
+	for _, login := range strings.Split(logins, ",") {
 		login = strings.ToLower(strings.TrimSpace(login))
 		if login == "" {
 			continue
@@ -330,8 +343,8 @@ func loadAuthConfig(appEnv string, problems []error) (Auth, []error) {
 		}
 		auth.AllowedLogins = append(auth.AllowedLogins, login)
 	}
-	if len(auth.AllowedLogins) == 0 {
-		problems = append(problems, errors.New("ALLOWED_GITHUB_LOGINS is required: a comma-separated list of GitHub logins that may sign in"))
+	if len(auth.AllowedLogins) == 0 && strings.TrimSpace(logins) != "" {
+		problems = append(problems, errors.New("ALLOWED_GITHUB_LOGINS names no login; leave it empty to let any GitHub account sign in"))
 	}
 
 	if auth.SessionTTL < 5*time.Minute || auth.SessionTTL > 30*24*time.Hour {

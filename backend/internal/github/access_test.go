@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"testing"
@@ -26,10 +27,36 @@ var testAllowedAccounts = []int64{testAccountID}
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+// newTestHandler opens a test database in which devmind2320 has signed in
+// and connected the test installation, as in production, and returns a
+// handler with no account allowlist.
 func newTestHandler(t *testing.T) (*WebhookHandler, *storage.DB) {
 	t.Helper()
 	db := storagetest.Open(t, "test_github")
-	return NewWebhookHandler("unused", testAllowedAccounts, db, testQueue(db), discardLogger()), db
+	connect(t, db, 7001, "devmind2320", testInstallationID)
+	return NewWebhookHandler("unused", nil, db, testQueue(db), discardLogger()), db
+}
+
+// connect records a sign-in by login whose GitHub listing reaches one
+// repository in each given installation, which is what connects an
+// installation to SBOMDelta.
+func connect(t *testing.T, db *storage.DB, githubUserID int64, login string, githubInstallationIDs ...int64) models.User {
+	t.Helper()
+	ctx := context.Background()
+	user, err := db.UpsertUser(ctx, models.User{GitHubUserID: githubUserID, Login: login})
+	if err != nil {
+		t.Fatalf("UpsertUser(%s) error = %v", login, err)
+	}
+	repos := make([]models.AccessibleRepository, 0, len(githubInstallationIDs))
+	for i, id := range githubInstallationIDs {
+		repos = append(repos, models.AccessibleRepository{
+			GitHubRepoID: githubUserID*100 + int64(i), GitHubInstallationID: id, Owner: login, Name: fmt.Sprintf("listed-%d", i),
+		})
+	}
+	if err := db.ReplaceUserRepositories(ctx, user.ID, repos, time.Now()); err != nil {
+		t.Fatalf("ReplaceUserRepositories(%s) error = %v", login, err)
+	}
+	return user
 }
 
 func testQueue(db *storage.DB) *queue.Queue { return queue.New(db.Pool(), time.Minute) }

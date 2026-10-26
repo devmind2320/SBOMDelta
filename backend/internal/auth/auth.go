@@ -54,6 +54,9 @@ type Service struct {
 	client  *http.Client
 	apiBase string
 	logger  *slog.Logger
+	// listed, when set, is told which installations a sign-in's repository
+	// listing reached, once that listing is stored.
+	listed func(ctx context.Context, githubInstallationIDs []int64) error
 }
 
 // New builds the service. apiBaseURL is the GitHub REST API root used to read
@@ -66,6 +69,13 @@ func New(cfg config.Auth, apiBaseURL string, db *storage.DB, logger *slog.Logger
 		apiBase: strings.TrimRight(apiBaseURL, "/"),
 		logger:  logger,
 	}
+}
+
+// OnInstallationsListed registers fn to run after each sign-in stores the
+// user's repository list, with the installations that list reached. A failure
+// is logged and does not fail the sign-in.
+func (s *Service) OnInstallationsListed(fn func(ctx context.Context, githubInstallationIDs []int64) error) {
+	s.listed = fn
 }
 
 // developmentUser stands in for a signed-in person when AUTH_DISABLED is set,
@@ -95,8 +105,10 @@ func newToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+// allowed reports whether login may sign in: any login unless
+// ALLOWED_GITHUB_LOGINS restricts sign-in.
 func (s *Service) allowed(login string) bool {
-	return slices.Contains(s.cfg.AllowedLogins, strings.ToLower(login))
+	return len(s.cfg.AllowedLogins) == 0 || slices.Contains(s.cfg.AllowedLogins, strings.ToLower(login))
 }
 
 func (s *Service) callbackURL() string {
@@ -313,12 +325,14 @@ func (s *Service) Me(w http.ResponseWriter, r *http.Request) {
 		"login":        user.Login,
 		"avatarUrl":    user.AvatarURL,
 		"authDisabled": s.cfg.Disabled,
+		"installUrl":   s.cfg.InstallURL,
 	})
 }
 
 // RequireUser admits only requests carrying a live session for an allowed
-// login. The allowlist is checked on every request, not just at sign-in, so
-// removing a login from ALLOWED_GITHUB_LOGINS cuts off its existing sessions.
+// login. When ALLOWED_GITHUB_LOGINS restricts sign-in it is checked on every
+// request, not just at sign-in, so removing a login cuts off its existing
+// sessions.
 func (s *Service) RequireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Responses behind sign-in must never be served from a shared cache.
@@ -513,7 +527,22 @@ func (s *Service) recordRepositories(ctx context.Context, user models.User, toke
 		return s.db.ClearUserRepositories(context.WithoutCancel(ctx), user.ID, code, time.Now())
 	}
 	s.logger.Info("listed the user's repositories", "login", user.Login, "repositories", len(repos))
-	return s.db.ReplaceUserRepositories(context.WithoutCancel(ctx), user.ID, repos, time.Now())
+	if err := s.db.ReplaceUserRepositories(context.WithoutCancel(ctx), user.ID, repos, time.Now()); err != nil {
+		return err
+	}
+	if s.listed != nil {
+		var installations []int64
+		for _, repo := range repos {
+			if !slices.Contains(installations, repo.GitHubInstallationID) {
+				installations = append(installations, repo.GitHubInstallationID)
+			}
+		}
+		if err := s.listed(context.WithoutCancel(ctx), installations); err != nil {
+			s.logger.Warn("could not queue reconciliation of the user's installations",
+				"login", user.Login, "error", err)
+		}
+	}
+	return nil
 }
 
 // listAccessibleRepositories pages through the installations the user can

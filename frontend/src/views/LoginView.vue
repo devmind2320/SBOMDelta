@@ -54,8 +54,8 @@ async function endDisallowedSession() {
       </span>
       <h1 class="mt-5 mb-0 text-xl font-semibold tracking-tight text-ink">Sign in to SBOMDelta</h1>
       <p class="mx-auto mt-2 mb-0 max-w-[40ch] text-sm leading-relaxed text-ink-muted">
-        Software supply-chain security for your repositories. Dependency data for private repositories is shown
-        only to accounts this dashboard allows.
+        Software supply-chain security for your repositories. Sign in with your GitHub account; you see and scan
+        only the repositories GitHub lets your account reach through SBOMDelta’s GitHub App.
       </p>
 
       <div class="mt-6 flex flex-col gap-3 text-left">
